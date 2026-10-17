@@ -1,0 +1,17 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "model": "mock-model",
+  "engine_lib": null,
+  "cors_origins": ["*"],
+  "ui_dir": null,
+  "log_metrics": false,
+  "calibrate": {
+    "spec_draft_min_speedup": 1.05,
+    "spec_draft_min_accept": 0.5,
+    "kv_quant_min_speedup": 1.03,
+    "kv_quant_max_ppl_penalty_pct": 1.0,
+    "tier_nvme_min_ram_ratio": 0.25,
+    "tier_boundary_bytes": 1073741824
+  }
+}

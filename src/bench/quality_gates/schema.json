@@ -23,12 +23,12 @@
     "gsm8k_32": {
       "file": "data/gsm8k_32.jsonl",
       "fields": ["id", "question", "answer"],
-      "status": "placeholder: синтетические 32 задачи; реальный поднабор GSM8K подключается после интеграции весов"
+      "status": "real: реальный поднабор GSM8K (openai/grade-school-math, test.jsonl), выборка 32 задач seed=42 — детерминирована, скрипт stell_bench.fetch_quality_gates"
     },
     "humaneval_32": {
       "file": "data/humaneval_32.jsonl",
       "fields": ["task_id", "prompt", "canonical_solution", "test", "entry_point"],
-      "status": "placeholder: синтетические 32 задачи; реальный поднабор HumanEval подключается после интеграции весов"
+      "status": "real: реальный поднабор HumanEval (openai/human-eval, HumanEval.jsonl.gz), выборка 32 задач seed=42 — детерминирована, скрипт stell_bench.fetch_quality_gates"
     },
     "ppl_fixed_text": {
       "file": "data/ppl_text.txt",

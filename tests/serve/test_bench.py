@@ -82,16 +82,56 @@ def test_write_report(tmp_path):
     assert data["pending"] is True
 
 
-def test_quality_gates_data_and_schema():
-    assert len(gsm8k_32()) == 32
-    assert len(humaneval_32()) == 32
+def test_quality_gates_data_are_real_datasets():
+    # round 2: датасеты РЕАЛЬНЫЕ (fixed seed=42, 32 задачи из открытых датасетов)
+    gsm = gsm8k_32()
+    he = humaneval_32()
+    assert len(gsm) == 32 and len(he) == 32
+    # реальные поля GSM8K: вопрос/числовой ответ, не синтетика round 1
+    assert all(item["id"].startswith("gsm8k_test_") for item in gsm)
+    assert all(isinstance(item["answer"], str) for item in gsm)
+    assert not any(item["id"].startswith("gsm8k_synth_") for item in gsm)
+    assert all("question" in item and "answer" in item for item in gsm)
+    # реальные поля HumanEval: task_id/prompt/canonical_solution/test/entry_point
+    assert all({"task_id", "prompt", "canonical_solution", "test",
+                "entry_point"} <= set(item) for item in he)
+    assert all(item["task_id"].startswith("HumanEval/") for item in he)
     assert len(ppl_text().split()) > 100
     schema = load_schema()
     assert schema["datasets"]["gsm8k_32"]["file"] == "data/gsm8k_32.jsonl"
+    assert "real:" in schema["datasets"]["gsm8k_32"]["status"]
+    assert "seed=42" in schema["datasets"]["humaneval_32"]["status"]
 
 
-def test_quality_gates_pending_without_model():
-    gates = run_gates_pending()
-    assert len(gates) == 3
-    assert all(g.pending for g in gates)
-    assert all(g.value is None for g in gates)
+def test_fetch_sample_is_deterministic():
+    # скрипт загрузки: выборка 32 задач seed=42 детерминирована (без сети —
+    # чистая функция _sample на фиксированных входах)
+    from stell_bench.fetch_quality_gates import _sample
+
+    items = [{"id": f"i{i:03d}"} for i in range(100)]
+    a = _sample(items, key=lambda x: x["id"])
+    b = _sample(items, key=lambda x: x["id"])
+    assert a == b
+    assert len(a) == 32
+    assert all(x in items for x in a)
+
+
+def test_quality_gates_runner_writes_pending_report(mock_engine_lib, tmp_path):
+    from stell_bench.quality_gates_runner import main
+
+    rc = main(["--engine-lib", str(mock_engine_lib), "--results-dir",
+               str(tmp_path)])
+    assert rc == 0
+    report = tmp_path / "report.json"
+    data = json.loads(report.read_text())
+    assert data["pending"] is True
+    gates = {g["dataset"]: g for g in data["gates"]}
+    assert set(gates) == {"gsm8k_32", "humaneval_32", "ppl_fixed_text"}
+    assert gates["gsm8k_32"]["items"] == 32
+    assert gates["humaneval_32"]["items"] == 32
+    assert gates["ppl_fixed_text"]["unit"] == "ppl"
+    assert all(g["pending"] for g in data["gates"])
+    # честная фиксация расхождения ABI: логитов нет → PPL не вычислим
+    assert all(any("не отдаёт логитов" in n for n in g["notes"])
+               for g in data["gates"])
+    assert (tmp_path / "run.log").exists()
