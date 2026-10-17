@@ -274,7 +274,9 @@ class CtypesEngineBackend(EngineBackend):
             # token_id — serve подставляет текст (ADR-11 §3; подмена
             # детокенизатора модели — точка расширения, контракт не меняется).
             for ev in events:
-                if ev.get("type") == "token" and "text" not in ev:
+                if ev.get("type") == "token" and not ev.get("text"):
+                    # core-2: движок несёт text:"" при runner без прод-токенизатора —
+                    # пустой текст тоже замещаем детокенизатором serve.
                     ev["text"] = self._detokenize(int(ev.get("token_id", -1)))
         return events
 

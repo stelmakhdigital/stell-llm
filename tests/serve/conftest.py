@@ -27,7 +27,11 @@ MOCK_SO = ROOT / "build" / "cpu" / "src" / "serve" / "libstell_mock_core.so"
 # поток core вклеит свой SHARED `stell_core` в build/cpu/src/engine/, биндинг
 # prefers его (engine.resolve_engine_lib); эта сборка остаётся для локальных
 # тестов ABI (включая stell_step).
-REAL_SO = ROOT / "build" / "cpu" / "src" / "serve" / "libstell_core_serve.so"
+# Интеграционный фикс (worker, раунд 2): предпочитать РЕАЛЬНЫЙ libstell_core.so
+# (SHARED-таргет потока core в build/cpu/src/engine/), ABI-копия — fallback.
+REAL_SO_PREF = ROOT / "build" / "cpu" / "src" / "engine" / "libstell_core.so"
+REAL_SO = (REAL_SO_PREF if REAL_SO_PREF.exists()
+           else ROOT / "build" / "cpu" / "src" / "serve" / "libstell_core_serve.so")
 
 
 def _toolchain_env() -> dict:
