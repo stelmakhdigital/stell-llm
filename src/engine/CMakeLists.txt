@@ -4,6 +4,8 @@ add_library(stell_engine STATIC
     src/scheduler.cpp
     src/execution_plan.cpp
     src/speculative.cpp
+    src/json.cpp
+    src/capi.cpp
 )
 target_include_directories(stell_engine PUBLIC include)
 target_compile_options(stell_engine PRIVATE -Wall -Wextra)
@@ -57,3 +59,17 @@ add_executable(test_engine_kv_stream
 target_link_libraries(test_engine_kv_stream stell_engine)
 target_include_directories(test_engine_kv_stream PRIVATE ../../tests/core)
 add_test(NAME engine/kv_stream COMMAND test_engine_kv_stream)
+
+add_executable(test_engine_comm
+    ../../tests/core/engine/test_comm.cpp
+)
+target_link_libraries(test_engine_comm stell_engine)
+target_include_directories(test_engine_comm PRIVATE ../../tests/core)
+add_test(NAME engine/comm COMMAND test_engine_comm)
+
+add_executable(test_engine_capi
+    ../../tests/core/engine/test_capi.cpp
+)
+target_link_libraries(test_engine_capi stell_engine)
+target_include_directories(test_engine_capi PRIVATE ../../tests/core)
+add_test(NAME engine/capi COMMAND test_engine_capi)
