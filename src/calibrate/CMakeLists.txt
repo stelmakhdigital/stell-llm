@@ -1,1 +1,3 @@
-# calibrate: наполнение в ветке agent/<role>/1 (см. docs/design/calibrate.md)
+# calibrate: калибровщик-арбитр — Python-пакет stell_calibrate
+# (политика + замер-харнесс + конфиг; см. stell_calibrate/__init__.py).
+# C++-часть появится при интеграции с движком потока A.
