@@ -5,6 +5,10 @@ worker_prompt_addition.md
 memory*
 agents*.log
 .agent/
+.pi/
+
+# Worktrees подагентов
+.worktrees/
 
 # Сборка
 build/
@@ -21,3 +25,6 @@ venv/
 # Временные артефакты агентов
 /scratch/
 *.swp
+
+# Результаты локальных прогонов (только финальные bench/results коммитятся)
+bench/results/local/
