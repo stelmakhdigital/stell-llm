@@ -8,7 +8,7 @@
 #include <cstring>
 #include <vector>
 
-#include "stell/engine/cuda/graph_executor.hpp"
+#include "graph_executor.hpp"
 
 namespace stell::engine::cuda {
 
