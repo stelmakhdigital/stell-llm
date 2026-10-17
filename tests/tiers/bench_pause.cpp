@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,7 @@ int main(int argc, char** argv) {
     mgr.set_layer_map(layers_map);
 
     const auto t0 = std::chrono::steady_clock::now();
+    std::vector<double> raw_ms;
     for (int p = 0; p < passes; ++p) {
         for (int l = 0; l < layers; ++l) {
             // router-lookahead: prefetch следующего слоя ДО паузы слоя.
@@ -116,8 +118,11 @@ int main(int argc, char** argv) {
                     keys.push_back(GroupKey{gid, plan[(size_t)gid.value].role});
                 mgr.prefetch(keys);
             }
+            const auto tw = std::chrono::steady_clock::now();
             auto a = mgr.pin_layer(unsigned(l)); // пауза слоя меряется sink'ом pin_layer
             a->wait();
+            raw_ms.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tw).count());
             for (GroupId gid : layers_map[unsigned(l)])
                 mgr.unpin(GroupKey{gid, plan[(size_t)gid.value].role});
         }
@@ -126,7 +131,25 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() - t0).count();
 
     const TierStats st = mgr.stats();
+    if (std::getenv("BENCH_DEBUG")) {
+        // Честный дамп сырых пауз (двойной замер в бенче, независимый от
+        // stats-снапшота tiers).
+        std::printf("raw pauses (ms): ");
+        for (double p : raw_ms) std::printf("%.1f ", p);
+        std::printf("\n");
+    }
     const double io_gb = double(st.io_bytes) / double(1 << 30);
+    // Двойной замер: bench-side percentiles по raw_ms (независимы от tiers).
+    std::vector<double> sorted(raw_ms);
+    std::sort(sorted.begin(), sorted.end());
+    auto q = [&](double f) {
+        const std::size_t i = std::min(sorted.size() - 1,
+            static_cast<std::size_t>(f * double(sorted.size() - 1)));
+        return sorted.empty() ? 0.0 : sorted[i];
+    };
+    std::printf(
+        "  bench-side pause p50=%.3f ms p95=%.3f ms p99=%.3f ms\n",
+        q(0.50), q(0.95), q(0.99));
     std::printf(
         "bench_pause: backend=%s path=%s groups=%d slot=%zu layers=%d passes=%d mode=%s\n"
         "  pause p50=%.3f ms p95=%.3f ms p99=%.3f ms (цель PLAN.md §4: p95 ≤ 5 мс)\n"
