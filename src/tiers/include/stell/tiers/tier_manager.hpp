@@ -134,7 +134,10 @@ private:
     std::vector<TensorGroup> plan_;
     std::unordered_map<std::uint32_t, GroupState> states_;
     std::unordered_map<std::uint32_t, std::vector<GroupId>> layers_;
-    std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> ram_; // gid → слот RAM-тира
+    std::unordered_map<std::uint32_t, std::uint8_t*> ram_; // gid → буфер RAM-тира
+                                                           // (cudaHostAlloc/pinned
+                                                           // при STELL_CUDA,
+                                                           // alloc_ram_buffer)
 
     // VRAM-тир: N слотов фиксированного размера (CPU-эмуляция / device ptr).
     std::vector<std::uint8_t> vram_storage_;
@@ -147,9 +150,23 @@ private:
     // NVMe-тир.
     std::unique_ptr<TierNvmeFile> nvme_;
 
+#if defined(STELL_CUDA)
+    // CUDA/DMA-путь (ADR-08, серверная сборка SM70):
+    //   - VRAM-тир: cudaMalloc-пул слотов фиксированного размера (device ptr);
+    //   - RAM-тир: cudaHostAlloc (pinned) — источник DMA;
+    //   - DMA RAM→VRAM: cudaMemcpyAsync на выделенном стриме (см. process_job).
+    std::uint8_t* dev_storage_ = nullptr;  // пул VRAM-слотов (device ptr)
+    void*         dma_stream_  = nullptr;  // cudaStream_t (CUDA-типы скрыты в hpp)
+#endif
+
     // Счётчики переносов тир↔тир (io_uring-чтения + RAM→VRAM DMA/memcpy).
     std::atomic<std::uint64_t> io_bytes_{0};
     std::atomic<std::uint64_t> io_ops_{0};
+
+    // In-flight job'ы воркера: job мог быть взят из очереди (queue пуст),
+    // а process_job ещё идёт — ResetPlan обязан дождаться дренажа, чтобы
+    // не освободить RAM/VRAM-буферы под живой загрузкой.
+    std::atomic<int> active_jobs_{0};
 
     // Политика/предиктор.
     EvictionPolicy policy_;

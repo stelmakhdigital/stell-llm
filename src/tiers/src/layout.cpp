@@ -191,9 +191,12 @@ void TierLayoutWriter::finalize() {
     put32(hdr + 0x28, header_.n_tensors);
     std::size_t n = std::min(header_.model_name.size(), kHeaderModelNameLen);
     std::memcpy(hdr + kHeaderModelNameOff, header_.model_name.data(), n);
-    // ADR-12 §2: reserved-поле char[176] на 0xA0 оставлено нулевым; до конца
-    // 512 байт — нулевой padding (несоответствие размеров в ADR-12 см. в отчёте).
-    const std::uint32_t crc = crc32(hdr, 0x28); // поля 0x00..0x28 (ADR-12 §2)
+    // ADR-12 §2 (уточнение round 1): заголовок — ровно 512 байт; 0xA0..0x1FF —
+    // нулевой padding/reserved (memset выше покрывает всё поле).
+    // Канон header_crc32 (уточнение round 1, ADR-12): CRC32 байтов [0x00..0x2C)
+    // — поля 0x00..0x28 ВКЛЮЧИТЕЛЬНО (magic..n_tensors), как у конвертера
+    // models (stelltier_format.cpp, crc32_ieee(h, 0x2C)).
+    const std::uint32_t crc = crc32(hdr, 0x2C); // байты [0x00..0x2C), ADR-12 §2
     put32(hdr + 0x2C, crc);
     put64(hdr + 0x30, header_.index_offset);
     put64(hdr + 0x38, header_.data_offset);
@@ -244,7 +247,9 @@ TierLayoutReader::TierLayoutReader(std::string path) : path_(std::move(path)) {
             throw TierError(TierError::Code::IoFailure, "layout: unsupported version");
         if (slot_align != kTierSlotAlign || index_align != kTierIndexAlign)
             throw TierError(TierError::Code::IoFailure, "layout: unsupported alignment");
-        const std::uint32_t crc = crc32(hdr, 0x28);
+        // Канон (уточнение round 1, ADR-12): байты [0x00..0x2C) — как у
+        // конвертера/лоадера models. См. комментарий в finalize().
+        const std::uint32_t crc = crc32(hdr, 0x2C);
         if (crc != hdr_crc_stored)
             throw TierError(TierError::Code::IoFailure, "layout: header CRC mismatch");
 

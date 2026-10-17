@@ -22,6 +22,24 @@ double now_ms_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t).count();
 }
+
+// Буферы RAM-тира: при STELL_CUDA — pinned (cudaHostAlloc) как источник
+// cudaMemcpyAsync DMA; CPU-эмуляция — обычная heap-память.
+#if defined(STELL_CUDA)
+std::uint8_t* alloc_ram_buffer(std::size_t n) {
+    void* p = nullptr;
+    const cudaError_t e = cudaHostAlloc(&p, n, cudaHostAllocDefault);
+    if (e != cudaSuccess)
+        throw TierError(TierError::Code::IoFailure,
+                        std::string("tiers: cudaHostAlloc RAM-тира failed: ") +
+                            cudaGetErrorString(e));
+    return static_cast<std::uint8_t*>(p);
+}
+void free_ram_buffer(std::uint8_t* p) { if (p) cudaFreeHost(p); }
+#else
+std::uint8_t* alloc_ram_buffer(std::size_t n) { return new std::uint8_t[n]; }
+void free_ram_buffer(std::uint8_t* p) { delete[] p; }
+#endif
 } // namespace
 
 // --- TierAwaiter -------------------------------------------------------------
@@ -91,6 +109,19 @@ TierManager::TierManager(TierConfig cfg)
     : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead) {
     if (cfg_.vram_slots == 0 || cfg_.ram_capacity == 0)
         throw TierError(TierError::Code::PlanMismatch, "tiers: vram_slots/ram_capacity must be > 0");
+#if defined(STELL_CUDA)
+    // Выделенный DMA-стрим: RAM(pinned)→VRAM(device) копирования не
+    // смешиваются с legacy-стримом (ADR-08: Awaiter — fan-in io_uring/DMA).
+    {
+        cudaStream_t s = nullptr;
+        const cudaError_t e = cudaStreamCreate(&s);
+        if (e != cudaSuccess)
+            throw TierError(TierError::Code::IoFailure,
+                            std::string("tiers: cudaStreamCreate failed: ") +
+                                cudaGetErrorString(e));
+        dma_stream_ = s;
+    }
+#endif
     workers_.emplace_back([this] { worker_loop(); });
 }
 
@@ -101,6 +132,16 @@ TierManager::~TierManager() {
     }
     qcv_.notify_all();
     for (auto& w : workers_) if (w.joinable()) w.join();
+    // Устройство освобождаем только после join воркеров (DMA мог быть в полёте).
+    for (auto& kv : ram_) free_ram_buffer(kv.second);
+    ram_.clear();
+#if defined(STELL_CUDA)
+    if (dev_storage_) { cudaFree(dev_storage_); dev_storage_ = nullptr; }
+    if (dma_stream_) {
+        cudaStreamDestroy(static_cast<cudaStream_t>(dma_stream_));
+        dma_stream_ = nullptr;
+    }
+#endif
 }
 
 GroupState* TierManager::find(GroupId id) {
@@ -124,6 +165,16 @@ bool TierManager::resident_in_vram(GroupId id) const {
 }
 
 void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
+    // Безопасный ResetPlan: воркер мог взять job из очереди (queue пуста,
+    // а process_job ещё идёт) — дожидаемся дренажа in-flight job'ов ДО mu_
+    // (воркеру нужен mu_ на завершении job'а; см. ADR-08 §4 «холодная»
+    // дисциплина — одновременный вызов с рабочими методами недопустим).
+    for (int spin = 0; active_jobs_.load(std::memory_order_acquire) != 0; ++spin) {
+        if (spin > 30000) // ~30 с: протокол-нарушение/залипший job
+            throw TierError(TierError::Code::PlanMismatch,
+                            "set_plan: reset while load jobs in-flight");
+        std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    }
     std::lock_guard<std::mutex> lk(mu_);
     if (plan_active_) {
         // Повторный вызов = ResetPlan; одновременный вызов с рабочими методами
@@ -162,7 +213,6 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     plan_ = groups;
     std::sort(plan_.begin(), plan_.end(),
               [](const TensorGroup& a, const TensorGroup& b) { return a.id.value < b.id.value; });
-
     // NVMe-тир: открытие layout и сверка с планом (ADR-12 §2.2/§4).
     nvme_.reset();
     if (!cfg_.nvme_layout.empty()) {
@@ -187,22 +237,33 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
 
     slot_size_ = max_slot;
     states_.clear();
+    for (auto& kv : ram_) free_ram_buffer(kv.second);
     ram_.clear();
     layers_.clear();
     tick_ = 0;
     last_accessed_ = GroupId{0};
     for (const auto& g : plan_) states_[g.id.value] = GroupState{};
 
-    // VRAM-тир: N слотов фиксированного размера. CPU-эмуляция; при STELL_CUDA
-    // слоты — device-буферы (см. ниже, DMA через cudaMemcpyAsync).
+    // VRAM-тир: N слотов фиксированного размера.
 #if defined(STELL_CUDA)
-    // CUDA-путь собирается и проверяется на целевом сервере (V100, SM70);
-    // локальная машина без GPU — эмуляция слотов host-памятью.
-    vram_storage_.assign(cfg_.vram_slots * slot_size_, 0);
+    // CUDA/DMA-путь: VRAM-слоты — device-буферы (cudaMalloc-пул); DMA
+    // RAM→VRAM — cudaMemcpyAsync на выделенном стриме (см. process_job).
+    if (dev_storage_) { cudaFree(dev_storage_); dev_storage_ = nullptr; }
+    {
+        void* dev = nullptr;
+        const cudaError_t e = cudaMalloc(&dev, cfg_.vram_slots * slot_size_);
+        if (e != cudaSuccess)
+            throw TierError(TierError::Code::IoFailure,
+                            std::string("tiers: cudaMalloc VRAM-слотов failed: ") +
+                                cudaGetErrorString(e));
+        dev_storage_ = static_cast<std::uint8_t*>(dev);
+    }
+    vram_storage_.clear(); // host-эмуляция не используется (device ptr ниже)
     vram_slots_.assign(cfg_.vram_slots, nullptr);
     for (std::size_t i = 0; i < cfg_.vram_slots; ++i)
-        vram_slots_[i] = vram_storage_.data() + i * slot_size_;
+        vram_slots_[i] = dev_storage_ + i * slot_size_;
 #else
+    // CPU-эмуляция VRAM-тира: host-память.
     vram_storage_.assign(cfg_.vram_slots * slot_size_, 0);
     vram_slots_.assign(cfg_.vram_slots, nullptr);
     for (std::size_t i = 0; i < cfg_.vram_slots; ++i)
@@ -365,7 +426,10 @@ void TierManager::worker_loop() {
             job = queue_.front();
             queue_.pop_front();
         }
+        // Дренаж-счётчик для безопасного ResetPlan (set_plan ждёт 0; см. hpp).
+        active_jobs_.fetch_add(1, std::memory_order_acq_rel);
         process_job(job);
+        active_jobs_.fetch_sub(1, std::memory_order_release);
     }
 }
 
@@ -374,8 +438,7 @@ void TierManager::evict_ram_if_needed(std::size_t need) {
     // с RAM-копией вне текущей загрузки, которую можно снять безопасно:
     //  - resident в VRAM (копия в VRAM сохранна),
     //  - не resident и не закреплена (pinned == 0).
-    std::size_t used = 0;
-    for (const auto& kv : ram_) used += kv.second.size();
+    std::size_t used = ram_.size() * slot_size_;
     if (used + need <= cfg_.ram_capacity) return;
     std::vector<std::pair<GroupId, std::uint64_t>> cand;
     for (const auto& kv : states_) {
@@ -389,21 +452,20 @@ void TierManager::evict_ram_if_needed(std::size_t need) {
         GroupState& st = states_[c.first.value];
         auto it = ram_.find(c.first.value);
         if (it == ram_.end()) continue;
-        const std::size_t sz = it->second.size();
+        free_ram_buffer(it->second);
         ram_.erase(it);
         st.in_ram = false;
-        used -= sz;
+        used -= slot_size_;
         if (used + need <= cfg_.ram_capacity) break;
     }
 }
 
 void TierManager::update_ram_tier(GroupId id, std::size_t need) {
     evict_ram_if_needed(need);
-    auto& buf = ram_[id.value];
-    if (buf.size() < need) {
-        buf.resize(slot_size_); // слот RAM-тира = размер VRAM-слота (pinned при CUDA)
-        // Прим.: при STELL_CUDA здесь cudaHostAlloc — см. отчёт (серверная сборка).
-    }
+    std::uint8_t*& buf = ram_[id.value];
+    if (!buf)
+        buf = alloc_ram_buffer(slot_size_); // pinned при STELL_CUDA (cudaHostAlloc)
+    (void)need; // слот RAM-тира = размер VRAM-слота
 }
 
 std::int32_t TierManager::acquire_slot(GroupId) {
@@ -467,7 +529,9 @@ void TierManager::process_job(const Job& job) {
         need_read = !st->in_ram;
         if (need_read) update_ram_tier(gid, slot_size_);
         auto it = ram_.find(gid.value);
-        ram_buf = it->second.data();
+        ram_buf = it->second;
+        if (!ram_buf)
+            throw TierError(TierError::Code::IoFailure, "tiers: RAM-буфер группы отсутствует");
     }
 
     // Фаза B: NVMe → RAM (io_uring, вне mu_).
@@ -488,7 +552,7 @@ void TierManager::process_job(const Job& job) {
         }
     }
 
-    // Фаза C: RAM → VRAM-слот (DMA при CUDA; memcpy в CPU-эмуляции).
+    // Фаза C: RAM → VRAM-слот (DMA при STELL_CUDA; memcpy в CPU-эмуляции).
     std::int32_t slot = -1;
     std::exception_ptr slot_err = nullptr;
     {
@@ -505,9 +569,27 @@ void TierManager::process_job(const Job& job) {
     }
     // Копирование вне mu_ (может быть тяжёлым).
 #if defined(STELL_CUDA)
-    // cudaMemcpyAsync(slots_[slot], ram_buf, slot_size_, cudaDeviceToHost?) —
-    // точная схема DMA фиксируется на серверной сборке (см. отчёт).
-    std::memcpy(vram_slots_[(size_t)slot], ram_buf, slot_size_);
+    // DMA RAM(pinned)→VRAM(device): cudaMemcpyAsync на выделенном стриме;
+    // Awaiter группы завершается после синхронизации стрима (fan-in по
+    // событиям CUDA — развитие следующего раунда, см. отчёт о честности).
+    {
+        cudaStream_t s = static_cast<cudaStream_t>(dma_stream_);
+        cudaError_t e = cudaMemcpyAsync(vram_slots_[(size_t)slot], ram_buf,
+                                        slot_size_, cudaMemcpyHostToDevice, s);
+        if (e != cudaSuccess) {
+            fail_all(std::make_exception_ptr(TierError(
+                TierError::Code::IoFailure,
+                std::string("tiers: DMA RAM→VRAM failed: ") + cudaGetErrorString(e))));
+            return;
+        }
+        e = cudaStreamSynchronize(s);
+        if (e != cudaSuccess) {
+            fail_all(std::make_exception_ptr(TierError(
+                TierError::Code::IoFailure,
+                std::string("tiers: DMA stream sync failed: ") + cudaGetErrorString(e))));
+            return;
+        }
+    }
 #else
     std::memcpy(vram_slots_[(size_t)slot], ram_buf, slot_size_);
 #endif
@@ -560,8 +642,7 @@ TierStats TierManager::stats() const {
     std::uint64_t vram_bytes = 0;
     for (const auto& kv : states_)
         if (kv.second.in_vram) vram_bytes += slot_size_;
-    std::uint64_t ram_bytes = 0;
-    for (const auto& kv : ram_) ram_bytes += kv.second.size();
+    std::uint64_t ram_bytes = ram_.size() * slot_size_;
     ts.tier_bytes[0] = vram_bytes;
     ts.tier_bytes[1] = ram_bytes;
     ts.tier_bytes[2] = nvme_ ? [&] {

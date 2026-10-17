@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+#include <iterator>
 
 #include "harness.hpp"
 
@@ -85,7 +86,9 @@ T_CASE(layout_roundtrip) {
 T_CASE(layout_header_crc_corruption) {
     const std::string path = "/tmp/stell_tier_test_layout_hdr.stelltier";
     write_layout(path, sample_plan(4096));
-    // Порча любого поля CRC-диапазона заголовка (0x00..0x28) → файл невалиден.
+    // Порча любого поля CRC-диапазона заголовка [0x00..0x2C) → файл невалиден.
+    // Канон (уточнение round 1, ADR-12): байты [0x00..0x2C) — как у конвертера
+    // models; сюда входят и байты n_tensors (0x28..0x2B).
     std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
     f.seekp(0x12); // created_ts — поле внутри диапазона CRC (ADR-12 §2)
     f.write("\xff", 1);
@@ -99,6 +102,72 @@ T_CASE(layout_header_crc_corruption) {
         thrown = e.code() == TierError::Code::IoFailure;
     }
     T_REQUIRE(thrown, "порча заголовка → IoFailure при открытии");
+}
+
+T_CASE(layout_header_crc_boundary_0x2c) {
+    // Канон header_crc32 (уточнение round 1, ADR-12): байты [0x00..0x2C),
+    // как у конвертера models. Проверяем честно в обе стороны:
+    //  (a) файл writer'а tiers принимается reader'ом tiers (roundtrip);
+    //  (b) файл, чей header_crc32 посчитан по старому ошибочному канону
+    //      [0x00..0x28) (без n_tensors), reader'ом ОТКЛОНЯЕТСЯ —
+    //      т.к. байты n_tensors (0x28..0x2B) входят в CRC-диапазон;
+    //  (c) порча байта 0x28 (первого байта n_tensors) обнаруживается.
+    const std::string path = "/tmp/stell_tier_test_layout_bnd.stelltier";
+    write_layout(path, sample_plan(4096));
+
+    // (a) roundtrip на канонической границе.
+    {
+        TierLayoutReader r(path);
+        T_REQUIRE(r.header().n_groups == 4, "канонический файл читается");
+    }
+
+    // (b) старый канон [0x00..0x28) — CRC перезаписывается по первым 0x28 байтам.
+    {
+        const std::string old_path = "/tmp/stell_tier_test_layout_bnd_old.stelltier";
+        std::fstream src(path, std::ios::binary | std::ios::in);
+        std::vector<std::uint8_t> blob((std::istreambuf_iterator<char>(src)),
+                                       std::istreambuf_iterator<char>());
+        src.close();
+        T_REQUIRE(blob.size() >= 0x30, "файл достаточно велик");
+        const std::uint32_t crc_old = crc32(blob.data(), 0x28);
+        for (int b = 0; b < 4; ++b)
+            blob[0x2C + b] = static_cast<std::uint8_t>((crc_old >> (8 * b)) & 0xFF);
+        std::fstream out(old_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(blob.data()),
+                  static_cast<std::streamsize>(blob.size()));
+        out.close();
+        bool thrown = false;
+        try {
+            TierLayoutReader r(old_path);
+            (void)r;
+        } catch (const TierError& e) {
+            thrown = e.code() == TierError::Code::IoFailure;
+        }
+        T_REQUIRE(thrown,
+                  "CRC по [0x00..0x28) (старый канон) → header CRC mismatch → IoFailure");
+    }
+
+    // (c) порча первого байта n_tensors (0x28 — внутри канонического диапазона).
+    {
+        const std::string nt_path = "/tmp/stell_tier_test_layout_bnd_nt.stelltier";
+        std::fstream src(path, std::ios::binary | std::ios::in);
+        std::vector<std::uint8_t> blob((std::istreambuf_iterator<char>(src)),
+                                       std::istreambuf_iterator<char>());
+        src.close();
+        blob[0x28] ^= 0xFF;
+        std::fstream out(nt_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(blob.data()),
+                  static_cast<std::streamsize>(blob.size()));
+        out.close();
+        bool thrown = false;
+        try {
+            TierLayoutReader r(nt_path);
+            (void)r;
+        } catch (const TierError& e) {
+            thrown = e.code() == TierError::Code::IoFailure;
+        }
+        T_REQUIRE(thrown, "порча байта 0x28 (n_tensors) → IoFailure");
+    }
 }
 
 T_CASE(layout_group_crc_corruption) {

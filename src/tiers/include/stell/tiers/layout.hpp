@@ -75,7 +75,9 @@ struct TierGroupIndexEntry {
     std::uint64_t slot_bytes  = 0;      // кратен 4096
     std::uint32_t shape_rank  = 0;
     std::array<std::uint32_t, 4> shape{}; // до 4 измерений
-    std::uint32_t crc32       = 0;      // CRC32 полезной нагрузки группы
+    std::uint32_t crc32       = 0;      // CRC32 слота группы целиком (payload +
+                                        // нулевой padding до slot_bytes; уточнение
+                                        // round 1, ADR-12 §2.3)
     std::string   name;                 // человекочитаемое, обрезано
 };
 
