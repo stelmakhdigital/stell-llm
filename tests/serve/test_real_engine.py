@@ -235,3 +235,23 @@ def test_dashboard_serves_on_real_engine(real_client):
     assert "/metrics" in app_js.text
     assert "tiers?.tier_bytes" in app_js.text          # отсутствие tiers не роняет UI
     assert real_client.get("/ui/style.css").status_code == 200
+
+
+def test_resolve_engine_lib_paths(real_engine_lib, monkeypatch):
+    from pathlib import Path
+
+    from stell_serve.engine import (_DEFAULT_MOCK, _REAL_CANDIDATES,
+                                    default_engine_lib, resolve_engine_lib)
+
+    # явный путь mock → kind mock
+    assert resolve_engine_lib(str(_DEFAULT_MOCK))[1] == "mock"
+    # env → реальный движок (STELL_ENGINE_LIB)
+    monkeypatch.setenv("STELL_ENGINE_LIB", str(real_engine_lib))
+    path, kind = resolve_engine_lib()
+    assert kind == "real" and path == Path(real_engine_lib)
+    # дефолт (без env): реальный кандидат (таргет core в build/cpu/src/engine/)
+    # имеет приоритет над локальной ABI-копией; последняя — фолббек
+    monkeypatch.delenv("STELL_ENGINE_LIB", raising=False)
+    assert default_engine_lib() == real_engine_lib
+    assert _REAL_CANDIDATES[0] == Path(_REAL_CANDIDATES[0])
+    assert _DEFAULT_MOCK.name == "libstell_mock_core.so"
