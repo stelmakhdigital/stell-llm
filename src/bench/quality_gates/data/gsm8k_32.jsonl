@@ -1,0 +1,34 @@
+// ЗАГОТОВКА: синтетический подмен GSM8K-32 (реальный поднабор подключается
+// после интеграции весов/движка; см. schema.json). Прогон pending.
+{"id": "gsm8k_synth_000", "question": "Natalia has 3 apples and buys 5 more. How many apples does she have now?", "answer": "8"}
+{"id": "gsm8k_synth_001", "question": "A train travels 30 km in 2 hours. What is its speed in km/h?", "answer": "15"}
+{"id": "gsm8k_synth_002", "question": "Ann has 3 boxes with 5 pencils each. How many pencils in total?", "answer": "15"}
+{"id": "gsm8k_synth_003", "question": "Tom had 60 dollars and spent 50. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_004", "question": "Natalia has 4 apples and buys 7 more. How many apples does she have now?", "answer": "11"}
+{"id": "gsm8k_synth_005", "question": "A train travels 40 km in 2 hours. What is its speed in km/h?", "answer": "20"}
+{"id": "gsm8k_synth_006", "question": "Ann has 4 boxes with 7 pencils each. How many pencils in total?", "answer": "28"}
+{"id": "gsm8k_synth_007", "question": "Tom had 80 dollars and spent 70. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_008", "question": "Natalia has 5 apples and buys 9 more. How many apples does she have now?", "answer": "14"}
+{"id": "gsm8k_synth_009", "question": "A train travels 50 km in 2 hours. What is its speed in km/h?", "answer": "25"}
+{"id": "gsm8k_synth_010", "question": "Ann has 5 boxes with 9 pencils each. How many pencils in total?", "answer": "45"}
+{"id": "gsm8k_synth_011", "question": "Tom had 100 dollars and spent 90. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_012", "question": "Natalia has 6 apples and buys 11 more. How many apples does she have now?", "answer": "17"}
+{"id": "gsm8k_synth_013", "question": "A train travels 60 km in 2 hours. What is its speed in km/h?", "answer": "30"}
+{"id": "gsm8k_synth_014", "question": "Ann has 6 boxes with 11 pencils each. How many pencils in total?", "answer": "66"}
+{"id": "gsm8k_synth_015", "question": "Tom had 120 dollars and spent 110. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_016", "question": "Natalia has 7 apples and buys 13 more. How many apples does she have now?", "answer": "20"}
+{"id": "gsm8k_synth_017", "question": "A train travels 70 km in 2 hours. What is its speed in km/h?", "answer": "35"}
+{"id": "gsm8k_synth_018", "question": "Ann has 7 boxes with 13 pencils each. How many pencils in total?", "answer": "91"}
+{"id": "gsm8k_synth_019", "question": "Tom had 140 dollars and spent 130. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_020", "question": "Natalia has 8 apples and buys 15 more. How many apples does she have now?", "answer": "23"}
+{"id": "gsm8k_synth_021", "question": "A train travels 80 km in 2 hours. What is its speed in km/h?", "answer": "40"}
+{"id": "gsm8k_synth_022", "question": "Ann has 8 boxes with 15 pencils each. How many pencils in total?", "answer": "120"}
+{"id": "gsm8k_synth_023", "question": "Tom had 160 dollars and spent 150. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_024", "question": "Natalia has 9 apples and buys 17 more. How many apples does she have now?", "answer": "26"}
+{"id": "gsm8k_synth_025", "question": "A train travels 90 km in 2 hours. What is its speed in km/h?", "answer": "45"}
+{"id": "gsm8k_synth_026", "question": "Ann has 9 boxes with 17 pencils each. How many pencils in total?", "answer": "153"}
+{"id": "gsm8k_synth_027", "question": "Tom had 180 dollars and spent 170. How much is left?", "answer": "10"}
+{"id": "gsm8k_synth_028", "question": "Natalia has 10 apples and buys 19 more. How many apples does she have now?", "answer": "29"}
+{"id": "gsm8k_synth_029", "question": "A train travels 100 km in 2 hours. What is its speed in km/h?", "answer": "50"}
+{"id": "gsm8k_synth_030", "question": "Ann has 10 boxes with 19 pencils each. How many pencils in total?", "answer": "190"}
+{"id": "gsm8k_synth_031", "question": "Tom had 200 dollars and spent 190. How much is left?", "answer": "10"}

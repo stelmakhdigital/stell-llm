@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-2020-12/schema#",
+  "title": "stell-llm quality-gates schema (PLAN.md §5)",
+  "type": "object",
+  "required": ["gate", "dataset", "pending", "items"],
+  "properties": {
+    "gate": {"const": "quality-gate"},
+    "dataset": {"enum": ["gsm8k_32", "humaneval_32", "ppl_fixed_text"]},
+    "pending": {
+      "type": "boolean",
+      "description": "True = прогона нет (нет модели/весов); значения не выдумываются"
+    },
+    "value": {"type": ["number", "null"], "description": "accuracy (GSM8K/HumanEval, 0..1) или PPL"},
+    "unit": {"enum": ["score", "ppl"]},
+    "items": {"type": "integer", "minimum": 0},
+    "notes": {"type": "array", "items": {"type": "string"}},
+    "env": {
+      "type": "object",
+      "description": "KV-dtype, batch, memory-utilization, CUDA/драйвер, GPU-часы, co-tenancy (PLAN.md §5)"
+    }
+  },
+  "datasets": {
+    "gsm8k_32": {
+      "file": "data/gsm8k_32.jsonl",
+      "fields": ["id", "question", "answer"],
+      "status": "placeholder: синтетические 32 задачи; реальный поднабор GSM8K подключается после интеграции весов"
+    },
+    "humaneval_32": {
+      "file": "data/humaneval_32.jsonl",
+      "fields": ["task_id", "prompt", "canonical_solution", "test", "entry_point"],
+      "status": "placeholder: синтетические 32 задачи; реальный поднабор HumanEval подключается после интеграции весов"
+    },
+    "ppl_fixed_text": {
+      "file": "data/ppl_text.txt",
+      "protocol": "фиксированный текст, PPL считается движком после интеграции; текст не меняется между версиями"
+    }
+  }
+}
