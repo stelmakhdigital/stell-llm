@@ -1,16 +1,33 @@
-// Реализация C ABI (ADR-11 §1) поверх Scheduler (round 1, CPU-контур).
-// runner:"demo" — детерминированный встроенный раннер для CPU CI; реальный
-// runner приходит от models/kernels при вклейке (потоки C/D/A-срезы).
+// Реализация C ABI (ADR-11 §1) поверх Scheduler (round 1 CPU-контур; round 2 —
+// вклейка реального CPU-раннера: каталог операций + лоадеры models + tiers).
+// runner:"demo" — детерминированный встроенный раннер для CPU CI (round 1);
+// runner:"ops" (round 2) — реальное CPU-исполнение модели (срез 1, A×D):
+//   cfg: {"runner":"ops",
+//         "engine":{"max_slots":16,"batch_step_max":16},
+//         "model":{"description":"<path>","weights":"<uri>",
+//                  "weights_format":"safetensors|gguf|nvfp4w4a16|stelltier",
+//                  "tokenizer":"byte",
+//                  "tiering":{"vram_slots":4,"ram_capacity":...,
+//                             "nvme_layout":"<path>"}   // опционально
+//          }}
+// Честные пометки: tokenizer — byte-level fallback (прод-токенизатор —
+// отдельная задача); tiering в CPU-контуре даёт residency/prefetch/паузы,
+// сами веса материалены из лоадера (см. ops_runner.hpp).
 #include "stell/engine/capi.h"
 
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "stell/engine/json.hpp"
+#include "stell/engine/ops_runner.hpp"
+#include "stell/engine/plain_spec.hpp"
 #include "stell/engine/scheduler.hpp"
+#include "stell/engine/tokenizer.hpp"
 
 using namespace stell::engine;
 
@@ -29,10 +46,20 @@ public:
     std::map<SlotId, int> counter_;            // детерминизм по слоту
 };
 
+PlainWeightsFormat weights_format_from_name(const std::string& name) {
+    if (name == "safetensors") return PlainWeightsSafetensors;
+    if (name == "gguf") return PlainWeightsGGUF;
+    if (name == "nvfp4w4a16") return PlainWeightsNVFP4W4A16;
+    if (name == "stelltier") return PlainWeightsStellTier;
+    throw std::runtime_error("capi: неизвестный weights_format '" + name + "'");
+}
+
 struct EngineCtx {
     FixedSlotPool* pool = nullptr;
     Scheduler* sched = nullptr;
-    DemoRunner* runner = nullptr;
+    std::unique_ptr<IModelRunner> runner;          // DemoRunner | CpuModelRunner
+    std::unique_ptr<stell::tiers::TierManager> tiers;
+    ByteTokenizer tok;
     std::string last_error;
 };
 
@@ -55,10 +82,56 @@ int stell_engine_create(const char* cfg_json, stell_engine_t** out) {
                 batch_step_max = static_cast<std::uint32_t>(v->as_int(16));
         }
         ctx->pool = new FixedSlotPool(max_slots, 4096);
-        ctx->runner = new DemoRunner{};
-        Scheduler::Config cfg2{};
-        cfg2.batch_step_max = batch_step_max;
-        ctx->sched = new Scheduler(*ctx->runner, *ctx->pool, nullptr, cfg2);
+
+        std::string runner_name = "demo";
+        if (const Json* v = cfg.find("runner")) runner_name = v->as_string("demo");
+
+        if (runner_name == "ops") {
+            // Round 2: реальное CPU-исполнение модели (срез 1 A×D, ADR-09/03).
+            const Json* model = cfg.find("model");
+            if (!model)
+                throw std::runtime_error("capi: runner=ops требует секцию model");
+            const std::string desc_path = model->find("description")
+                                              ? model->find("description")->as_string("")
+                                              : std::string();
+            const std::string weights_uri =
+                model->find("weights") ? model->find("weights")->as_string("") : std::string();
+            const std::string fmt_name =
+                model->find("weights_format")
+                    ? model->find("weights_format")->as_string("safetensors")
+                    : std::string("safetensors");
+            if (desc_path.empty() || weights_uri.empty())
+                throw std::runtime_error("capi: runner=ops требует model.description "
+                                         "и model.weights");
+
+            const PlainSpec spec = load_plain_spec(desc_path);
+            const LoadedWeights weights =
+                load_plain_weights(weights_uri, spec, weights_format_from_name(fmt_name));
+            const ExecutionPlan plan = build_execution_plan(spec);
+
+            stell::tiers::TierManager* tiers = nullptr;
+            if (const Json* t = model->find("tiering")) {
+                stell::tiers::TierConfig tc{};
+                if (const Json* v = t->find("vram_slots"))
+                    tc.vram_slots = static_cast<std::size_t>(v->as_int(4));
+                if (const Json* v = t->find("ram_capacity"))
+                    tc.ram_capacity = static_cast<std::size_t>(v->as_int(0));
+                if (const Json* v = t->find("nvme_layout"))
+                    tc.nvme_layout = v->as_string("");
+                ctx->tiers = std::make_unique<stell::tiers::TierManager>(tc);
+                tiers = ctx->tiers.get();
+            }
+
+            ctx->runner = std::make_unique<CpuModelRunner>(spec, plan, weights, tiers);
+            ctx->sched = new Scheduler(*ctx->runner, *ctx->pool);
+            ctx->sched->set_tokenizer(&ctx->tok);          // byte-level fallback
+        } else {
+            ctx->runner = std::make_unique<DemoRunner>();
+            Scheduler::Config cfg2{};
+            cfg2.batch_step_max = batch_step_max;
+            ctx->sched = new Scheduler(*ctx->runner, *ctx->pool, nullptr, cfg2);
+            // demo: токенизатора нет — text пуст (round-1 поведение, честно).
+        }
         *out = reinterpret_cast<stell_engine_t*>(ctx);
         return 0;
     } catch (const std::exception& ex) {
@@ -71,7 +144,8 @@ void stell_engine_destroy(stell_engine_t* e) {
     if (!e) return;
     auto* ctx = reinterpret_cast<EngineCtx*>(e);
     delete ctx->sched;
-    delete ctx->runner;
+    ctx->runner.reset();
+    ctx->tiers.reset();
     delete ctx->pool;
     delete ctx;
 }
@@ -117,14 +191,31 @@ uint64_t stell_submit(stell_engine_t* e, const char* request_json, char** msg_ou
     }
 }
 
-// событие → JSON-строка (ADR-11 §3)
+// событие → JSON-строка (ADR-11 §3); text экранируется минимально (ASCII-safe:
+// byte-fallback токенизатор даёт printable-байты; escape-синтаксис —
+// ограничение парсера serve-стороны, см. engine/json.hpp).
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\u%04X", c);
+            out += buf;
+        } else out += c;
+    }
+    return out;
+}
+
 static std::string event_to_json(const Event& ev) {
-    char buf[256];
+    char buf[512];
     switch (ev.type) {
     case Event::Type::Token:
         std::snprintf(buf, sizeof buf,
-                      "{\"seq\":%llu,\"type\":\"token\",\"token_id\":%d}",
-                      (unsigned long long)ev.seq, ev.token_id);
+                      "{\"seq\":%llu,\"type\":\"token\",\"token_id\":%d,"
+                      "\"text\":\"%s\"}",
+                      (unsigned long long)ev.seq, ev.token_id,
+                      json_escape(ev.text).c_str());
         break;
     case Event::Type::Finish:
         std::snprintf(buf, sizeof buf,

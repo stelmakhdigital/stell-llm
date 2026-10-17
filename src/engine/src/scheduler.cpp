@@ -12,6 +12,8 @@ Scheduler::Scheduler(IModelRunner& runner, ISlotPool& pool,
                      parallel::ICommunicator* comm, Config cfg)
     : runner_(&runner), pool_(&pool), comm_(comm), cfg_(cfg) {}
 
+void Scheduler::set_tokenizer(const ITokenizer* tok) { tokenizer_ = tok; }
+
 SessionId Scheduler::submit(const SubmitRequest& req) {
     SlotId slot = 0;
     if (!pool_->acquire(slot)) {
@@ -46,6 +48,7 @@ bool Scheduler::cancel(SessionId id) {
     ev.completion_tokens = s.completion;
     emit(s, ev);
     s.finished = true;
+    release_slot(s.slot);
     return true;
 }
 
@@ -63,6 +66,7 @@ void Scheduler::finish_session(Session& s, const char* reason) {
     emit(s, ev);
     s.finished = true;
     pool_->release(s.slot);
+    release_slot(s.slot);
 }
 
 void Scheduler::step() {
@@ -79,22 +83,30 @@ void Scheduler::step() {
         if (batch.size() == cfg_.batch_step_max) break;
     }
 
-    // ADR-10 §3: планировщик на ранке 0 рассылает мету шага (маленькая,
-    // фиксированная) через allgather; остальные ранки исполняют ту же логику.
-    // Раунд 1: мета = [шаг, размер батча] как float-слоты (F32), документировано
-    // в отчёте как упрощение до появления comm-реализации (поток C).
+    // ADR-10 §3 + уточнение round 1: мета шага = фиксированный F32-пейлоад
+    // (8 слотов = 32 байта) через allgather; ранг 0 — источник (слоты
+    // [0]=шаг, [1]=размер батча, 6 зарезервированных); остальные ранки отдают
+    // заготовленные слоты и исполняют полученную мету. recv-ёмкость = 8 × world
+    // (семантика allgather — сбор по ранкам; см. ADR-10 §2).
     if (comm_ && cfg_.broadcast_step_meta) {
-        float meta[8] = {static_cast<float>(steps_),
-                         static_cast<float>(batch.size()), 0, 0, 0, 0, 0, 0};
-        float recv[8] = {};
-        comm_->allgather(meta, recv, 8, parallel::CommDType::F32);
+        const parallel::rank_t world = comm_->world_size();
+        float send[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (comm_->rank() == 0) {
+            send[0] = static_cast<float>(steps_);
+            send[1] = static_cast<float>(batch.size());
+        }
+        std::vector<float> recv(static_cast<std::size_t>(8) * world, 0.0f);
+        comm_->allgather(send, recv.data(), 8, parallel::CommDType::F32);
+        // Формат слотов — внутреннее дело engine (ADR-10 «Уточнение»: parallel
+        // семантически нейтрален; решение по метe — детерминированное: ранг 0).
     }
 
     if (batch.empty()) { ++steps_; return; }
 
     std::vector<IModelRunner::DecodeInput> inputs;
     inputs.reserve(batch.size());
-    for (Session* s : batch) inputs.push_back({s->slot, s->last_token});
+    for (Session* s : batch)
+        inputs.push_back({s->slot, s->last_token, s->req.prompt_tokens, s->req.sampling});
 
     std::vector<IModelRunner::DecodeOutput> outputs = runner_->decode_step(inputs);
 
@@ -107,6 +119,9 @@ void Scheduler::step() {
         Event ev{};
         ev.type = Event::Type::Token;
         ev.token_id = out.token;
+        // round 2: text из токенизатора (byte-fallback; прод-токенизатор —
+        // отдельная задача, честная пометка в tokenizer.hpp).
+        if (tokenizer_) ev.text = tokenizer_->decode(out.token);
         emit(*s, ev);
         s->last_token = out.token;
         ++s->completion;
@@ -119,6 +134,12 @@ void Scheduler::step() {
     }
 
     ++steps_;
+}
+
+void Scheduler::release_slot(SlotId slot) {
+    // Слот вернулся в пул (finish/cancel): runner сбрасывает KV-кеш слота —
+    // слот пула переиспользуется новой сессией (ADR-05/ADR-11 §3).
+    runner_->release_slot(slot);
 }
 
 std::vector<Event> Scheduler::poll(SessionId id) {

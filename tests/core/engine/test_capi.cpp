@@ -2,9 +2,11 @@
 #include "test_util.hpp"
 
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "engine/synth.hpp"
 #include "stell/engine/capi.h"
 
 namespace {
@@ -22,7 +24,7 @@ std::string poll_json(stell_engine_t* e, uint64_t sid, int* n_out) {
 
 } // namespace
 
-void run() {
+void run_demo_case() {
     // --- create: минимальный конфиг (round 1 CPU-контур) ---------------------
     stell_engine_t* e = nullptr;
     char* msg = nullptr;
@@ -106,6 +108,81 @@ void run() {
     STELL_CHECK(stell_cancel(e, s2) == 0);           // повторный cancel — 0
 
     stell_engine_destroy(e);
+}
+
+// --- round 2: runner:"ops" — реальное CPU-исполнение модели через ABI -------
+// mini_dense fixture → лоадер safetensors → каталог операций → логиты;
+// byte-токенизатор: text в token-событиях (ADR-11 §3, честная пометка: прод-
+// токенизатор — отдельная задача).
+void run_ops_case() {
+    using namespace stell_core_test;
+    const char* weights = "/tmp/stell_core_test_capi_ops.safetensors";
+    {
+        stell::engine::PlainSpec spec =
+            stell::engine::load_plain_spec(STELL_FIXTURES_DIR "/mini_dense.json");
+        write_safetensors(weights, fixture_tensors(spec));
+    }
+
+    const std::string cfg = std::string("{\"runner\":\"ops\",") +
+        "\"engine\":{\"max_slots\":4}," +
+        "\"model\":{\"description\":\"" STELL_FIXTURES_DIR "/mini_dense.json\"," +
+        "\"weights\":\"" + weights + "\"," +
+        "\"weights_format\":\"safetensors\",\"tokenizer\":\"byte\"}}";
+
+    stell_engine_t* e = nullptr;
+    STELL_CHECK_MSG(stell_engine_create(cfg.c_str(), &e) == 0, "ops engine created");
+    STELL_CHECK(e != nullptr);
+
+    char* msg = nullptr;
+    const uint64_t id = stell_submit(e,
+        "{\"prompt_tokens\":[1,2],\"sampling\":{\"max_tokens\":3,"
+        "\"temperature\":0},\"eos_token\":-1}", &msg);
+    if (msg) free_str(msg);
+    STELL_CHECK(id != 0);
+
+    for (int i = 0; i < 3; ++i) stell_step(e);
+    int n = 0;
+    const std::string evs = poll_json(e, id, &n);
+    STELL_CHECK(n >= 1);
+    // 3 token-события + finish(length); text заполняется byte-токенизатором
+    int tokens = 0, with_text = 0;
+    std::size_t pos = 0;
+    while ((pos = evs.find("\"type\":\"token\"", pos)) != std::string::npos) {
+        ++tokens;
+        ++pos;
+    }
+    pos = 0;
+    while ((pos = evs.find("\"text\":", pos)) != std::string::npos) {
+        ++with_text;
+        ++pos;
+    }
+    STELL_CHECK(tokens == 3);
+    STELL_CHECK(with_text == 3);
+    STELL_CHECK_MSG(evs.find("\"type\":\"finish\"") != std::string::npos, "finish");
+    STELL_CHECK(evs.find("\"reason\":\"length\"") != std::string::npos);
+    STELL_CHECK(evs.find("\"completion_tokens\":3") != std::string::npos);
+
+    // детерминизм: вторая сессия с тем же промптом → те же токены
+    const uint64_t id2 = stell_submit(e,
+        "{\"prompt_tokens\":[1,2],\"sampling\":{\"max_tokens\":3,"
+        "\"temperature\":0},\"eos_token\":-1}", nullptr);
+    STELL_CHECK(id2 != 0);
+    for (int i = 0; i < 3; ++i) stell_step(e);
+    const std::string evs2 = poll_json(e, id2, &n);
+    STELL_CHECK(evs2 == evs);
+
+    char* mj = nullptr;
+    STELL_CHECK(stell_metrics(e, &mj) == 0);
+    const std::string metrics(mj);
+    free_str(mj);
+    STELL_CHECK(metrics.find("\"engine\":{") != std::string::npos);
+
+    stell_engine_destroy(e);
+}
+
+void run() {
+    run_demo_case();
+    run_ops_case();
 }
 
 STELL_TEST_MAIN(run)

@@ -165,6 +165,48 @@ void run() {
             STELL_CHECK_MSG(close(out[i], scale * s4, 1e-6f), "W4A16 группы");
         }
     }
+
+    // --- block32-раскладка (round 2, единая с лоадером models, ADR-03) -------
+    // Блок = 32 элемента, один payload-буфер: [ceil(n/2) нибблов][n_blocks scale].
+    {
+        const std::size_t n = 40;                       // 2 блока: 32 + 8
+        const std::size_t n_blocks = 2;
+        std::vector<std::uint8_t> payload((n + 1) / 2 + n_blocks);
+        // нибблы: детерминированный LCG (значения e2m1/int4 покрывают оба блока)
+        test::Lcg g(1234);
+        for (std::size_t i = 0; i < (n + 1) / 2; ++i) payload[i] = g.next_u8();
+        // scales NVFP4: e4m3(0.5) = код 0x3F? — берём e4m3_encode(0.5)
+        payload[(n + 1) / 2 + 0] = e4m3_encode(0.5f);
+        payload[(n + 1) / 2 + 1] = e4m3_encode(2.0f);
+        std::vector<float> out(n);
+        dequant_nvfp4_block32(payload.data(), n, out.data());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint8_t byte = payload[i / 2];
+            const std::uint8_t nib = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+            const float scale = (i < 32) ? 0.5f : 2.0f;
+            STELL_CHECK_MSG(close(out[i], e2m1_value(nib) * scale, 1e-6f),
+                            "NVFP4 block32: value = e2m1 * e4m3(scale)");
+        }
+    }
+    {
+        const std::size_t n = 40;
+        const std::size_t n_blocks = 2;
+        std::vector<std::uint8_t> payload((n + 1) / 2 + 2 * n_blocks);
+        test::Lcg g(4321);
+        for (std::size_t i = 0; i < (n + 1) / 2; ++i) payload[i] = g.next_u8();
+        // scales W4A16: F16 (LE): 1.0 и 0.25
+        payload[(n + 1) / 2 + 0] = 0x00; payload[(n + 1) / 2 + 1] = 0x3C;   // 1.0
+        payload[(n + 1) / 2 + 2] = 0x00; payload[(n + 1) / 2 + 3] = 0x34;   // 0.25
+        std::vector<float> out(n);
+        dequant_w4a16_block32(payload.data(), n, out.data());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint8_t byte = payload[i / 2];
+            const int nib = static_cast<int>((i % 2 == 0) ? (byte & 0x0F) : (byte >> 4));
+            const float scale = (i < 32) ? 1.0f : 0.25f;
+            STELL_CHECK_MSG(close(out[i], (static_cast<float>(nib) - 8.0f) * scale, 1e-5f),
+                            "W4A16 block32: (nib - 8) * f16(scale)");
+        }
+    }
 }
 
 STELL_TEST_MAIN(run)

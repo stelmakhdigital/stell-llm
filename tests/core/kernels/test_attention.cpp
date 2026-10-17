@@ -113,6 +113,67 @@ void run() {
                                 "layout-реплей: результат per-head инвариантен к позиции головы");
     }
 
+    // --- decode-форма (round 2): одна query-строка против кеша (ADR-04) ------
+    {
+        const std::uint32_t heads = 4, kv_heads = 2, T = 5, d = 4;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(d));
+        std::vector<float> kc(static_cast<std::size_t>(kv_heads) * T * d),
+                           vc(kc.size()), q(heads * d), out(heads * d);
+        fill_lcg(kc, 404);
+        fill_lcg(vc, 505);
+        fill_lcg(q, 606);
+        attention_decode_f32(q.data(), kc.data(), vc.data(), heads, kv_heads, T, d,
+                             out.data());
+        // независимый референс: GQA-мапинг kvh = h / (heads/kv_heads)
+        const std::uint32_t per_kv = heads / kv_heads;
+        float max_err = 0.0f;
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const std::uint32_t kvh = h / per_kv;
+            float probs[8];
+            float mx = -1e30f;
+            for (std::uint32_t j = 0; j < T; ++j) {
+                float acc = 0.0f;
+                for (std::uint32_t dd = 0; dd < d; ++dd)
+                    acc += q[h * d + dd] * kc[kvh * T * d + j * d + dd];
+                probs[j] = acc * scale;
+                mx = std::max(mx, probs[j]);
+            }
+            float sum = 0.0f;
+            for (std::uint32_t j = 0; j < T; ++j) { probs[j] = std::exp(probs[j] - mx); sum += probs[j]; }
+            for (std::uint32_t dd = 0; dd < d; ++dd) {
+                float acc = 0.0f;
+                for (std::uint32_t j = 0; j < T; ++j)
+                    acc += (probs[j] / sum) * vc[kvh * T * d + j * d + dd];
+                max_err = std::max(max_err, std::fabs(out[h * d + dd] - acc));
+            }
+        }
+        STELL_CHECK_MSG(max_err < 1e-5f, "decode-форма: совпадение с референсом GQA");
+    }
+    // вырожденный случай: kv_heads == heads (без GQA) — decode == forward-строка
+    {
+        const std::uint32_t heads = 2, T = 3, d = 2;
+        std::vector<float> kc(heads * T * d), vc(kc.size());
+        std::vector<float> q(heads * d), out(heads * d);
+        fill_lcg(kc, 707);
+        fill_lcg(vc, 808);
+        fill_lcg(q, 909);
+        attention_decode_f32(q.data(), kc.data(), vc.data(), heads, heads, T, d,
+                             out.data());
+        // полная форма: q-строки все равны текущей → последняя строка out == decode
+        // (раскладка kernels: [heads][T][d])
+        std::vector<float> qf(heads * T * d, 0.0f), ff(heads * T * d, 0.0f);
+        for (std::uint32_t h = 0; h < heads; ++h)
+            for (std::uint32_t t = 0; t < T; ++t)
+                std::memcpy(qf.data() + (h * T + t) * d, q.data() + h * d,
+                            d * sizeof(float));
+        attention_forward_f32(qf.data(), kc.data(), vc.data(), heads, T, d, ff.data());
+        for (std::uint32_t h = 0; h < heads; ++h)
+            for (std::uint32_t dd = 0; dd < d; ++dd)
+                STELL_CHECK_MSG(close(out[h * d + dd],
+                                      ff[h * T * d + (T - 1) * d + dd]),
+                                "decode == последняя строка полной формы");
+    }
+
     // --- softmax rows: сумма строк = 1 --------------------------------------
     {
         float s[6];

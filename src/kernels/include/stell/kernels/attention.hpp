@@ -28,4 +28,18 @@ void attention_forward_f32(const float* q, const float* k, const float* v,
                            std::uint32_t n_heads, std::uint32_t T, std::uint32_t d_head,
                            float* out);
 
+// Decode-вариант (round 2, интеграция engine): ОДНА query-строка (текущий
+// токен decode-шага) против кеша K/V длины T. Это операторная форма, в которой
+// decode-шаг обращается к полной истории (ADR-04 KV-кеш) без пере-вычисления
+// Q прошлых позиций:
+//   q        — [n_heads][d_head]           (текущий токен, после проекции Wq);
+//   k, v     — [n_kv_heads][T][d_head]     (кеш; GQA — n_heads % n_kv_heads == 0);
+//   out      — [n_heads][d_head]           (строка текущего токена).
+// Соответствие голов (GQA): голова h использует kv-голову h / (n_heads/n_kv_heads).
+// Раскладка и масштаб идентичны attention_forward_f32 (FP32 QK/PV, scale 1/sqrt(d)).
+void attention_decode_f32(const float* q, const float* k, const float* v,
+                          std::uint32_t n_heads, std::uint32_t n_kv_heads,
+                          std::uint32_t T, std::uint32_t d_head,
+                          float* out);
+
 } // namespace stell::kernels

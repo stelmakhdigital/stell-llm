@@ -138,4 +138,40 @@ void dequant_w4a16(const std::uint8_t* packed, const std::uint16_t* scales_f16,
     }
 }
 
+// --- block32 (единая раскладка с лоадером models, ADR-03) --------------------
+void dequant_nvfp4_block32(const std::uint8_t* payload, std::size_t n, float* out) {
+    const std::size_t n_blocks = (n + 31) / 32;
+    const std::uint8_t* nibbles = payload;                 // ceil(n/2) байт
+    const std::uint8_t* scales = payload + (n + 1) / 2;    // n_blocks байт E4M3
+    for (std::size_t blk = 0; blk < n_blocks; ++blk) {
+        const std::size_t begin = blk * 32;
+        const std::size_t end = std::min(n, begin + std::size_t{32});
+        const float scale = e4m3_value(scales[blk]);
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::uint8_t byte = nibbles[i / 2];
+            const std::uint8_t nib =
+                static_cast<std::uint8_t>((i % 2 == 0) ? (byte & 0x0F) : (byte >> 4));
+            out[i] = e2m1_value(nib) * scale;
+        }
+    }
+}
+
+void dequant_w4a16_block32(const std::uint8_t* payload, std::size_t n, float* out) {
+    const std::size_t n_blocks = (n + 31) / 32;
+    const std::uint8_t* nibbles = payload;                 // ceil(n/2) байт
+    const std::uint16_t* scales =
+        reinterpret_cast<const std::uint16_t*>(payload + (n + 1) / 2); // 2*n_blocks байт F16
+    for (std::size_t blk = 0; blk < n_blocks; ++blk) {
+        const std::size_t begin = blk * 32;
+        const std::size_t end = std::min(n, begin + std::size_t{32});
+        const std::uint16_t hb = static_cast<std::uint16_t>(scales[blk]);   // LE
+        const float scale = half_to_float(hb);
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::uint8_t byte = nibbles[i / 2];
+            const int nib = static_cast<int>((i % 2 == 0) ? (byte & 0x0F) : (byte >> 4));
+            out[i] = (static_cast<float>(nib) - 8.0f) * scale;
+        }
+    }
+}
+
 } // namespace stell::kernels

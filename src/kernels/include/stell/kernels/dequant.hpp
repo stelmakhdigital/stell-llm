@@ -36,6 +36,17 @@ void dequant_nvfp4(const std::uint8_t* packed, const std::uint8_t* scales,
 void dequant_w4a16(const std::uint8_t* packed, const std::uint16_t* scales_f16,
                    std::size_t n, std::uint32_t group_size, float* out);
 
+// --- Block32-раскладка (round 2, интеграция engine ↔ models) -----------------
+// Единая упаковка лоадера NVFP4W4A16 / конвертера stell-tier (ADR-03/ADR-12):
+// блок = 32 элемента, один payload-буфер: [ceil(n/2) байт нибблов]
+// [n_blocks байт scale]. Деquant выполняется ядрами engine/kernels (ADR-09 §3);
+// функции dequant_nvfp4/dequant_w4a16 выше — раскладка групп по 16 (replay-
+// фикстура), не совместимая с лоадером — потому отдельные block32-варианты.
+//   NVFP4: value = e2m1(nibble) * e4m3(scale)               (младший nibble — чётный элемент)
+//   W4A16: value = (int4(nibble) - 8) * f16(scale)          (two's complement: nibble = q + 8)
+void dequant_nvfp4_block32(const std::uint8_t* payload, std::size_t n, float* out);
+void dequant_w4a16_block32(const std::uint8_t* payload, std::size_t n, float* out);
+
 // IEEE half → float (для scale F16; без libdevice/F16-хардваря CPU-путь).
 float half_to_float(std::uint16_t h);
 
