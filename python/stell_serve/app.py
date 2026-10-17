@@ -42,7 +42,18 @@ except Exception:  # pragma: no cover
 
 
 def default_engine_cfg(model: str = "mock-model") -> Dict[str, Any]:
-    return {"model": model, "mock": {"ttft_ms": 1.0, "tpot_ms": 14.0}}
+    """cfg_json для stell_engine_create (ADR-11 §1).
+
+    Реальный движок читает runner/engine/parallel-блоки; mock — блок mock
+    (неизвестные ключи игнорируются обеими сторонами — ABI-совместимо).
+    """
+    return {
+        "model": model,
+        "mock": {"ttft_ms": 1.0, "tpot_ms": 14.0},
+        "runner": "demo",
+        "engine": {"max_slots": 16, "batch_step_max": 16},
+        "parallel": {"tp": 1, "pp": 1, "ep": 1},
+    }
 
 
 # ----------------------------- pydantic-модели -----------------------------
@@ -155,14 +166,25 @@ def build_engine_request(
     }
 
 
+MAX_POLL_ROUNDS = 1024  # жёсткий кап итераций poll-цикла (защита от зависания)
+
+
 def drain_events(backend: EngineBackend, session_id: int) -> List[Dict[str, Any]]:
-    """Выкачивает все события сессии до закрытия (ADR-11 §3: poll → 0/-1)."""
+    """Выкачивает все события сессии до закрытия (ADR-11 §3: poll → 0/-1).
+
+    Реальный движок шаги декода ведёт вызовами stell_step (однопоточный
+    CPU-контур, ADR-11 «Уточнение»): при пустом poll делаем backend.step(),
+    пока не придёт событие/finish. Для mock step() — no-op.
+    """
     events: List[Dict[str, Any]] = []
     empty_streak = 0
-    while empty_streak < 32:
+    rounds = 0
+    while empty_streak < 32 and rounds < MAX_POLL_ROUNDS:
+        rounds += 1
         chunk = backend.poll(session_id)
         if not chunk:
             empty_streak += 1
+            backend.step()  # no-op для mock; двигает scheduler реального движка
             continue
         empty_streak = 0
         events.extend(chunk)
@@ -322,12 +344,15 @@ def create_app(
             finish_reason = "stop"
             usage = {"prompt_tokens": 0, "completion_tokens": 0}
             first = True
+            rounds = 0
             try:
                 empty_streak = 0
-                while empty_streak < 32:
+                while empty_streak < 32 and rounds < MAX_POLL_ROUNDS:
+                    rounds += 1
                     chunk_events = app.state.engine.poll(sid)
                     if not chunk_events:
                         empty_streak += 1
+                        app.state.engine.step()  # real: движок шага (см. drain_events)
                         continue
                     empty_streak = 0
                     for ev in chunk_events:
@@ -527,11 +552,14 @@ def create_app(
             usage = {"prompt_tokens": 0, "completion_tokens": 0}
             stop_reason = "end_turn"
             empty_streak = 0
+            rounds = 0
             try:
-                while empty_streak < 32:
+                while empty_streak < 32 and rounds < MAX_POLL_ROUNDS:
+                    rounds += 1
                     chunk_events = app.state.engine.poll(sid)
                     if not chunk_events:
                         empty_streak += 1
+                        app.state.engine.step()  # real: движок шага (см. drain_events)
                         continue
                     empty_streak = 0
                     for ev in chunk_events:

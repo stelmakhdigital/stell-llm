@@ -343,6 +343,7 @@ struct stell_engine {
     char tool_args[1024];
     int fail_create;
     int fail_submit;
+    int cancelled_total;      /* расширение метрик (additive-поле, ADR-11 §1: поля только добавляются) */
 };
 
 static void copy_str(char *dst, size_t cap, const char *src) {
@@ -540,6 +541,7 @@ int stell_cancel(stell_engine_t *e, uint64_t session_id) {
     mock_session *s = session_find(eng, session_id);
     if (!s || s->phase == 2) return -1;
     s->cancelled = 1;
+    eng->cancelled_total++;
     return 0;
 }
 
@@ -550,7 +552,7 @@ int stell_metrics(stell_engine_t *e, char **out_json) {
     int active = sessions_active(eng);
     double decode_tok_s = eng->tpot_ms > 0 ? 1000.0 / eng->tpot_ms : 0.0;
     sb_printf(&b,
-        "{\"engine\":{\"state\":\"serving\",\"sessions_active\":%d,"
+        "{\"engine\":{\"state\":\"serving\",\"cancelled_total\":%d,\"sessions_active\":%d,"
         "\"slots_busy\":%d,\"slots_total\":%d,\"batch_size_max\":%d},"
         "\"latency\":{\"ttft_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f},"
         "\"tpot_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f},"
@@ -562,7 +564,7 @@ int stell_metrics(stell_engine_t *e, char **out_json) {
         "\"features\":{\"spec_draft\":false,\"kv_quant\":\"F16\"},"
         "\"build\":{\"version\":\"%s\",\"cuda\":\"none (CPU mock)\",\"sm\":\"cpu\"},"
         "\"model\":\"%s\"}",
-        active, active, eng->slots_total, eng->slots_total,
+        eng->cancelled_total, active, active, eng->slots_total, eng->slots_total,
         eng->ttft_ms, eng->ttft_ms * 1.3, eng->ttft_ms * 1.6,
         eng->tpot_ms, eng->tpot_ms * 1.3, eng->tpot_ms * 1.6,
         decode_tok_s, eng->prefill_tok_s,

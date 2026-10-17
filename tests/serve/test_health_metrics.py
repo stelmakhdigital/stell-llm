@@ -40,6 +40,18 @@ def test_metrics_passthrough_and_serve(client):
     assert "version" in snap["build"]
 
 
+def test_cancelled_total_serve_and_engine(client, app):
+    # уточнение ADR-11 round 2: факт отмены — в /metrics (не в семантике
+    # finish_reason); счётчики: serve.cancelled_total + engine passthrough
+    # (additive-поле mock-движка)
+    sid = app.state.engine.submit({"session": {"max_tokens": 10},
+                                   "messages": [], "stream": False})
+    assert client.post(f"/v1/chat/completions/cancel/{sid}").status_code == 200
+    snap = client.get("/metrics").json()
+    assert snap["serve"]["cancelled_total"] == 1
+    assert snap["engine"]["cancelled_total"] == 1
+
+
 def test_metrics_before_requests(client):
     snap = client.get("/metrics").json()
     assert snap["serve"]["requests_total"] == 0
