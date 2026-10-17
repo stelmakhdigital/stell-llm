@@ -33,7 +33,15 @@ add_library(stell_core_serve_check SHARED
     ../engine/src/execution_plan.cpp
     ../engine/src/speculative.cpp
     ../engine/src/json.cpp)
-target_include_directories(stell_core_serve_check PRIVATE ../engine/include)
+# Интеграционный фикс (worker, раунд 2): engine с вклейкой реальных модулей
+# включает заголовки stell/tiers, stell/models, stell/parallel, stell/kernels —
+# ABI-копии нужны их include-пути.
+target_include_directories(stell_core_serve_check PRIVATE
+    ../engine/include
+    ../tiers/include
+    ../models/include
+    ../parallel/include
+    ../kernels/include)
 set_target_properties(stell_core_serve_check PROPERTIES
     OUTPUT_NAME "stell_core_serve"
     CXX_STANDARD 20
