@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>stell-llm — дашборд-монитор</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>stell-llm дашборд</h1>
+    <div id="status">загрузка…</div>
+  </header>
+
+  <main>
+    <section id="vram">
+      <h2>VRAM-карта (tier-байты)</h2>
+      <div id="tier-map" class="bars"></div>
+      <div id="tier-legend" class="legend"></div>
+    </section>
+
+    <section id="engine">
+      <h2>Движок</h2>
+      <div id="engine-cards" class="cards"></div>
+      <h3>Латентность (engine)</h3>
+      <div id="latency-table"></div>
+    </section>
+
+    <section id="tiers">
+      <h2>Tier-статистика</h2>
+      <div id="prefetch"></div>
+      <div id="pauses"></div>
+    </section>
+
+    <section id="sessions">
+      <h2>Сессии / слоты</h2>
+      <div id="slots"></div>
+    </section>
+
+    <section id="features">
+      <h2>Фичи / сборка</h2>
+      <div id="features-cards" class="cards"></div>
+    </section>
+
+    <section id="logs">
+      <h2>Логи serve</h2>
+      <pre id="log-view"></pre>
+    </section>
+  </main>
+
+  <footer>
+    <span id="updated"></span>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>

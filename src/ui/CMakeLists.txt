@@ -1,1 +1,3 @@
-# ui: наполнение в ветке agent/<role>/1 (см. docs/design/ui.md)
+# ui: дашборд-монитор — статика без сборочных зависимостей
+# (index.html + app.js + style.css), отдаётся control-plane на /ui.
+# См. docs/design/serve.md и ADR-11 §4 (источник данных — /metrics).
