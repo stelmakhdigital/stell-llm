@@ -1,20 +1,91 @@
 # engine: планировщик continuous batching, пулы слотов, CUDA Graph + eager-фолббек,
-# спекулятивный контур, KV-streaming (поток A — core; контракты ADR-08/09/10/11)
-add_library(stell_engine STATIC
+# спекулятивный контур, KV-streaming, CPU-исполнение модели (round 2, интеграция
+# A×D), C ABI (libstell_core.so — ADR-11 §1); контракты ADR-08/09/10/11
+#
+# Round 2: зависимости C++ — stell_tiers (ADR-08, реальный TierManager),
+# stell_models (ADR-09/03/12, лоадеры/реестр — через TU-мост model_spec_bridge),
+# stell_parallel (ADR-10, CPU-эмулятор), stell_kernels (CPU-референс attention/
+# MoE/dequant).
+set(STELL_ENGINE_SOURCES
     src/scheduler.cpp
     src/execution_plan.cpp
     src/speculative.cpp
     src/json.cpp
+    src/tokenizer.cpp
+    src/ops_runner.cpp
+    src/model_spec_bridge.cpp
     src/capi.cpp
 )
+
+find_package(Threads REQUIRED)   # parallel: pthread (CPU-эмулятор, ADR-10 §4)
+
+add_library(stell_engine STATIC ${STELL_ENGINE_SOURCES})
 target_include_directories(stell_engine PUBLIC include)
+target_link_libraries(stell_engine
+    PUBLIC stell_tiers stell_models stell_parallel stell_kernels)
 target_compile_options(stell_engine PRIVATE -Wall -Wextra)
+
+# --- C ABI для serve (ADR-11 §1): libstell_core.so через dlopen ---------------
+# Символы экспортированы целиком (visibility default); smoke-тест dlopen —
+# tests/core/engine/test_capi_dlopen.cpp.
+#
+# Зависимости (stell_tiers/models/parallel/kernels — статические, round 1,
+# потоки B/C/D) собраны БЕЗ -fPIC и их CMakeLists менять запрещено правилами
+# раунда — поэтому dep-исходники включены в SHARED-таргет как собственные
+# исходники с их include-каталогами (честно: дублирует компиляцию dep-модулей
+# в .so, не трогая чужие цели).
+add_library(stell_core SHARED
+    ${STELL_ENGINE_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/kernels/src/attention.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernels/src/moe_gather_scatter.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernels/src/dequant.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernels/src/kv_quant.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernels/src/draft.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/io_uring.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/nvme_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/tiers/src/predictor.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/json.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/description.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/crc32.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/quant.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/stelltier_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/loader_safetensors.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/loader_gguf.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/loader_quant.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/loader_stelltier.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/weights_factory.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/src/converter.cpp
+    ${CMAKE_SOURCE_DIR}/src/parallel/src/comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/parallel/src/emulated_communicator.cpp
+    ${CMAKE_SOURCE_DIR}/src/parallel/src/plan.cpp
+)
+target_include_directories(stell_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/kernels/include
+    ${CMAKE_SOURCE_DIR}/src/tiers/include
+    ${CMAKE_SOURCE_DIR}/src/tiers/src
+    ${CMAKE_SOURCE_DIR}/src/models/include
+    ${CMAKE_SOURCE_DIR}/src/models/src
+    ${CMAKE_SOURCE_DIR}/src/parallel/include)
+target_compile_definitions(stell_core PRIVATE
+    STELL_REGISTRY_DIR="${CMAKE_SOURCE_DIR}/src/models/registry")
+target_link_libraries(stell_core PUBLIC Threads::Threads)
+target_compile_options(stell_core PRIVATE -Wall -Wextra)
+if(STELL_CUDA)
+    target_compile_definitions(stell_core PRIVATE STELL_CUDA=1)
+endif()
 
 if(STELL_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 70)   # Tesla V100 (SM70, SXM2)
     target_sources(stell_engine PRIVATE cuda/graph_executor.cu)
+    target_sources(stell_core PRIVATE cuda/graph_executor.cu)
     target_compile_definitions(stell_engine PUBLIC STELL_CUDA=1)
+    target_compile_definitions(stell_core PUBLIC STELL_CUDA=1)
 endif()
 
 # --- юнит-тесты планировщика/пулов/планов (tests/core/engine) ----------------
@@ -72,4 +143,71 @@ add_executable(test_engine_capi
 )
 target_link_libraries(test_engine_capi stell_engine)
 target_include_directories(test_engine_capi PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_capi PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/capi COMMAND test_engine_capi)
+
+# --- round 2: интеграционные тесты срезов 1 (CPU-вариант) --------------------
+# Фикстуры моделей (поток D, tests/models/fixtures) и golden-каталог —
+# read-only использование чужих каталогов; путь задаётся компайл-тайм.
+
+add_executable(test_engine_ops_dense
+    ../../tests/core/engine/test_ops_dense.cpp
+)
+target_link_libraries(test_engine_ops_dense stell_engine)
+target_include_directories(test_engine_ops_dense PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_dense PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_dense COMMAND test_engine_ops_dense)
+
+add_executable(test_engine_ops_moe
+    ../../tests/core/engine/test_ops_moe.cpp
+)
+target_link_libraries(test_engine_ops_moe stell_engine)
+target_include_directories(test_engine_ops_moe PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_moe PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_moe COMMAND test_engine_ops_moe)
+
+add_executable(test_engine_golden
+    ../../tests/core/engine/test_golden.cpp
+)
+target_link_libraries(test_engine_golden stell_engine)
+target_include_directories(test_engine_golden PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_golden PRIVATE
+    STELL_GOLDEN_FIXTURE="${CMAKE_SOURCE_DIR}/tests/models/golden"
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/golden COMMAND test_engine_golden)
+
+add_executable(test_engine_tier_integration
+    ../../tests/core/engine/test_tier_integration.cpp
+)
+target_link_libraries(test_engine_tier_integration stell_engine)
+target_include_directories(test_engine_tier_integration PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_tier_integration PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/tier_integration COMMAND test_engine_tier_integration)
+
+add_executable(test_engine_parallel_integration
+    ../../tests/core/engine/test_parallel_integration.cpp
+)
+target_link_libraries(test_engine_parallel_integration stell_engine)
+target_include_directories(test_engine_parallel_integration PRIVATE ../../tests/core)
+add_test(NAME engine/parallel_integration COMMAND test_engine_parallel_integration)
+
+add_executable(test_engine_tokenizer
+    ../../tests/core/engine/test_tokenizer.cpp
+)
+target_link_libraries(test_engine_tokenizer stell_engine)
+target_include_directories(test_engine_tokenizer PRIVATE ../../tests/core)
+add_test(NAME engine/tokenizer COMMAND test_engine_tokenizer)
+
+add_executable(test_engine_capi_dlopen
+    ../../tests/core/engine/test_capi_dlopen.cpp
+)
+# Только dlopen: stell_engine НЕ линкуется (проверяется именно загрузка .so).
+target_compile_definitions(test_engine_capi_dlopen PRIVATE
+    STELL_CORE_LIB="$<TARGET_FILE:stell_core>")
+target_link_libraries(test_engine_capi_dlopen ${CMAKE_DL_LIBS})
+target_include_directories(test_engine_capi_dlopen PRIVATE ../../tests/core)
+add_test(NAME engine/capi_dlopen COMMAND test_engine_capi_dlopen)
