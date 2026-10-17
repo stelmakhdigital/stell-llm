@@ -9,6 +9,7 @@ add_executable(test_parallel
     test_ep_registry_glm.cpp
     test_stress_multi_rank.cpp
     test_meta_broadcast.cpp
+    test_golden_real_models.cpp
 )
 
 target_include_directories(test_parallel PRIVATE
@@ -16,8 +17,12 @@ target_include_directories(test_parallel PRIVATE
     # Реестр архитектур (glm-class) — src/models (заголовки + quant.hpp).
     ${CMAKE_SOURCE_DIR}/src/models/include
     ${CMAKE_SOURCE_DIR}/src/models/src
+    # CPU-референсы kernels (attention, MoE gather/scatter).
+    ${CMAKE_SOURCE_DIR}/src/kernels/include
+    # Писатели синтетических safetensors/GGUF (tests/models).
+    ${CMAKE_SOURCE_DIR}/tests/models
 )
-target_link_libraries(test_parallel PRIVATE stell::parallel stell_models)
+target_link_libraries(test_parallel PRIVATE stell::parallel stell_models stell_kernels)
 target_compile_definitions(test_parallel PRIVATE
     STELL_PARALLEL_REGISTRY_DIR="${CMAKE_SOURCE_DIR}/src/models/registry"
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures"
