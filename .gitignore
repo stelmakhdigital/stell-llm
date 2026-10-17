@@ -1,0 +1,23 @@
+# Служебные файлы конвейера агентов
+task.md
+worker_roles.md
+worker_prompt_addition.md
+memory*
+agents*.log
+.agent/
+
+# Сборка
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Временные артефакты агентов
+/scratch/
+*.swp
