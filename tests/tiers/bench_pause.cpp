@@ -55,7 +55,7 @@ void build_layout(const std::string& path, int groups, std::size_t slot) {
 int main(int argc, char** argv) {
     if (argc < 6) {
         std::fprintf(stderr,
-                     "usage: %s <layout.stelltier> <groups> <slot_bytes> <layers> <passes>\n",
+                     "usage: %s <layout.stelltier> <groups> <slot_bytes> <layers> <passes> [prefetch|cold]\n",
                      argv[0]);
         return 2;
     }
@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
     const std::size_t slot = std::strtoull(argv[3], nullptr, 10);
     const int layers = std::atoi(argv[4]);
     const int passes = std::atoi(argv[5]);
+    const std::string mode = argc > 6 ? argv[6] : "prefetch";
     if (groups <= 0 || layers <= 0 || layers * 2 != groups || slot % 4096 != 0 ||
         passes <= 0) {
         std::fprintf(stderr, "bench: groups==2*layers, slot кратно 4096\n");
@@ -107,7 +108,9 @@ int main(int argc, char** argv) {
     for (int p = 0; p < passes; ++p) {
         for (int l = 0; l < layers; ++l) {
             // router-lookahead: prefetch следующего слоя ДО паузы слоя.
-            if (l + 1 < layers) {
+            // (mode cold — без prefetch: честная пауза холодной загрузки
+            // слоя NVMe→RAM→VRAM, когда lookahead не угадал.)
+            if (mode == "prefetch" && l + 1 < layers) {
                 std::vector<GroupKey> keys;
                 for (GroupId gid : layers_map[unsigned(l + 1)])
                     keys.push_back(GroupKey{gid, plan[(size_t)gid.value].role});
@@ -125,10 +128,11 @@ int main(int argc, char** argv) {
     const TierStats st = mgr.stats();
     const double io_gb = double(st.io_bytes) / double(1 << 30);
     std::printf(
-        "bench_pause: backend=%s path=%s groups=%d slot=%zu layers=%d passes=%d\n"
+        "bench_pause: backend=%s path=%s groups=%d slot=%zu layers=%d passes=%d mode=%s\n"
         "  pause p50=%.3f ms p95=%.3f ms p99=%.3f ms (цель PLAN.md §4: p95 ≤ 5 мс)\n"
         "  io_bytes=%llu (%.2f GiB) io_ops=%llu throughput=%.2f GiB/s total=%.0f ms\n",
         nvme_io_backend().c_str(), path.c_str(), groups, slot, layers, passes,
+        mode.c_str(),
         st.layer_pause.p50_ms, st.layer_pause.p95_ms, st.layer_pause.p99_ms,
         (unsigned long long)st.io_bytes, io_gb, (unsigned long long)st.io_ops,
         io_gb / (total_ms / 1000.0), total_ms);
