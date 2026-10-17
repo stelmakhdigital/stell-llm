@@ -1,0 +1,51 @@
+# ============================================================================
+# tests/models — юнит-тесты модуля models (Поток D, ADR-09/03/12).
+# Синтетические входные файлы (safetensors/GGUF) генерируются самими тестами;
+# golden-тест логитов — каркас (см. golden/README.md), фикстуры pending.
+# ============================================================================
+
+# Внутренние заголовки модуля (quant.hpp, tensor_file_formats.hpp) и каркасы тестов.
+set(_models_src_dir ${CMAKE_SOURCE_DIR}/src/models/src)
+
+add_executable(test_models_json test_json.cpp)
+add_executable(test_models_description test_description.cpp)
+add_executable(test_models_registry test_registry.cpp)
+add_executable(test_models_weights_safetensors test_weights_safetensors.cpp)
+add_executable(test_models_weights_gguf test_weights_gguf.cpp)
+add_executable(test_models_weights_quant test_weights_quant.cpp)
+add_executable(test_models_convert_stelltier test_convert.cpp)
+add_executable(test_models_golden_logits golden/golden_logits.cpp)
+
+foreach(t
+    test_models_json
+    test_models_description
+    test_models_registry
+    test_models_weights_safetensors
+    test_models_weights_gguf
+    test_models_weights_quant
+    test_models_convert_stelltier
+    test_models_golden_logits)
+    target_include_directories(${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/models/include
+        ${_models_src_dir}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/golden
+    )
+    target_link_libraries(${t} PRIVATE stell_models)
+    target_compile_definitions(${t} PRIVATE
+        STELL_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+        STELL_GOLDEN_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/golden"
+    )
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${t} PRIVATE -Wall -Wextra)
+    endif()
+endforeach()
+
+add_test(NAME models_json COMMAND test_models_json)
+add_test(NAME models_description COMMAND test_models_description)
+add_test(NAME models_registry COMMAND test_models_registry)
+add_test(NAME models_weights_safetensors COMMAND test_models_weights_safetensors)
+add_test(NAME models_weights_gguf COMMAND test_models_weights_gguf)
+add_test(NAME models_weights_quant COMMAND test_models_weights_quant)
+add_test(NAME models_convert_stelltier COMMAND test_models_convert_stelltier)
+add_test(NAME models_golden_logits COMMAND test_models_golden_logits)

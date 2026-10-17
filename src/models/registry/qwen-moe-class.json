@@ -1,0 +1,137 @@
+{
+  "schema": "1.0",
+  "name": "qwen-moe-class",
+  "class": "moe",
+  "dtype_weights": "W4A16",
+  "vocab_size": 151936,
+  "d_model": 2048,
+  "n_layers": 48,
+  "n_heads": 32,
+  "d_head": 64,
+  "kv": {
+    "dtype": "F16",
+    "n_kv_heads": 4,
+    "d_kv": 64,
+    "quant": null
+  },
+  "moe": {
+    "n_experts": 128,
+    "n_experts_active": 8,
+    "expert_d_ff": 768,
+    "router": "softmax-topk"
+  },
+  "ops": [
+    {
+      "op": "rmsnorm",
+      "io": ["hidden"],
+      "params": { "eps": 1e-6 }
+    },
+    {
+      "op": "attention",
+      "io": ["hidden", "kv"],
+      "params": { "kernel": "sm70_fp32_qk_pv" }
+    },
+    {
+      "op": "moe_gather_scatter",
+      "io": ["hidden", "experts"],
+      "params": { "kernel": "sm70_moe_gs" }
+    }
+  ],
+  "tensor_groups": [
+    {
+      "name": "embed",
+      "role": "attn",
+      "shape": [151936, 2048],
+      "dtype": "F16",
+      "source_pattern": "embedding.weight"
+    },
+    {
+      "name": "norm_final",
+      "role": "attn",
+      "shape": [2048],
+      "dtype": "F32",
+      "source_pattern": "model.norm.weight"
+    },
+    {
+      "name": "l{layer}.attn.norm",
+      "role": "attn",
+      "shape": [2048],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.input_layernorm.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.attn.wq",
+      "role": "attn",
+      "shape": [2048, 2048],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.self_attn.q_proj.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.attn.wk",
+      "role": "attn",
+      "shape": [256, 2048],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.self_attn.k_proj.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.attn.wv",
+      "role": "attn",
+      "shape": [256, 2048],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.self_attn.v_proj.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.attn.wo",
+      "role": "attn",
+      "shape": [2048, 2048],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.self_attn.o_proj.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.kv",
+      "role": "kv",
+      "shape": [256, 2048],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.kv_cache",
+      "kv_block": true,
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.mlp.norm",
+      "role": "attn",
+      "shape": [2048],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.mlp.norm.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.mlp.router",
+      "role": "expert",
+      "shape": [128],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.mlp.router.weight",
+      "cardinality": { "layer": 48 }
+    },
+    {
+      "name": "l{layer}.e{expert}.up",
+      "role": "expert",
+      "shape": [768, 2048],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.mlp.experts.{expert}.up.weight",
+      "cardinality": { "layer": 48, "expert": 128 }
+    },
+    {
+      "name": "l{layer}.e{expert}.down",
+      "role": "expert",
+      "shape": [2048, 768],
+      "dtype": "W4A16",
+      "source_pattern": "layers.{layer}.mlp.experts.{expert}.down.weight",
+      "cardinality": { "layer": 48, "expert": 128 }
+    }
+  ]
+}

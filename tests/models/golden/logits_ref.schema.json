@@ -1,0 +1,17 @@
+{
+  "schema": "Схема фикстуры golden-теста логитов (ADR-09 §4). Описание полей — tests/models/golden/README.md.",
+  "required": {
+    "schema": "string, '1.0'",
+    "model": "string, имя архитектуры реестра (Registry::available())",
+    "profile": "string enum: F16 | NVFP4 | W4A16 (ADR-03)",
+    "path": "string enum: loader | stelltier | tiering_nvme_miss (ADR-09 §4)",
+    "prompt_tokens": "array of non-negative int",
+    "seed": "uint, 0 (bench-контракт PLAN.md §5)",
+    "greedy": "bool, true (T=1)",
+    "tolerance_rel": "double, порог rel-ошибки по элементу",
+    "logits_ref": "array of number, эталон HF последнего слоя"
+  },
+  "optional": {
+    "logits_tested": "array of number, прогоны stell-llm; без поля тест = SKIP"
+  }
+}
