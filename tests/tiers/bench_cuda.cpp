@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -38,8 +39,6 @@ int main() {
             std::printf("SKIP: cudaMemGetInfo failed\n");
             return 0;
         }
-        free_b = f;
-        total_b = t;
         std::printf("VRAM до бенча: свободно %.1f MiB / %.1f MiB (co-tenancy: см. отчёт)\n",
                     double(f) / double(1 << 20), double(t) / double(1 << 20));
         if (f < (std::size_t(256) << 20)) {
