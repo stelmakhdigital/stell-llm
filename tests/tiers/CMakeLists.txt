@@ -49,6 +49,9 @@ endforeach()
 # GPU-smoke DMA-копирований (cudaMemcpyAsync H↔D, pinned→device) — только
 # при STELL_CUDA; честный отчёт co-tenancy (свободная VRAM) — см. bench.
 if(STELL_CUDA)
+  # CUDA::cudart — directory-scoped imported target; find_package в этой
+  # директории (наследование из src/tiers не видно — sibling subdirectory).
+  find_package(CUDAToolkit REQUIRED)
   add_executable(bench_tiers_cuda bench_cuda.cpp)
-  target_link_libraries(bench_tiers_cuda PRIVATE stell_tiers CUDA::cudart)
+  target_link_libraries(bench_tiers_cuda PRIVATE CUDA::cudart)
 endif()
