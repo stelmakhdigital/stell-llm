@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -34,9 +35,10 @@ struct Registrar {
     }
 };
 
-inline void run_all(const char* suite) {
-    std::printf("[%s]\n", suite);
+inline void run_all(const char* suite, const char* filter = nullptr) {
+    std::printf("[%s]%s\n", suite, filter ? " (фильтр)" : "");
     for (const auto& c : registry()) {
+        if (filter && std::strstr(c.name, filter) == nullptr) continue;
         const int before = failures();
         try {
             c.fn();
