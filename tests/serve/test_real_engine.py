@@ -222,3 +222,16 @@ def test_api_cancelled_total_real_engine(real_app):
 
 def test_decimal_detokenizer_is_deterministic():
     assert [decimal_detokenizer(i) for i in range(4)] == ["0", "1", "2", "3"]
+
+
+def test_dashboard_serves_on_real_engine(real_client):
+    """Дашборд соответствует /metrics реального движка (снапшот round 2):
+    у реального движка нет tiers/latency — app.js рендерит через optional
+    chaining (tiers?.tier_bytes), /metrics честно отдаёт только engine+serve."""
+    resp = real_client.get("/ui/index.html")
+    assert resp.status_code == 200 and "stell-llm" in resp.text
+    app_js = real_client.get("/ui/app.js")
+    assert app_js.status_code == 200
+    assert "/metrics" in app_js.text
+    assert "tiers?.tier_bytes" in app_js.text          # отсутствие tiers не роняет UI
+    assert real_client.get("/ui/style.css").status_code == 200

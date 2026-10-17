@@ -8,6 +8,8 @@
 from .config import CalibrationConfig
 from .harness import CalibrationHarness, timed_call
 from .policy import CalibrationDecision, decide
+from .runner import CalibrationRun, decode_run, measure_tok_s, run_calibration
 
 __all__ = ["CalibrationConfig", "CalibrationDecision", "decide",
-           "CalibrationHarness", "timed_call"]
+           "CalibrationHarness", "timed_call", "CalibrationRun",
+           "decode_run", "measure_tok_s", "run_calibration"]
