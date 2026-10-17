@@ -1,0 +1,117 @@
+{
+  "schema": "1.0",
+  "name": "mini-moe-test",
+  "class": "moe",
+  "dtype_weights": "NVFP4",
+  "vocab_size": 16,
+  "d_model": 8,
+  "n_layers": 2,
+  "n_heads": 2,
+  "d_head": 4,
+  "kv": {
+    "dtype": "F16",
+    "n_kv_heads": 1,
+    "d_kv": 4,
+    "quant": null
+  },
+  "moe": {
+    "n_experts": 4,
+    "n_experts_active": 2,
+    "expert_d_ff": 8,
+    "router": "softmax-topk"
+  },
+  "ops": [
+    { "op": "rmsnorm", "io": ["hidden"], "params": { "eps": 1e-5 } },
+    { "op": "attention", "io": ["hidden", "kv"], "params": { "kernel": "sm70_fp32_qk_pv" } },
+    { "op": "moe_gather_scatter", "io": ["hidden", "experts"], "params": { "kernel": "sm70_moe_gs" } }
+  ],
+  "tensor_groups": [
+    {
+      "name": "embed",
+      "role": "attn",
+      "shape": [16, 8],
+      "dtype": "F16",
+      "source_pattern": "embedding.weight"
+    },
+    {
+      "name": "norm_final",
+      "role": "attn",
+      "shape": [8],
+      "dtype": "F32",
+      "source_pattern": "model.norm.weight"
+    },
+    {
+      "name": "l{layer}.attn.norm",
+      "role": "attn",
+      "shape": [8],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.input_layernorm.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wq",
+      "role": "attn",
+      "shape": [8, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.self_attn.q_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wk",
+      "role": "attn",
+      "shape": [4, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.self_attn.k_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wv",
+      "role": "attn",
+      "shape": [4, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.self_attn.v_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wo",
+      "role": "attn",
+      "shape": [8, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.self_attn.o_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.kv",
+      "role": "kv",
+      "shape": [4, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.kv_cache",
+      "kv_block": true,
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.mlp.router",
+      "role": "expert",
+      "shape": [4],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.mlp.router.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.e{expert}.up",
+      "role": "expert",
+      "shape": [8, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.mlp.experts.{expert}.up.weight",
+      "cardinality": { "layer": 2, "expert": 4 }
+    },
+    {
+      "name": "l{layer}.e{expert}.down",
+      "role": "expert",
+      "shape": [8, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.mlp.experts.{expert}.down.weight",
+      "cardinality": { "layer": 2, "expert": 4 }
+    }
+  ]
+}

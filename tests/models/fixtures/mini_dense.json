@@ -1,0 +1,110 @@
+{
+  "schema": "1.0",
+  "name": "mini-dense-test",
+  "class": "dense",
+  "dtype_weights": "F16",
+  "vocab_size": 16,
+  "d_model": 8,
+  "n_layers": 2,
+  "n_heads": 2,
+  "d_head": 4,
+  "kv": {
+    "dtype": "F16",
+    "n_kv_heads": 1,
+    "d_kv": 4,
+    "quant": null
+  },
+  "ops": [
+    { "op": "rmsnorm", "io": ["hidden"], "params": { "eps": 1e-5 } },
+    { "op": "attention", "io": ["hidden", "kv"], "params": { "kernel": "sm70_fp32_qk_pv" } },
+    { "op": "ffn", "io": ["hidden"], "params": { "activation": "silu_mul" } }
+  ],
+  "tensor_groups": [
+    {
+      "name": "embed",
+      "role": "attn",
+      "shape": [16, 8],
+      "dtype": "F16",
+      "source_pattern": "embedding.weight"
+    },
+    {
+      "name": "norm_final",
+      "role": "attn",
+      "shape": [8],
+      "dtype": "F32",
+      "source_pattern": "model.norm.weight"
+    },
+    {
+      "name": "head",
+      "role": "attn",
+      "shape": [16, 8],
+      "dtype": "F16",
+      "source_pattern": "head.weight"
+    },
+    {
+      "name": "l{layer}.attn.norm",
+      "role": "attn",
+      "shape": [8],
+      "dtype": "F32",
+      "source_pattern": "layers.{layer}.input_layernorm.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wq",
+      "role": "attn",
+      "shape": [8, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.self_attn.q_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wk",
+      "role": "attn",
+      "shape": [4, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.self_attn.k_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wv",
+      "role": "attn",
+      "shape": [4, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.self_attn.v_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.attn.wo",
+      "role": "attn",
+      "shape": [8, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.self_attn.o_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.ffn.up",
+      "role": "attn",
+      "shape": [16, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.mlp.up_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.ffn.down",
+      "role": "attn",
+      "shape": [8, 16],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.mlp.down_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.kv",
+      "role": "kv",
+      "shape": [4, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.kv_cache",
+      "kv_block": true,
+      "cardinality": { "layer": 2 }
+    }
+  ]
+}
