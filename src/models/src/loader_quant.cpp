@@ -38,27 +38,44 @@ protected:
     void do_fill(const stell::tiers::TensorGroup& g, const TensorInfo& t,
                  void* dst, std::size_t dst_bytes) override {
         check_shape(g, t);
-        if (g.dtype != stell::tiers::DType::NVFP4 && g.dtype != stell::tiers::DType::W4A16)
-            throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                              "nvfp4w4a16 loader: группа '" + g.name +
-                                  "' не квантованного dtype");
-        if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
-                         *t.dtype != stell::tiers::DType::F32))
-            throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                              "nvfp4w4a16 loader: источник должен быть F16/F32, получено '" +
-                                  t.dtype_str + "'");
-        const std::size_t n = numel(g.shape);
+        // Плоские группы (F16/F32) профиля — fill_plain (round 2: профильный
+        // лоадер обслуживает ОПИСАНИЕ целиком; round-1 бросал UnsupportedQuant
+        // на неквантованные группы, что не позволяло загрузить модель одним
+        // лоадером — исправлено, см. отчёт раунда).
+        if (g.dtype != stell::tiers::DType::NVFP4 &&
+            g.dtype != stell::tiers::DType::W4A16) {
+            if (!compatible_plain(g.dtype, t))
+                throw LoaderError(
+                    LoaderError::Code::UnsupportedQuant,
+                    "nvfp4w4a16 loader: группа '" + g.name + "' (dtype " +
+                        dtype_name(g.dtype) + "): источник '" + t.dtype_str +
+                        "' не совместим (плоский путь)");
+            fill_plain(g, t, dst, dst_bytes);
+            return;
+        }
+        // Источник → f32: F16/F32-тензора напрямую; GGUF Q4_0/Q8_0 — dequant
+        // (round 2: квантованные GGUF-блоки подхвачены NVFP4/W4A16-профилем).
+        std::size_t n = numel(g.shape);
         std::vector<float> src(n);
-        if (*t.dtype == stell::tiers::DType::F16) {
-            std::vector<std::uint8_t> raw(t.bytes);
-            read_tensor_payload(t, raw.data());
-            for (std::size_t i = 0; i < n; ++i) {
-                std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
-                                  (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
-                src[i] = f16_bits_to_f32(h);
-            }
+        if (is_quantized_ggml(t.dtype_str)) {
+            gguf_dequant_tensor(file(), t, src);
         } else {
-            read_tensor_payload(t, src.data());
+            if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
+                             *t.dtype != stell::tiers::DType::F32))
+                throw LoaderError(LoaderError::Code::UnsupportedQuant,
+                                  "nvfp4w4a16 loader: источник должен быть F16/F32, получено '" +
+                                      t.dtype_str + "'");
+            if (*t.dtype == stell::tiers::DType::F16) {
+                std::vector<std::uint8_t> raw(t.bytes);
+                read_tensor_payload(t, raw.data());
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
+                                      (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
+                    src[i] = f16_bits_to_f32(h);
+                }
+            } else {
+                read_tensor_payload(t, src.data());
+            }
         }
         // Квантование в payload группы; хвост слота (выравнивание) = 0.
         std::uint8_t* out = static_cast<std::uint8_t*>(dst);
@@ -80,6 +97,17 @@ private:
         if (dt == stell::tiers::DType::NVFP4) return (n + 1) / 2 + (n + 31) / 32;
         if (dt == stell::tiers::DType::W4A16) return (n + 1) / 2 + 2 * ((n + 31) / 32);
         return 0;
+    }
+
+    static const char* dtype_name(stell::tiers::DType d) {
+        switch (d) {
+            case stell::tiers::DType::F16: return "F16";
+            case stell::tiers::DType::F32: return "F32";
+            case stell::tiers::DType::E4M3: return "E4M3";
+            case stell::tiers::DType::NVFP4: return "NVFP4";
+            case stell::tiers::DType::W4A16: return "W4A16";
+        }
+        return "?";
     }
 };
 

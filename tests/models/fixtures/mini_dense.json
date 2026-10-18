@@ -82,6 +82,14 @@
       "cardinality": { "layer": 2 }
     },
     {
+      "name": "l{layer}.ffn.gate",
+      "role": "attn",
+      "shape": [16, 8],
+      "dtype": "F16",
+      "source_pattern": "layers.{layer}.mlp.gate_proj.weight",
+      "cardinality": { "layer": 2 }
+    },
+    {
       "name": "l{layer}.ffn.up",
       "role": "attn",
       "shape": [16, 8],

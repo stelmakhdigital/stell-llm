@@ -1,0 +1,41 @@
+{
+  "schema": "1.0",
+  "model": "mini-moe-test",
+  "profile": "NVFP4",
+  "path": "loader",
+  "prompt_tokens": [
+    1,
+    2,
+    3
+  ],
+  "seed": 0,
+  "greedy": true,
+  "tolerance_rel": 0.001,
+  "logits_ref": [
+    -0.3389410972595215,
+    -0.8540968894958496,
+    -1.1662803888320923,
+    0.669651985168457,
+    -0.1309518814086914,
+    -0.35584506392478943,
+    0.3840078115463257,
+    -1.8881661891937256,
+    -0.00549769401550293,
+    -0.5148564577102661,
+    0.35638248920440674,
+    1.6623072624206543,
+    -1.0125418901443481,
+    0.7505106925964355,
+    0.47351133823394775,
+    0.11711177229881287
+  ],
+  "meta": {
+    "generator": "tests/models/golden/generate_golden.py (независимый Python/torch-free интерпретатор ops-графа, numpy float32; ADR-09 §4, режим greedy)",
+    "weights": "mini_moe.safetensors (синтетические, LCG-конвенция — README)",
+    "quant_note": "NVFP4-веса = dequant(quantize(F16→f32)) по референсу src/models quant.hpp (блок 32, E2M1+E4M3), порт quant.cpp в generate_golden.py",
+    "ops_semantics": "см. tests/models/golden/README.md (контракт раунда)",
+    "greedy_token": 11,
+    "logits_min": -1.8881661891937256,
+    "logits_max": 1.6623072624206543
+  }
+}

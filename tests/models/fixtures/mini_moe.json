@@ -92,10 +92,18 @@
     {
       "name": "l{layer}.mlp.router",
       "role": "expert",
-      "shape": [4],
+      "shape": [4, 8],
       "dtype": "F32",
       "source_pattern": "layers.{layer}.mlp.router.weight",
       "cardinality": { "layer": 2 }
+    },
+    {
+      "name": "l{layer}.e{expert}.gate",
+      "role": "expert",
+      "shape": [8, 8],
+      "dtype": "NVFP4",
+      "source_pattern": "layers.{layer}.mlp.experts.{expert}.gate.weight",
+      "cardinality": { "layer": 2, "expert": 4 }
     },
     {
       "name": "l{layer}.e{expert}.up",

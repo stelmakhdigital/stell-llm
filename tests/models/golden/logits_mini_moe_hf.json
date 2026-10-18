@@ -1,0 +1,44 @@
+{
+  "schema": "1.0",
+  "model": "mini-moe-test",
+  "profile": "NVFP4",
+  "path": "loader",
+  "prompt_tokens": [
+    1,
+    2,
+    3
+  ],
+  "seed": 0,
+  "greedy": true,
+  "tolerance_rel": 0.0001,
+  "logits_ref": [
+    -0.33894112706184387,
+    -0.8540968298912048,
+    -1.1662803888320923,
+    0.669651985168457,
+    -0.13095182180404663,
+    -0.3558449447154999,
+    0.3840079605579376,
+    -1.8881663084030151,
+    -0.005497574806213379,
+    -0.5148564577102661,
+    0.3563826084136963,
+    1.6623072624206543,
+    -1.0125417709350586,
+    0.7505108118057251,
+    0.4735112488269806,
+    0.11711172759532928
+  ],
+  "meta": {
+    "implementation": "HF MixtralForCausalLM (transformers 5.x, CPU float32) — второй референс (best effort, ADR-09 §4)",
+    "config": "MixtralConfig из fixture mini_moe.json (hidden 8, 2 слоя, 2 головы, head_dim 4, kv=1, intermediate 8, 4 эксперта, top-2, tie=True — head отсутствует в fixture, eps 1e-5)",
+    "patches": [
+      "RoPE → identity (fixture ops НЕ содержат позиционной операции)",
+      "head = tied embeddings (в fixture нет группы head)",
+      "веса NVFP4 — референсные dequant(quantize(F16→f32)) (см. generate_golden.py)"
+    ],
+    "weights": "tests/models/fixtures/mini_moe.safetensors",
+    "max_rel_err_vs_python_ref": 1.4901161193847656e-07,
+    "verdict": "сходится с независимым Python-референсом в пороге "
+  }
+}

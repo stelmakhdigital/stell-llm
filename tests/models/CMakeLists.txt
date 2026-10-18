@@ -1,7 +1,9 @@
 # ============================================================================
 # tests/models — юнит-тесты модуля models (Поток D, ADR-09/03/12).
 # Синтетические входные файлы (safetensors/GGUF) генерируются самими тестами;
-# golden-тест логитов — каркас (см. golden/README.md), фикстуры pending.
+# golden-логиты — референсы раунда 2 (независимый Python-интерпретатор +
+# HF-кроссчек, см. golden/README.md); прогоны engine (core-2) дописывают
+# logits_tested.
 # ============================================================================
 
 # Внутренние заголовки модуля (quant.hpp, tensor_file_formats.hpp) и каркасы тестов.
@@ -15,6 +17,8 @@ add_executable(test_models_weights_gguf test_weights_gguf.cpp)
 add_executable(test_models_weights_quant test_weights_quant.cpp)
 add_executable(test_models_convert_stelltier test_convert.cpp)
 add_executable(test_models_golden_logits golden/golden_logits.cpp)
+add_executable(test_models_golden_fixtures test_golden_fixtures.cpp)
+add_executable(test_models_gguf_description test_gguf_description.cpp)
 
 foreach(t
     test_models_json
@@ -24,7 +28,9 @@ foreach(t
     test_models_weights_gguf
     test_models_weights_quant
     test_models_convert_stelltier
-    test_models_golden_logits)
+    test_models_golden_logits
+    test_models_golden_fixtures
+    test_models_gguf_description)
     target_include_directories(${t} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/models/include
         ${_models_src_dir}
@@ -49,3 +55,5 @@ add_test(NAME models_weights_gguf COMMAND test_models_weights_gguf)
 add_test(NAME models_weights_quant COMMAND test_models_weights_quant)
 add_test(NAME models_convert_stelltier COMMAND test_models_convert_stelltier)
 add_test(NAME models_golden_logits COMMAND test_models_golden_logits)
+add_test(NAME models_golden_fixtures COMMAND test_models_golden_fixtures)
+add_test(NAME models_gguf_description COMMAND test_models_gguf_description)

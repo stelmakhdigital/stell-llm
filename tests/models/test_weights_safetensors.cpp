@@ -71,6 +71,12 @@ std::vector<SynthTensor> make_tensors([[maybe_unused]] const ModelDescription& d
                              "F16", {8, 8}, f16_payload(wo)));
         std::vector<std::uint16_t> up(16 * 8);
         for (std::size_t i = 0; i < up.size(); ++i) up[i] = static_cast<std::uint16_t>((i + layer * 7 + 23) & 0x3FFF);
+        std::vector<std::uint16_t> gate(16 * 8);
+        for (std::size_t i = 0; i < gate.size(); ++i)
+            gate[i] = static_cast<std::uint16_t>((i + layer * 17 + 19) & 0x3FFF);
+        // gate — round 2: fixture mini_dense получил ffn.gate (SwiGLU, README golden)
+        out.push_back(tensor("layers." + std::to_string(layer) + ".mlp.gate_proj.weight",
+                             "F16", {16, 8}, f16_payload(gate)));
         out.push_back(tensor("layers." + std::to_string(layer) + ".mlp.up_proj.weight",
                              "F16", {16, 8}, f16_payload(up)));
         std::vector<std::uint16_t> down(8 * 16);
