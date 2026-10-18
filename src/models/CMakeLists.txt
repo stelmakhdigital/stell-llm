@@ -26,6 +26,10 @@ target_include_directories(stell_models
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# Round 2: реальный stell/tiers/types.hpp (поток B, ADR-08 §1) — зеркало
+# tiers_compat.hpp удалено, типы stell::tiers приходят из stell_tiers.
+target_link_libraries(stell_models PUBLIC stell_tiers)
+
 # Каталог встроенных описаний (реестр, ADR-09 §2): env STELL_MODELS_REGISTRY_DIR
 # перекрывает это значение (см. Registry::registry_dir).
 target_compile_definitions(stell_models PRIVATE
