@@ -142,6 +142,11 @@ void rendez_collective(GroupState::Rendez& r, rank_t /*my_rank*/, rank_t world,
     r.arrived = 0;
     ++r.epoch;
     r.cv.notify_all();
+    // Контракт (ADR-10 §2/§4): при ошибке ВСЕ ранки получают ту же CommError —
+    // включая последнего прибывшего (исполнителя exec); NcclFailure — страж
+    // «ошибки нет».
+    if (r.error != CommError::Code::NcclFailure)
+        throw CommError(r.error, "collective failed on this rank");
 }
 
 } // namespace
@@ -353,7 +358,11 @@ void EmulatedCommunicator::kv_stream_push(const void* kv_block, std::size_t byte
 
 bool EmulatedCommunicator::kv_stream_pop(void* dst, std::size_t bytes) {
     GroupState& g = *impl_->g;
-    GroupState::KvRing& ring = g.kv_ring(impl_->cfg.rank);
+    // Ёмкость кольца задаётся симметрично (kv_ring_capacity обоих ранков):
+    // кто первым создаст кольцо (push/pop), тот и фиксирует ёмкость.
+    GroupState::KvRing& ring =
+        g.kv_ring(impl_->cfg.rank,
+                  impl_->cfg.kv_ring_capacity ? impl_->cfg.kv_ring_capacity : 16);
     std::lock_guard<std::mutex> lk(ring.m);
     if (ring.q.empty()) return false;
     if (ring.q.front().size() != bytes)
