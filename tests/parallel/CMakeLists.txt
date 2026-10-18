@@ -28,3 +28,21 @@ target_compile_definitions(test_parallel PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures"
 )
 add_test(NAME test_parallel COMMAND test_parallel)
+
+# --- GPU-тест NCCL-backend (только STELL_CUDA=ON + libnccl, сервер) ----------
+if(STELL_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    find_path(_NCCL_INCLUDE_DIR nccl.h PATHS "/usr/include" "/usr/local/cuda/include")
+    find_library(_NCCL_LIB nccl PATHS "/usr/lib/x86_64-linux-gnu" "/usr/lib64" "/usr/lib")
+    add_executable(test_parallel_gpu test_nccl_gpu.cpp)
+    target_include_directories(test_parallel_gpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${_NCCL_INCLUDE_DIR}
+    )
+    target_link_libraries(test_parallel_gpu PRIVATE stell::parallel CUDA::cudart)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_parallel_gpu PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME parallel_gpu COMMAND test_parallel_gpu)
+endif()
