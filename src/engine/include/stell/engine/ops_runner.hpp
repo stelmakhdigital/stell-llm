@@ -93,7 +93,7 @@ private:
     // --- каталог операций (ADR-09 §1) ----------------------------------------
     float op_eps() const;                              // eps из params rmsnorm
     void layer_body(std::size_t layer, std::vector<float>& hidden, SlotState& st);
-    void op_rmsnorm(std::size_t layer, std::vector<float>& hidden) const;
+    void op_rmsnorm(std::size_t layer, std::vector<float>& hidden);
     void op_attention(std::size_t layer, std::vector<float>& hidden, SlotState& st);
     void op_ffn(std::size_t layer, std::vector<float>& hidden);
     void op_moe(std::size_t layer, std::vector<float>& hidden);
@@ -111,6 +111,11 @@ private:
     ExecutionPlan plan_;
     std::unordered_map<std::uint32_t, Mat> mats_;      // gid → dequant F32
     stell::tiers::TierManager* tiers_ = nullptr;
+
+    // Буфер нормализованного входа (вклейка golden D): rmsnorm НЕ трогает
+    // hidden — residual сохраняется; attention/FFN/MoE берут norm_in_ как
+    // вход проекций и добавляют результат к скрытому состоянию.
+    std::vector<float> norm_in_;
 
     std::unordered_map<SlotId, SlotState> slots_;
 

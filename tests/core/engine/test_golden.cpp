@@ -21,6 +21,7 @@
 // StellTier-лоадер / tiering c принудительными промахами (ADR-09 §4).
 #include "test_util.hpp"
 
+#include <filesystem>
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
@@ -153,11 +154,35 @@ void run() {
         // Загрузка модели реестра: имя фикстуры → файл описания <model>.json.
         // Честно: путь описания ищем в tests/models/fixtures и в реестре
         // (STELL_MODELS_REGISTRY_DIR / встроенный реестр через Registry).
+        // Интеграционный фикс (worker): имя модели в описании ('mini-dense-test')
+        // не обязано совпадать с именем файла ('mini_dense.json') — резолвим
+        // файл описания сканом каталога фикстур по полю name.
         std::string desc_path;
         {
             const std::string cand1 = std::string(STELL_FIXTURES_DIR) + "/" + fx.model + ".json";
             std::FILE* f1 = std::fopen(cand1.c_str(), "rb");
             if (f1) { std::fclose(f1); desc_path = cand1; }
+        }
+        if (desc_path.empty()) {
+            // Скан каталога фикстур: JSON, у которого name == fx.model.
+            for (const auto& entry : std::filesystem::directory_iterator(STELL_FIXTURES_DIR)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+                std::FILE* jf = std::fopen(entry.path().string().c_str(), "rb");
+                if (!jf) continue;
+                std::string buf, line, got;
+                char chunk[4096];
+                while (std::fgets(chunk, sizeof chunk, jf)) buf += chunk;
+                std::fclose(jf);
+                // Минимальный поиск поля "name": "..." (файлы — машинные, не ручные).
+                std::size_t npos = buf.find("\"name\"");
+                if (npos == std::string::npos) continue;
+                std::size_t colon = buf.find(":", npos);
+                std::size_t q1 = buf.find('\"', colon);
+                std::size_t q2 = buf.find('\"', q1 + 1);
+                if (q1 == std::string::npos || q2 == std::string::npos) continue;
+                got = buf.substr(q1 + 1, q2 - q1 - 1);
+                if (got == fx.model) { desc_path = entry.path().string(); break; }
+            }
         }
         if (desc_path.empty()) {
             const char* reg = std::getenv("STELL_MODELS_REGISTRY_DIR");
@@ -175,8 +200,21 @@ void run() {
                 fx.model.c_str());
             continue;
         }
-        if (fx.weights.empty() ||
-            ![](const std::string& p) {
+        // Интеграционный фикс (worker): golden-файлы D не несут пути весов —
+        // выводим их из имени файла: logits_<fixture>.json → fixtures/<fixture>
+        // .safetensors (суффикс _hf → тот же fixture); формат — по профилю.
+        if (fx.weights.empty()) {
+            std::string base = file;
+            base = base.substr(0, base.size() - 5);  // отрезаем .json
+            if (base.rfind("logits_", 0) == 0) base.erase(0, 7);
+            if (base.size() > 3 && base.compare(base.size() - 3, 3, "_hf") == 0)
+                base.erase(base.size() - 3, 3);
+            fx.weights = std::string(STELL_FIXTURES_DIR) + "/" + base + ".safetensors";
+        }
+        if (fx.weights_format.empty() || fx.weights_format == "safetensors")
+            fx.weights_format =
+                fx.profile == "F16" ? "safetensors" : "nvfp4w4a16";
+        if (![](const std::string& p) {
                 std::FILE* f = std::fopen(p.c_str(), "rb");
                 if (f) { std::fclose(f); return true; }
                 return false;

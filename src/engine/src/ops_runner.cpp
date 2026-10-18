@@ -167,7 +167,7 @@ float OpsInterpreter::op_eps() const {
     return eps;
 }
 
-void OpsInterpreter::op_rmsnorm(std::size_t layer, std::vector<float>& hidden) const {
+void OpsInterpreter::op_rmsnorm(std::size_t layer, std::vector<float>& hidden) {
     const PlainGroup* ng = group(layer_prefix(layer) + "attn.norm");
     if (!ng) throw std::invalid_argument("ops runner: нет группы нормы слоя " +
                                          std::to_string(layer));
@@ -180,7 +180,9 @@ void OpsInterpreter::op_rmsnorm(std::size_t layer, std::vector<float>& hidden) c
     const float inv = 1.0f / std::sqrt(static_cast<float>(ms / hidden.size()) + eps);
     std::vector<float> y(hidden.size());
     for (std::size_t i = 0; i < hidden.size(); ++i) y[i] = w->w[i] * hidden[i] * inv;
-    hidden = std::move(y);
+    // Вклейка golden D: норма НЕ перезаписывает hidden (residual сохраняется);
+    // нормализованный вход — в norm_in_ для последующих проекций слоя.
+    norm_in_ = std::move(y);
 }
 
 void OpsInterpreter::op_attention(std::size_t layer, std::vector<float>& hidden,
@@ -200,9 +202,9 @@ void OpsInterpreter::op_attention(std::size_t layer, std::vector<float>& hidden,
     // Проекции: q [n_heads*d_head], k/v [n_kv_heads*d_kv] (GQA, ADR-09 §1).
     const std::uint32_t d_model = spec_.d_model;
     const std::uint32_t dkv = spec_.n_kv_heads * spec_.d_kv;
-    std::vector<float> q = matvec(*wq, hidden);
-    std::vector<float> k = matvec(*wk, hidden);
-    std::vector<float> v = matvec(*wv, hidden);
+    std::vector<float> q = matvec(*wq, norm_in_);
+    std::vector<float> k = matvec(*wk, norm_in_);
+    std::vector<float> v = matvec(*wv, norm_in_);
 
     // KV-кеш: token-major [pos][dkv] (FP32 CPU-контур; квант KV E4M3 —
     // ADR-04, задача SM70-контура). Позиция нового токена = st.pos.
@@ -261,9 +263,23 @@ void OpsInterpreter::op_ffn(std::size_t layer, std::vector<float>& hidden) {
     if (!up || !dn) throw std::invalid_argument("ops runner: нет весов ffn слоя");
     // Честная конвенция фикстуры: "silu_mul" при отсутствии gate-группы =
     // silu(up(x)) → down (gate-fusion требует парной группы — в fixtures нет).
-    std::vector<float> h = matvec(*up, hidden);
-    for (float& x : h) x = silu(x);
-    std::vector<float> y = matvec(*dn, h);
+    // Round 2 (вклейка golden D): в mini_dense ДОБАВЛЕНА ffn.gate → SwiGLU:
+    // m = silu(gate·h)·(up·h). Fallback без gate сохранён (round-1 описания).
+    std::vector<float> m_vec;
+    if (const PlainGroup* ggate = group(layer_prefix(layer) + "ffn.gate")) {
+        const Mat* gt = mat(ggate->id);
+        if (!gt)
+            throw std::invalid_argument("ops runner: нет весов ffn.gate слоя");
+        std::vector<float> g = matvec(*gt, hidden);
+        for (float& f : g) f = silu(f);
+        std::vector<float> u = matvec(*up, hidden);
+        m_vec.resize(g.size());
+        for (std::size_t i = 0; i < g.size(); ++i) m_vec[i] = g[i] * u[i];
+    } else {
+        m_vec = matvec(*up, hidden);
+        for (float& f : m_vec) f = silu(f);
+    }
+    std::vector<float> y = matvec(*dn, m_vec);
     for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] += y[i];
 }
 
@@ -271,30 +287,46 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
     const PlainGroup* grouter = group(layer_prefix(layer) + "mlp.router");
     if (!grouter) throw std::invalid_argument("ops runner: нет роутера слоя");
     const Mat* router = mat(grouter->id);
-    if (!router || router->rows != 1)
-        throw std::invalid_argument("ops runner: роутер не вектор");
-    // Честная конвенция фикстуры: router — вектор экспертных скоров
-    // [n_experts] (нет matmul со скрытым состоянием; softmax-topk — ADR-09 §1).
-    std::vector<float> scores(router->w);
+    if (!router)
+        throw std::invalid_argument("ops runner: нет весов роутера");
+    // Round 2 (вклейка golden D): router — матрица [n_experts, d_model];
+    // scores[e] = router_e · hidden (matmul со скрытым состоянием), softmax
+    // по всем экспертам, top-k с перенормировкой probs = p_sel / Σ p_sel
+    // (семантика Mixtral, сверено с HF-кроссчеком D, rel ≤ 1.5e-07);
+    // ничья при argsort → меньший индекс (stable sort).
+    const std::uint32_t d_model = spec_.d_model;
+    if (router->cols != d_model)
+        throw std::invalid_argument("ops runner: роутер не [n_experts, d_model]");
+    std::vector<float> scores(router->rows, 0.0f);
+    for (std::uint32_t e = 0; e < router->rows; ++e) {
+        const float* row = router->w.data() + static_cast<std::size_t>(e) * d_model;
+        for (std::uint32_t d = 0; d < d_model; ++d)
+            scores[e] += row[d] * hidden[d];
+    }
     float mx = *std::max_element(scores.begin(), scores.end());
     float sum = 0.0f;
     for (float& s : scores) { s = std::exp(s - mx); sum += s; }
     for (float& s : scores) s /= sum;
 
-    // top-k экспертов (n_experts_active).
+    // top-k экспертов (n_experts_active): stable sort по -score (ничья → меньший
+    // индекс), затем перенормировка probs по выбранным k (Mixtral-семантика).
     const std::uint32_t k_top =
         std::min<std::uint32_t>(spec_.n_experts_active,
                                 static_cast<std::uint32_t>(scores.size()));
     std::vector<std::uint32_t> order(scores.size());
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(order.size()); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
         return scores[a] > scores[b];
     });
     order.resize(k_top);
+    float pk_sum = 0.0f;
+    for (std::uint32_t j = 0; j < k_top; ++j) pk_sum += scores[order[j]];
+    std::vector<float> probs(k_top, 0.0f);
+    for (std::uint32_t j = 0; j < k_top; ++j)
+        probs[j] = pk_sum > 0.0f ? scores[order[j]] / pk_sum : 0.0f;
 
     // --- MoE gather/scatter через kernels CPU-референс (ADR-09 §1) -----------
     // x — [1][d_model]; expert_ids — [1][k_top]; gathered — [k_top][d_model].
-    const std::uint32_t d_model = spec_.d_model;
     std::vector<float> x(hidden.begin(), hidden.end());
     std::vector<std::int32_t> expert_ids(static_cast<std::size_t>(k_top));
     std::vector<float> gathered(static_cast<std::size_t>(k_top) * d_model, 0.0f);
@@ -323,12 +355,44 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
                                         std::to_string(e));
         const float* src = gathered.data() + static_cast<std::size_t>(j) * d_model;
         std::vector<float> h(src, src + d_model);
-        std::vector<float> hu = matvec(*up, h);
-        for (float& f : hu) f = silu(f);
-        std::vector<float> y = matvec(*dn, hu);
+        std::vector<float> y;
+        // SwiGLU эксперта (вклейка golden D): gate_up (glm-class: [0:d_ff]=gate,
+        // [d_ff:2d_ff]=up) либо отдельные gate/up; generic fallback без gate.
+        char buf2[64];
+        std::snprintf(buf2, sizeof buf2, "l%03zu.e%03u.gate_up", layer, e);
+        const PlainGroup* ggu_g = group(buf2);
+        std::snprintf(buf2, sizeof buf2, "l%03zu.e%03u.gate", layer, e);
+        const PlainGroup* gg_g = group(buf2);
+        if (ggu_g) {
+            const Mat* gu = mat(ggu_g->id);
+            if (!gu)
+                throw std::invalid_argument("ops runner: нет gate_up эксперта " +
+                                            std::to_string(e));
+            std::vector<float> g = matvec(*gu, h);       // все 2*d_ff строк
+            const std::size_t d_ff = g.size() / 2;
+            for (std::size_t i = 0; i < d_ff; ++i) g[i] = silu(g[i]);
+            std::vector<float> m(d_ff);
+            for (std::size_t i = 0; i < d_ff; ++i) m[i] = g[i] * g[d_ff + i];
+            y = matvec(*dn, m);
+        } else if (gg_g) {
+            const Mat* gt = mat(gg_g->id);
+            if (!gt)
+                throw std::invalid_argument("ops runner: нет gate эксперта " +
+                                            std::to_string(e));
+            std::vector<float> g = matvec(*gt, h);
+            for (float& f : g) f = silu(f);
+            std::vector<float> u = matvec(*up, h);
+            std::vector<float> m(g.size());
+            for (std::size_t i = 0; i < g.size(); ++i) m[i] = g[i] * u[i];
+            y = matvec(*dn, m);
+        } else {
+            std::vector<float> hu = matvec(*up, h);
+            for (float& f : hu) f = silu(f);
+            y = matvec(*dn, hu);
+        }
         for (std::size_t d = 0; d < d_model; ++d)
             expert_out[static_cast<std::size_t>(j) * d_model + d] = y[d];
-        weights[j] = scores[order[j]];
+        weights[j] = probs[j];
     }
     // Scatter-add: y[0] += Σ_j w[j] * expert_out[j] (kernels CPU-референс).
     std::vector<float> y(d_model, 0.0f);
