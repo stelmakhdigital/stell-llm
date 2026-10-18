@@ -77,3 +77,36 @@ CommDType) с разной семантикой полей:
   обнаружен мёртвый защитный путь BufferTooSmall в expert_alltoall
   (см. отчёт) и исправлены два дефекта эмулятора (rethrow последнего
   прибывшего; симметричная ёмкость KV-кольца).
+
+## 7. Дополнения раунда 2 (золотой прогон mini_dense/mini_moe)
+
+- **ODR-конфликт stub_models/stub_tiers**: engine (`adapters/stub_models.hpp`,
+  `adapters/stub_tiers.hpp`) выписал те же одноимённые типы
+  (`stell::models::ModelDescription/IRegistry`, `stell::tiers::TensorGroup/
+  GroupKey/GroupId/Awaiter`) — теперь реальные модули (`src/models`,
+  `src/tiers`) их определяют. Во вклейке: заменить все три stub-включения на
+  реальные заголовки (models/registry.hpp+description.hpp, tiers/types.hpp,
+  parallel/comm.hpp) и удалить stub-каталог adapters (иначе ODR/линк-конфликт).
+  Расхождения stub_models ↔ реальное описание: нет `ops`, `schema`,
+  `group_source_patterns`, `kv`-структура (плоские поля), `moe` (плоские поля) —
+  `build_execution_plan` потребует адаптации.
+- **Лоадер NVFP4W4A16 отклоняет F32/F16 группы** смешанного плана
+  (UnsupportedQuant в do_fill) — mini_moe (NVFP4-профиль, F32-нормы и
+  F32-роутер) читается ТОЛЬКО двумя источниками (plain safetensors +
+  quant-лоадер). Либо лоадеру нужен fallback для неквантованных групп, либо
+  смешанный план фиксируется как «два источника» в ADR-03/09.
+- **Расхождение раскладки NVFP4**: лоадер/конвертер models упаковывают блок
+  32 (nibbles + scale E4M3 на 32 элемента), kernels `dequant_nvfp4` ждёт блок
+  16 (`scales ceil(n/16)`) — де-квантование kernels над payload лоадера даст
+  мусор. Интеграция engine↔kernels обязана зафиксировать единую раскладку
+  (блок 32 — как в quant.hpp/weights.hpp) или две ветки.
+- **expert_alltoall не параметризует ширину токена**: контракт —
+  «max_tokens элементов dtype» (эмулятор раунда 1 гонит скаляры); реальный
+  MoE-токен — d_model-вектор. Тест раунда гонит вектор поэлементно
+  (slot_id кодирует позицию — допущение A3b) — работает, но нужен ADR:
+  либо параметр `token_width`, либо «токен = max_tokens×d_model элементов».
+- **allgather-as-broadcast**: recv-буфер обязан быть world×count (scheduler.cpp
+  выделяет count — переполнение, ASan-поймано; см. §2).
+- **expert_alltoall recv-ёмкость**: при контрактной ёмкости max_tokens×world
+  переполнение (BufferTooSmall) недостижимо (fan-out ≤ tp даёт inflow ≤
+  ёмкость ровно в worst-case) — либо ревизия контракта, либо ёмкость по плану.

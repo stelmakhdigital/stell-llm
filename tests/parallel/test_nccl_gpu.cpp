@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -55,7 +56,7 @@ void report_cotenance(const std::vector<int>& devices) {
     cudaGetDevice(&prev);
     for (int d : devices) {
         check_cuda(cudaSetDevice(d), "cudaSetDevice(report)");
-        int free_b = 0, total_b = 0;
+        std::size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
             std::printf("COTENANCE: GPU %d: свободно %.2f GB / %.2f GB "
                         "(чужой процесс strata держит остальное)\n", d,
@@ -75,50 +76,76 @@ struct RankOut {
 void rank_body(const ParallelConfig& cfg, const std::vector<std::size_t>& sizes,
                int iters_per_size, RankOut& out) {
     auto comm = make_communicator(cfg);
+    out.latency_us.assign(sizes.size(), 0.0);
     const rank_t world = comm->world_size();
     const std::size_t maxn = *std::max_element(sizes.begin(), sizes.end());
-    std::vector<float> buf(maxn), recv(maxn * std::size_t(world));
-    std::vector<double> lat(sizes.size(), 0.0);
-    // allgather: корректность (конкатенация send-паттернов по ранкам).
-    {
-        std::vector<float> send(maxn), r(maxn * std::size_t(world));
-        for (std::size_t i = 0; i < maxn; ++i)
-            send[i] = 100.0f * float(cfg.rank) + float(i);
-        comm->allgather(send.data(), r.data(), maxn, CommDType::F32);
-        for (rank_t s = 0; s < world; ++s)
+    // NCCL работает над DEVICE-буферами: выделяем в свободной VRAM (co-tenancy).
+    float* dev_buf = nullptr;
+    float* dev_recv = nullptr;
+    std::vector<float> host(maxn), recv(maxn * std::size_t(world));
+    check_cuda(cudaMalloc(&dev_buf, maxn * 4), "cudaMalloc(allreduce buf)");
+    check_cuda(cudaMalloc(&dev_recv, maxn * std::size_t(world) * 4),
+               "cudaMalloc(allgather recv)");
+    auto cleanup = [&] {
+        cudaFree(dev_buf);
+        cudaFree(dev_recv);
+    };
+    try {
+        // allgather: корректность (конкатенация send-паттернов по ранкам).
+        {
             for (std::size_t i = 0; i < maxn; ++i)
-                if (!(r[std::size_t(s) * maxn + i] == 100.0f * float(s) + float(i)))
-                    out.ok = false;
-    }
-    // allreduce: корректность + latency.
-    for (std::size_t si = 0; si < sizes.size(); ++si) {
-        const std::size_t n = sizes[si];
-        for (std::size_t i = 0; i < n; ++i) buf[i] = 1000.0f * float(cfg.rank) + float(i);
-        comm->allreduce(buf.data(), n, CommDType::F32);   // warmup + корректность
-        for (std::size_t i = 0; i < n; ++i) {
-            float expect = 0.f;
-            for (rank_t s = 0; s < world; ++s) expect += 1000.0f * float(s) + float(i);
-            if (!(buf[i] == expect)) out.ok = false;   // F32: суммы точны до 2^22
+                host[i] = 100.0f * float(cfg.rank) + float(i);
+            check_cuda(cudaMemcpy(dev_buf, host.data(), maxn * 4, cudaMemcpyHostToDevice),
+                       "H2D allgather");
+            comm->allgather(dev_buf, dev_recv, maxn, CommDType::F32);
+            check_cuda(cudaMemcpy(recv.data(), dev_recv,
+                                  maxn * std::size_t(world) * 4, cudaMemcpyDeviceToHost),
+                       "D2H allgather");
+            for (rank_t s = 0; s < world; ++s)
+                for (std::size_t i = 0; i < maxn; ++i)
+                    if (!(recv[std::size_t(s) * maxn + i] == 100.0f * float(s) + float(i)))
+                        out.ok = false;
         }
-        // Замер: медиана по итерациям.
-        std::vector<double> samples;
-        samples.reserve(std::size_t(iters_per_size));
-        for (int it = 0; it < iters_per_size; ++it) {
-            const auto t0 = std::chrono::steady_clock::now();
-            comm->allreduce(buf.data(), n, CommDType::F32);
-            const auto t1 = std::chrono::steady_clock::now();
-            samples.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        // allreduce: корректность + latency (медиана по итерациям).
+        for (std::size_t si = 0; si < sizes.size(); ++si) {
+            const std::size_t n = sizes[si];
+            for (std::size_t i = 0; i < n; ++i) host[i] = 1000.0f * float(cfg.rank) + float(i);
+            check_cuda(cudaMemcpy(dev_buf, host.data(), n * 4, cudaMemcpyHostToDevice),
+                       "H2D allreduce");
+            comm->allreduce(dev_buf, n, CommDType::F32);   // warmup + корректность
+            check_cuda(cudaMemcpy(host.data(), dev_buf, n * 4, cudaMemcpyDeviceToHost),
+                       "D2H allreduce");
+            for (std::size_t i = 0; i < n; ++i) {
+                float expect = 0.f;
+                for (rank_t s = 0; s < world; ++s) expect += 1000.0f * float(s) + float(i);
+                if (!(host[i] == expect)) out.ok = false;   // суммы целые < 2^22 — точны
+            }
+            std::vector<double> samples;
+            samples.reserve(std::size_t(iters_per_size));
+            for (int it = 0; it < iters_per_size; ++it) {
+                const auto t0 = std::chrono::steady_clock::now();
+                comm->allreduce(dev_buf, n, CommDType::F32);
+                const auto t1 = std::chrono::steady_clock::now();
+                samples.push_back(
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+            std::sort(samples.begin(), samples.end());
+            out.latency_us[si] = samples[samples.size() / 2];
         }
-        std::sort(samples.begin(), samples.end());
-        lat[si] = samples[samples.size() / 2];
+    } catch (...) {
+        cleanup();
+        throw;
     }
-    out.latency_us = lat;
+    cleanup();
 }
-
 } // namespace
 
 TEST(parallel_gpu_nccl_allreduce_allgather_latency) {
-    const std::vector<int> devices = parse_devices(STELL_GPU_TEST_DEVICES);
+    // Список устройств: env STELL_GPU_DEVICES (напр. "0,1,2,3") перекрывает
+    // дефолт STELL_GPU_TEST_DEVICES.
+    const char* env = std::getenv("STELL_GPU_DEVICES");
+    const std::vector<int> devices =
+        parse_devices(env ? env : STELL_GPU_TEST_DEVICES);
     std::printf("NCCL: версия %d.%d.%d, устройств в прогоне: %zu (%s)\n",
                 NCCL_MAJOR, NCCL_MINOR, NCCL_PATCH, devices.size(), STELL_GPU_TEST_DEVICES);
     report_cotenance(devices);
