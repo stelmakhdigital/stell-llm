@@ -35,4 +35,15 @@ public:
                  const std::string& out_dir) override;
 };
 
+// ----------------------------------------------------------------------------
+// Конвертер GGUF → описание модели (ADR-09 «Уточнение», round 2): GGUF не
+// поставляется с JSON-описанием, поэтому models генерирует его из метаданных
+// и тензорных имён файла. Имена тензоров — НАТИВНЫЕ llama.cpp-GGUF
+// (token_embd.weight, blk.{i}.attn_q.weight, …); source_pattern в описании —
+// те же нативные имена, лоадер сравнивает их буквально.
+// Возвращает JSON-текст описания (схема "1.0", как у llama-class.json).
+// Ошибки — LoaderError (SchemaMismatch/UnsupportedQuant/TensorNotFound).
+// ----------------------------------------------------------------------------
+std::string gguf_to_description(const std::string& gguf_uri);
+
 }  // namespace stell::models

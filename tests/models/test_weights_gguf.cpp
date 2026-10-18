@@ -2,6 +2,7 @@
 #include "stell/models/weights.hpp"
 #include "stell/models/registry.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -21,8 +22,14 @@ ModelDescription load_mini_dense() {
 }
 
 std::vector<SynthTensor> make_tensors() {
+    // ВАЖНО (round 2, конвенция shape GGUF): для матриц GGUF ne хранит
+    // {in, out} (байты C-порядка совпадают с row-major [out, in]); лоадер
+    // возвращает развернутый dims (логическую форму HF-конвенции). Писатeль
+    // write_gguf пишет dims КАК ЕСТЬ, поэтому тест передаёт GGUF-нативные
+    // dims (развернутые относительно HF-форм).
     std::vector<SynthTensor> out;
     auto push_f32 = [&](const std::string& name, std::vector<std::int64_t> shape, float seed) {
+        std::reverse(shape.begin(), shape.end());  // GGUF-native dims (ne[0] = input dim)
         SynthTensor t;
         t.name = name;
         t.dtype = "F32";
@@ -35,6 +42,7 @@ std::vector<SynthTensor> make_tensors() {
         out.push_back(std::move(t));
     };
     auto push_f16 = [&](const std::string& name, std::vector<std::int64_t> shape, int seed) {
+        std::reverse(shape.begin(), shape.end());  // GGUF-native dims (ne[0] = input dim)
         SynthTensor t;
         t.name = name;
         t.dtype = "F16";
@@ -99,14 +107,18 @@ void body() {
             const auto& g = d.groups[i];
             std::vector<std::uint8_t> buf(g.slot_bytes, 0);
             src->read({g.id, g.role}, buf.data(), buf.size());
-            CHECK(std::memcmp(buf.data(), ts[4].data.data(), ts[4].data.size()) == 0);
+            const SynthTensor* tq = nullptr;
+            for (const auto& x : ts)
+                if (x.name == "layers.0.self_attn.q_proj.weight") tq = &x;
+            CHECK(tq != nullptr);
+            CHECK(std::memcmp(buf.data(), tq->data.data(), tq->data.size()) == 0);
             wq_checked = true;
             break;
         }
         CHECK(wq_checked);
     }
 
-    // down layers.1: F16-тензор → побайтовое совпадение payload (ts[18]).
+    // down layers.1: F16-тензор → побайтовое совпадение payload (ts[16]).
     {
         bool down_checked = false;
         for (std::size_t i = 0; i < d.groups.size(); ++i) {
@@ -114,7 +126,11 @@ void body() {
             const auto& g = d.groups[i];
             std::vector<std::uint8_t> buf(g.slot_bytes, 0);
             src->read({g.id, g.role}, buf.data(), buf.size());
-            CHECK(std::memcmp(buf.data(), ts[18].data.data(), ts[18].data.size()) == 0);
+            const SynthTensor* td = nullptr;
+            for (const auto& x : ts)
+                if (x.name == "layers.1.mlp.down_proj.weight") td = &x;
+            CHECK(td != nullptr);
+            CHECK(std::memcmp(buf.data(), td->data.data(), td->data.size()) == 0);
             down_checked = true;
             break;
         }
@@ -160,7 +176,7 @@ void body() {
         stell_test::put_string_file(f, "embedding.weight");
         stell_test::put_u32_file(f, 1);
         stell_test::put_u64_file(f, 1);
-        stell_test::put_u32_file(f, 2);   // Q4_0 → UnsupportedQuant
+        stell_test::put_u32_file(f, 2);   // неподдержанный dtype-код → UnsupportedQuant
         stell_test::put_u64_file(f, 0);
         std::fclose(f);
         CHECK_THROW(loader->open(p4, d), LoaderError, "quantized gguf dtype rejected");

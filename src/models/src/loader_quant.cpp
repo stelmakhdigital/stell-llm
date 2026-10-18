@@ -53,24 +53,29 @@ protected:
             fill_plain(g, t, dst, dst_bytes);
             return;
         }
-        // Источник → f32: F16/F32-тензора напрямую.
+        // Источник → f32: F16/F32-тензора напрямую; GGUF Q4_0/Q8_0 — dequant
+        // (round 2: квантованные GGUF-блоки подхвачены NVFP4/W4A16-профилем).
         std::size_t n = numel(g.shape);
         std::vector<float> src(n);
-        if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
-                         *t.dtype != stell::tiers::DType::F32))
-            throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                              "nvfp4w4a16 loader: источник должен быть F16/F32, получено '" +
-                                  t.dtype_str + "'");
-        if (*t.dtype == stell::tiers::DType::F16) {
-            std::vector<std::uint8_t> raw(t.bytes);
-            read_tensor_payload(t, raw.data());
-            for (std::size_t i = 0; i < n; ++i) {
-                std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
-                                  (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
-                src[i] = f16_bits_to_f32(h);
-            }
+        if (is_quantized_ggml(t.dtype_str)) {
+            gguf_dequant_tensor(file(), t, src);
         } else {
-            read_tensor_payload(t, src.data());
+            if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
+                             *t.dtype != stell::tiers::DType::F32))
+                throw LoaderError(LoaderError::Code::UnsupportedQuant,
+                                  "nvfp4w4a16 loader: источник должен быть F16/F32, получено '" +
+                                      t.dtype_str + "'");
+            if (*t.dtype == stell::tiers::DType::F16) {
+                std::vector<std::uint8_t> raw(t.bytes);
+                read_tensor_payload(t, raw.data());
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
+                                      (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
+                    src[i] = f16_bits_to_f32(h);
+                }
+            } else {
+                read_tensor_payload(t, src.data());
+            }
         }
         // Квантование в payload группы; хвост слота (выравнивание) = 0.
         std::uint8_t* out = static_cast<std::uint8_t*>(dst);

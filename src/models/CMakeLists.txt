@@ -15,6 +15,7 @@ target_sources(stell_models PRIVATE
     src/stelltier_format.cpp
     src/loader_safetensors.cpp
     src/loader_gguf.cpp
+    src/gguf_description.cpp
     src/loader_quant.cpp
     src/loader_stelltier.cpp
     src/weights_factory.cpp

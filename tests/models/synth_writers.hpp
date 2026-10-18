@@ -21,6 +21,7 @@ struct SynthTensor {
     std::string dtype;              // "F16"/"F32" (safetensors), GGUF: dtype-код 0/1
     std::vector<std::int64_t> shape;
     std::vector<std::uint8_t> data; // payload LE
+    std::int64_t gguf_code = -1;    // GGUF: переопределить dtype-код (Q4_0=20, Q8_0=36)
 };
 
 // --- little-endian helpers ---------------------------------------------------
@@ -84,6 +85,8 @@ constexpr std::int64_t kGGML_F32 = 0, kGGML_F16 = 1;
 
 // GGML dtype коды (см. loader_gguf.cpp): 0=F32, 1=F16.
 constexpr std::uint32_t kGGMLMetaUint32 = 4;
+constexpr std::uint32_t kGGMLMetaFloat32 = 8;
+constexpr std::uint32_t kGGMLMetaBool = 10;
 constexpr std::uint32_t kGGMLMetaString = 11;
 
 inline void put_string(std::vector<std::uint8_t>& out, const std::string& s) {
@@ -99,16 +102,41 @@ inline void put_string_file(std::FILE* f, const std::string& s) {
     std::fwrite(s.data(), 1, s.size(), f);
 }
 
-// Данные: база = конец тензорных описаний, выровнен на 32; offset —
-// смещение внутри базы (как в GGUF v3).
-void write_gguf(const std::string& path, const std::vector<SynthTensor>& tensors) {
-    constexpr std::uint64_t kAlign = 32;
+// Значение метаданных GGUF (subset writer): u32/строка/f32/bool.
+struct GgufMetaKV {
+    std::string key;
+    std::uint32_t type = kGGMLMetaUint32;
+    std::uint64_t u64 = 0;
+    double f64 = 0.0;
+    std::string str;
+};
 
-    // Метаданные: general.alignment (u32).
-    std::vector<std::uint8_t> meta;
-    put_string(meta, "general.alignment");
-    put_u32(meta, kMetaUint32);
-    put_u32(meta, kAlign);
+inline void put_meta_kv(std::vector<std::uint8_t>& out, const GgufMetaKV& kv) {
+    put_string(out, kv.key);
+    put_u32(out, kv.type);
+    switch (kv.type) {
+        case kGGMLMetaUint32: put_u32(out, static_cast<std::uint32_t>(kv.u64)); break;
+        case kGGMLMetaBool: out.push_back(static_cast<std::uint8_t>(kv.u64 ? 1 : 0)); break;
+        case kGGMLMetaFloat32: put_f32(out, static_cast<float>(kv.f64)); break;
+        case kGGMLMetaString: put_string(out, kv.str); break;
+    }
+}
+
+// Данные: база = конец тензорных описаний, выровнен на 32 (alignment из
+// general.alignment, по умолчанию 32); offset — смещение внутри базы (GGUF v3).
+// meta — произвольные метаданные (конвертер описаний читает их для arch/размеров).
+// dims тензора пишутся из SynthTensor.shape КАК ЕСТЬ — для GGUF-нативного
+// порядка тест передаёт dims {in, out} (см. loader_gguf.cpp: развернутый
+// порядок == логической форме HF).
+void write_gguf_meta(const std::string& path, const std::vector<SynthTensor>& tensors,
+                     const std::vector<GgufMetaKV>& meta,
+                     std::uint64_t alignment = 32) {
+    // Метаданные: general.alignment (u32) + заданные пары.
+    std::vector<std::uint8_t> meta_bytes;
+    put_string(meta_bytes, "general.alignment");
+    put_u32(meta_bytes, kGGMLMetaUint32);
+    put_u32(meta_bytes, static_cast<std::uint32_t>(alignment));
+    for (const auto& kv : meta) put_meta_kv(meta_bytes, kv);
 
     // Тензорные описания: name, n_dims u32, dims u64*, dtype i32, offset u64.
     std::vector<std::uint8_t> infos;
@@ -117,29 +145,37 @@ void write_gguf(const std::string& path, const std::vector<SynthTensor>& tensors
         put_string(infos, t.name);
         put_u32(infos, static_cast<std::uint32_t>(t.shape.size()));
         for (auto d : t.shape) put_u64(infos, static_cast<std::uint64_t>(d));
-        const std::int64_t dt = (t.dtype == "F32") ? kGGML_F32 : kGGML_F16;
+        const std::int64_t dt =
+            t.gguf_code >= 0
+                ? t.gguf_code
+                : ((t.dtype == "F32") ? kGGML_F32 : kGGML_F16);
         put_u32(infos, static_cast<std::uint32_t>(dt));
         put_u64(infos, cursor);
         cursor += t.data.size();
     }
 
     const std::uint64_t data_base_raw =
-        4 + 4 + 8 + 8 + meta.size() + infos.size();
+        4 + 4 + 8 + 8 + meta_bytes.size() + infos.size();
     const std::uint64_t data_base =
-        (data_base_raw + kAlign - 1) / kAlign * kAlign;
+        (data_base_raw + alignment - 1) / alignment * alignment;
 
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot create " + path);
     std::fwrite("GGUF", 1, 4, f);
     put_u32_file(f, 3);            // version
     put_u64_file(f, tensors.size());
-    put_u64_file(f, 1);            // n_kv = 1
-    std::fwrite(meta.data(), 1, meta.size(), f);
+    put_u64_file(f, meta.size() + 1);  // n_kv = general.alignment + meta
+    std::fwrite(meta_bytes.data(), 1, meta_bytes.size(), f);
     std::fwrite(infos.data(), 1, infos.size(), f);
     // Паддинг до data_base.
     for (std::uint64_t p = data_base_raw; p < data_base; ++p) std::fputc(0, f);
     for (const auto& t : tensors) std::fwrite(t.data.data(), 1, t.data.size(), f);
     std::fclose(f);
+}
+
+// Round-1 обёртка: без метаданных (кроме general.alignment).
+void write_gguf(const std::string& path, const std::vector<SynthTensor>& tensors) {
+    write_gguf_meta(path, tensors, {});
 }
 
 inline void put_u32_file(std::FILE* f, std::uint32_t v) {
