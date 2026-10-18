@@ -112,7 +112,7 @@
     {
       "name": "l{layer}.mlp.router",
       "role": "expert",
-      "shape": [128],
+      "shape": [128, 2048],
       "dtype": "F32",
       "source_pattern": "layers.{layer}.mlp.router.weight",
       "cardinality": { "layer": 48 }

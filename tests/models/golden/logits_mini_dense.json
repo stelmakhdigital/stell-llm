@@ -1,0 +1,41 @@
+{
+  "schema": "1.0",
+  "model": "mini-dense-test",
+  "profile": "F16",
+  "path": "loader",
+  "prompt_tokens": [
+    1,
+    2,
+    3
+  ],
+  "seed": 0,
+  "greedy": true,
+  "tolerance_rel": 0.001,
+  "logits_ref": [
+    -0.3230930268764496,
+    -0.8607358336448669,
+    0.9068186283111572,
+    1.047652006149292,
+    1.5355769395828247,
+    -1.2416737079620361,
+    -0.34120506048202515,
+    0.9409192204475403,
+    -0.48564353585243225,
+    0.6838387846946716,
+    -0.31269827485084534,
+    0.9605532884597778,
+    -0.6287806034088135,
+    -0.9666614532470703,
+    0.7811005115509033,
+    -0.14613234996795654
+  ],
+  "meta": {
+    "generator": "tests/models/golden/generate_golden.py (независимый Python/torch-free интерпретатор ops-графа, numpy float32; ADR-09 §4, режим greedy)",
+    "weights": "mini_dense.safetensors (синтетические, LCG-конвенция — README)",
+    "quant_note": "веса F16 → float32 exact, вычисление FP32",
+    "ops_semantics": "см. tests/models/golden/README.md (контракт раунда)",
+    "greedy_token": 4,
+    "logits_min": -1.2416737079620361,
+    "logits_max": 1.5355769395828247
+  }
+}

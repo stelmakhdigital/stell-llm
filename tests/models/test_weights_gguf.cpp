@@ -57,6 +57,7 @@ std::vector<SynthTensor> make_tensors() {
         push_f16(p + "self_attn.k_proj.weight", {4, 8}, layer * 21 + 5);
         push_f16(p + "self_attn.v_proj.weight", {4, 8}, layer * 29 + 9);
         push_f16(p + "self_attn.o_proj.weight", {8, 8}, layer * 31 + 17);
+        push_f16(p + "mlp.gate_proj.weight", {16, 8}, layer * 17 + 19);
         push_f16(p + "mlp.up_proj.weight", {16, 8}, layer * 7 + 23);
         push_f16(p + "mlp.down_proj.weight", {8, 16}, layer * 11 + 27);
     }
@@ -105,7 +106,7 @@ void body() {
         CHECK(wq_checked);
     }
 
-    // down layers.1: F16-тензор → побайтовое совпадение payload (ts[16]).
+    // down layers.1: F16-тензор → побайтовое совпадение payload (ts[18]).
     {
         bool down_checked = false;
         for (std::size_t i = 0; i < d.groups.size(); ++i) {
@@ -113,7 +114,7 @@ void body() {
             const auto& g = d.groups[i];
             std::vector<std::uint8_t> buf(g.slot_bytes, 0);
             src->read({g.id, g.role}, buf.data(), buf.size());
-            CHECK(std::memcmp(buf.data(), ts[16].data.data(), ts[16].data.size()) == 0);
+            CHECK(std::memcmp(buf.data(), ts[18].data.data(), ts[18].data.size()) == 0);
             down_checked = true;
             break;
         }

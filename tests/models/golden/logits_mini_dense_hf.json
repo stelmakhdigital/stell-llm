@@ -1,0 +1,44 @@
+{
+  "schema": "1.0",
+  "model": "mini-dense-test",
+  "profile": "F16",
+  "path": "loader",
+  "prompt_tokens": [
+    1,
+    2,
+    3
+  ],
+  "seed": 0,
+  "greedy": true,
+  "tolerance_rel": 0.0001,
+  "logits_ref": [
+    -0.3230929970741272,
+    -0.8607357740402222,
+    0.9068186283111572,
+    1.0476521253585815,
+    1.5355769395828247,
+    -1.2416739463806152,
+    -0.34120500087738037,
+    0.9409191608428955,
+    -0.48564353585243225,
+    0.6838387250900269,
+    -0.3126983046531677,
+    0.9605532884597778,
+    -0.6287803649902344,
+    -0.9666613936424255,
+    0.7811005711555481,
+    -0.14613237977027893
+  ],
+  "meta": {
+    "implementation": "HF LlamaForCausalLM (transformers 5.x, CPU float32) — второй референс (best effort, ADR-09 §4)",
+    "config": "LlamaConfig из fixture mini_dense.json (hidden 8, 2 слоя, 2 головы, head_dim 4, GQA kv=1, intermediate 16, tie=False, eps 1e-5)",
+    "patches": [
+      "RoPE → identity (fixture ops НЕ содержат позиционной операции; round 1 — конвенция, README golden)",
+      "post_attention_layernorm → nn.Identity (в fixture нет pre-MLP нормы)",
+      "MLP SwiGLU: gate := fixture ffn.gate, up := fixture ffn.up, down := fixture ffn.down"
+    ],
+    "weights": "tests/models/fixtures/mini_dense.safetensors",
+    "max_rel_err_vs_python_ref": 2.384185791015625e-07,
+    "verdict": "сходится с независимым Python-референсом в пороге "
+  }
+}
