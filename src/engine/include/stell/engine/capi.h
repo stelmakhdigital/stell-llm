@@ -44,7 +44,16 @@ int  stell_cancel(stell_engine_t* e, uint64_t session_id);
 void stell_step(stell_engine_t* e);
 
 /* Метрики/health — JSON (ADR-11 §4): снапшот, потокобезопасно;
-   free() обязателен. */
+   free() обязателен.
+   Round 3 [R5] (planner Q5): секция "logits" — строгий формат,
+   БЕЗ payload логитов (массивы в /metrics не выдаются никогда):
+     "logits":{"requests_total":N,"errors_total":N,
+               "last_n_vocab":V,"last_positions":"last"|"all"|null}
+   requests_total — число УСПЕШНЫХ вызовов stell_logits (rc==0; ошибочный
+   вызов не даёт payload — тот же словарь, что и в serve-секции:
+   requests_total + errors_total = полное число вызовов);
+   last_n_vocab / last_positions — параметры последнего УСПЕШНОГО вызова,
+   до первого успеха — null. */
 int  stell_metrics(stell_engine_t* e, char** out_json);
 
 /* Round-2 расширение (ADR-11 §1: «поля/символы только добавляются» —
