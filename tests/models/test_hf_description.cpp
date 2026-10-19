@@ -34,6 +34,9 @@
 #include "stell/engine/plain_spec.hpp"
 #include "stell/engine/ops_runner.hpp"
 
+// [R2] round 6: побитовая сверка layout'ов перегенерации (TierLayoutReader).
+#include <stell/tiers/layout.hpp>
+
 using namespace stell::models;
 using namespace stell_test;
 namespace se = stell::engine;
@@ -309,6 +312,18 @@ std::vector<SynthTensor> moe_shared_hf_tensors() {
         ts.push_back(tensor(sp + "down_proj.weight", "F16", {8, 12},
                             f16_det(n, layer * 89 + 41)));
     }
+    return ts;
+}
+
+// [R1] round 6: та же фикстура + скалярный сигмоид-гейт shared-эксперта
+// (mlp.shared_expert_gate, форма [1, d_model] — как в реальных Qwen2Moe;
+// dtype F16 — однородный с shared-FFN тензора).
+std::vector<SynthTensor> moe_shared_gate_hf_tensors() {
+    auto ts = moe_shared_hf_tensors();
+    for (int layer = 0; layer < 2; ++layer)
+        ts.push_back(tensor("model.layers." + std::to_string(layer) +
+                            ".mlp.shared_expert_gate.weight", "F16", {1, 8},
+                            f16_det(8, layer * 7 + 53)));
     return ts;
 }
 
@@ -785,6 +800,99 @@ void body() {
     }
 
     // =========================================================================
+    // 7b. [R1] round 6 (ADR-09 round 6): скалярный сигмоид-гейт shared-
+    //     экспента — группа ffn.shared.gate_scalar из тензора
+    //     mlp.shared_expert_gate (форма [1, d_model]); отсутствие тензора —
+    //     группы нет (группы описаний побитово прежние, round 5); частичный
+    //     набор «gate есть, shared-FFN нет» — честный SchemaMismatch.
+    //     Семантика умножения — ops_runner (поток core, [R1] core-часть);
+    //     описание/roundtrip здесь побитово.
+    // =========================================================================
+    const std::string shgdir = out_dir("/tmp/stell_hf_shared_gate");
+    {
+        auto ts = moe_shared_gate_hf_tensors();
+        write_config(shgdir, "Qwen2MoeForCausalLM", true);
+        write_shards(shgdir, ts);
+        const std::string json = hf_to_description(shgdir);
+        const ModelDescription d = parse_model_description(json, "hf-shared-gate");
+        // 4 группы shared-контура на слой: ffn.shared.{gate,up,down} + gate_scalar.
+        const int gg0 = find_group(d, "l000.ffn.shared.gate_scalar");
+        CHECK(gg0 >= 0);
+        CHECK(d.group_source_patterns[gg0] ==
+              "model.layers.0.mlp.shared_expert_gate.weight");
+        CHECK((d.groups[gg0].shape == std::vector<std::int64_t>{1, 8}));
+        CHECK(d.groups[gg0].dtype == stell::tiers::DType::F16);
+        CHECK(d.groups[gg0].role == stell::tiers::Role::Attn);
+        const int gg1 = find_group(d, "l001.ffn.shared.gate_scalar");
+        CHECK(gg1 >= 0);
+        CHECK(d.group_source_patterns[gg1] ==
+              "model.layers.1.mlp.shared_expert_gate.weight");
+        // 48 (round 5: 42 MoE + 2×3 shared) + 2 gate_scalar = 50.
+        CHECK(d.groups.size() == 50);
+
+        // Обратная совместимость (отсутствие тензора — группы нет): описание
+        // фикстуры БЕЗ gate (секция 7) не содержит gate_scalar и имеет те же
+        // группы побитово (48 групп; round-4/5 поведение без изменений).
+        const std::string json_nogate = hf_to_description(shdir);
+        CHECK(json_nogate.find("gate_scalar") == std::string::npos);
+        {
+            const ModelDescription d5 = parse_model_description(json_nogate, "hf-shared-r5");
+            CHECK(d5.groups.size() == 48);
+            // Группы round-5 описания == round-6 описание без gate_scalar-групп
+            // (тот же план без гейта): имена/формы/dtype/patterns совпадают 1:1
+            // (гейт-группы вставляются в цикле слоёв — позиция внутри shared-
+            // контура своего слоя).
+            CHECK(d.groups.size() == d5.groups.size() + 2);
+            std::size_t j6 = 0;
+            for (std::size_t i = 0; i < d5.groups.size(); ++i, ++j6) {
+                while (j6 < d.groups.size() &&
+                       d.groups[j6].name.find("gate_scalar") != std::string::npos)
+                    ++j6;
+                CHECK_MSG(j6 < d.groups.size(), "состав групп round-5 не префикс round-6");
+                CHECK(d.groups[j6].name == d5.groups[i].name);
+                CHECK(d.groups[j6].shape == d5.groups[i].shape);
+                CHECK(d.groups[j6].dtype == d5.groups[i].dtype);
+                CHECK(d.group_source_patterns[j6] == d5.group_source_patterns[i]);
+            }
+        }
+
+        // Roundtrip: слоты layout == прямому лоадеру (побитно); логиты ==
+        // референсу того же плана (побитно). Гейт-группа попадает в план;
+        // умножение на скаляр — ops_runner (core, [R1]) — интерпретатор без
+        // гейта самосогласован (логиты == референсу того же плана).
+        const std::string single_g =
+            write_single("/tmp/stell_hf_shared_gate_single.safetensors", ts);
+        roundtrip_all(d, shgdir, single_g, "/tmp/stell_hf_shared_gate_out",
+                      se::PlainWeightsSafetensors, "moe+shared+gate (ffn.shared.gate)", true);
+        std::printf("moe+shared+gate: ffn.shared.gate_scalar OK (4 shared-группы/слой), план валиден\n");
+    }
+
+    // Частичный набор: gate есть, shared-FFN нет → честный SchemaMismatch
+    // (не тихое игнорирование тензора, ADR-09 round 6).
+    {
+        auto ts = moe_hf_tensors();
+        for (int layer = 0; layer < 2; ++layer)
+            ts.push_back(tensor("model.layers." + std::to_string(layer) +
+                                ".mlp.shared_expert_gate.weight", "F16", {1, 8},
+                                f16_det(8, layer * 7 + 53)));
+        const std::string dir = out_dir("/tmp/stell_hf_gate_only");
+        write_config(dir, "Qwen2MoeForCausalLM", true);
+        write_shards(dir, ts);
+        try {
+            hf_to_description(dir);
+            CHECK_MSG(false && "expected LoaderError",
+                      "gate без shared-FFN: ожидался SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "gate без shared-FFN: код ошибки != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("shared_expert_gate") !=
+                          std::string::npos,
+                      "gate без shared-FFN: сообщение не называет тензора");
+        }
+        std::printf("gate-only: частичный набор → SchemaMismatch OK\n");
+    }
+
+    // =========================================================================
     // 8. [R5] Clamp-сатурация BF16/F32→F16 (ADR-03 round 5): |v| > 65504 →
     //    ±65504 (не inf/NaN), обычные значения — побитово == прежней конверсии;
     //    счётчик сатураций; провенанс dtype_orig — в статистике конвертера.
@@ -883,6 +991,159 @@ void body() {
                     static_cast<std::size_t>(stats.f16_saturations),
                     static_cast<std::size_t>(stats.groups_dtype_orig_bf16),
                     static_cast<std::size_t>(stats.groups_dtype_orig_f32));
+    }
+
+    // =========================================================================
+    // 8b. [R2] round 6 (planner [Q6], ADR-03 round 5/6): провенанс dtype_orig
+    //     — top-level поле описания («исходный dtype весов до конверсии»;
+    //     читается R8-обёрткой serve/bench из description.json). Однородный
+    //     источник → "f32"/"bf16"/"f16"; смешанный источник — поле не
+    //     пишется (состав — в Stats конвертера groups_dtype_orig_bf16/f32 и
+    //     логе CLI). Поле информационное: перегенерация не меняет слоты/
+    //     логиты (ПОБИТОВО — сверка layout'ов по CRC/слотам + логиты
+    //     интерпретатора). Парсер схемы 1.0 толерантен к полю (неизвестные
+    //     top-level ключи игнорируются — прежние описания читаются).
+    // =========================================================================
+    {
+        // Однородный dense-чекпоинт (все тензора одного исходного dtype;
+        // d_model=8, vocab=16, d_ff=16, 2 слоя — конвенция dense_hf_tensors).
+        auto uniform_dense = [](const char* dt) {
+            const std::string dts = dt;
+            std::vector<SynthTensor> out;
+            auto push = [&](const std::string& name, std::vector<std::int64_t> sh,
+                            int seed) {
+                std::size_t n = 1;
+                for (auto d : sh) n *= static_cast<std::size_t>(d);
+                if (dts == "F32")
+                    out.push_back(tensor(name, "F32", std::move(sh),
+                                         f32_det(n, 0.125f + 0.03125f * seed)));
+                else if (dts == "BF16")
+                    out.push_back(tensor(name, "BF16", std::move(sh),
+                                         bf16_from_f32(f32_det(n, 0.125f + 0.03125f * seed))));
+                else
+                    out.push_back(tensor(name, "F16", std::move(sh), f16_det(n, seed)));
+            };
+            push("model.embed_tokens.weight", {16, 8}, 3);
+            push("model.norm.weight", {8}, 4);
+            push("lm_head.weight", {16, 8}, 5);
+            for (int layer = 0; layer < 2; ++layer) {
+                const std::string p =
+                    "model.layers." + std::to_string(layer) + ".";
+                push(p + "input_layernorm.weight", {8}, 6 + layer);
+                push(p + "post_attention_layernorm.weight", {8}, 8 + layer);
+                push(p + "self_attn.q_proj.weight", {8, 8}, 10 + layer);
+                push(p + "self_attn.k_proj.weight", {4, 8}, 12 + layer);
+                push(p + "self_attn.v_proj.weight", {4, 8}, 14 + layer);
+                push(p + "self_attn.o_proj.weight", {8, 8}, 16 + layer);
+                push(p + "mlp.gate_proj.weight", {16, 8}, 18 + layer);
+                push(p + "mlp.up_proj.weight", {16, 8}, 20 + layer);
+                push(p + "mlp.down_proj.weight", {8, 16}, 22 + layer);
+            }
+            return out;
+        };
+
+        // Полный протокол [R2]: описание с полем vs перегенерация в формате
+        // round-5 (без поля) — слоты layout'ов (CRC/офсеты/размеры) и логиты
+        // интерпретатора ПОБИТОВО идентичны.
+        auto check_dtype_orig = [&](const std::vector<SynthTensor>& ts,
+                                    const std::string& dir, const char* arch,
+                                    bool moe, const char* expect) {
+            write_config(dir, arch, moe);
+            write_shards(dir, ts);
+            const std::string json = hf_to_description(dir);
+            const std::string field =
+                std::string(",\"dtype_orig\":\"") + expect + "\"";
+            const std::size_t pos = json.find(field);
+            CHECK_MSG(pos != std::string::npos,
+                      "описание не содержит dtype_orig (ожидалось значение)");
+            const std::size_t vw = json.find(",\"vocab_size\":");
+            CHECK(pos < vw);  // поле — сразу после dtype_weights
+            CHECK(json.find(field + ",\"vocab_size\"") != std::string::npos);
+
+            // Формат round-5 (без поля) — референс побитовой сверки:
+            std::string json5 = json;
+            json5.erase(json5.find(field), field.size());
+            const ModelDescription d6 =
+                parse_model_description(json, "hf-r6-dtype-orig");
+            const ModelDescription d5 =
+                parse_model_description(json5, "hf-r5-no-field");
+            CHECK(d6.groups.size() == d5.groups.size());
+            for (std::size_t i = 0; i < d5.groups.size(); ++i) {
+                CHECK(d6.groups[i].name == d5.groups[i].name);
+                CHECK(d6.groups[i].shape == d5.groups[i].shape);
+                CHECK(d6.groups[i].dtype == d5.groups[i].dtype);
+            }
+
+            const std::string out6s = dir + "_out6";
+            const std::string out5s = dir + "_out5";
+            StellTierConverter c6, c5;
+            c6.convert_streaming(d6, dir, out_dir(out6s.c_str()));
+            c5.convert_streaming(d5, dir, out_dir(out5s.c_str()));
+            const std::string lay6 = out6s + "/" + d6.name + ".stelltier";
+            const std::string lay5 = out5s + "/" + d5.name + ".stelltier";
+            stell::tiers::TierLayoutReader r6(lay6);
+            stell::tiers::TierLayoutReader r5(lay5);
+            CHECK(r6.index().size() == r5.index().size());
+            bool slots_same = r6.index().size() == r5.index().size();
+            for (std::size_t i = 0; slots_same && i < r5.index().size(); ++i) {
+                const auto& e6 = r6.index()[i];
+                const auto& e5 = r5.index()[i];
+                slots_same = e6.group_id == e5.group_id &&
+                             e6.data_offset == e5.data_offset &&
+                             e6.slot_bytes == e5.slot_bytes &&
+                             e6.crc32 == e5.crc32;
+            }
+            CHECK_MSG(slots_same,
+                      "слоты перегенерации (с dtype_orig) != прежним (побитно)");
+
+            const se::PlainSpec s6 = se::plain_spec_from_description(d6);
+            const se::ExecutionPlan p6 = se::build_execution_plan(s6);
+            const se::PlainSpec s5 = se::plain_spec_from_description(d5);
+            const se::ExecutionPlan p5 = se::build_execution_plan(s5);
+            const se::LoadedWeights w6 =
+                se::load_plain_weights(lay6, s6, se::PlainWeightsStellTier);
+            const se::LoadedWeights w5 =
+                se::load_plain_weights(lay5, s5, se::PlainWeightsStellTier);
+            se::OpsInterpreter i6(s6, p6, w6, nullptr);
+            se::OpsInterpreter i5(s5, p5, w5, nullptr);
+            const std::vector<std::int32_t> prompt = {1, 2, 3, 4, 5};
+            const std::vector<float> l6 = i6.run_prompt_logits(prompt);
+            const std::vector<float> l5 = i5.run_prompt_logits(prompt);
+            CHECK(l6.size() == l5.size());
+            bool logits_same = l6.size() == l5.size();
+            for (std::size_t i = 0; logits_same && i < l5.size(); ++i)
+                logits_same = l6[i] == l5[i];
+            CHECK_MSG(logits_same,
+                      "логиты перегенерации (с dtype_orig) != прежним (побитно)");
+            std::printf("R2: dtype_orig=\"%s\" — слоты/логиты перегенерации побитово == прежним\n",
+                        expect);
+        };
+
+        {
+            const std::string dir = out_dir("/tmp/stell_hf_u32");
+            check_dtype_orig(uniform_dense("F32"), dir, "LlamaForCausalLM", false, "f32");
+        }
+        {
+            const std::string dir = out_dir("/tmp/stell_hf_ubf");
+            check_dtype_orig(uniform_dense("BF16"), dir, "LlamaForCausalLM", false, "bf16");
+        }
+        {
+            const std::string dir = out_dir("/tmp/stell_hf_uf16");
+            check_dtype_orig(uniform_dense("F16"), dir, "LlamaForCausalLM", false, "f16");
+        }
+
+        // Смешанный источник (нормы F32 + матрицы F16) — поле НЕ пишется
+        // (честно: скаляр неоднозначен; полный состав — в Stats конвертера
+        // groups_dtype_orig_bf16/f32 и логе CLI конвертера).
+        {
+            const std::string dir = out_dir("/tmp/stell_hf_mixed_dt");
+            auto ts = dense_hf_tensors();
+            write_config(dir, "LlamaForCausalLM", false);
+            write_shards(dir, ts);
+            const std::string json = hf_to_description(dir);
+            CHECK(json.find("\"dtype_orig\"") == std::string::npos);
+            std::printf("R2: смешанный источник — dtype_orig отсутствует (честно; состав — в Stats/логе конвертера)\n");
+        }
     }
 
     // =========================================================================

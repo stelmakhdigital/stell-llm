@@ -57,6 +57,11 @@ public:
     // convert_streaming, печатается в лог CLI конвертера (счётчик сатураций
     // clamp-сатурации F32/BF16→F16; исходные dtype групп — dtype_orig: bf16/f32,
     // честность профиля: точка регрессии/замер знает о сжатии из BF16).
+    // [R2] round 6: провенанс dtype_orig живёт в ДВУХ местах — здесь
+    // (счётчики групп по dtype) и top-level поле "dtype_orig" описания
+    // (пишет hf_to_description при однородном источнике: "f32"/"bf16"/"f16";
+    // при смешанном — поле не пишется, полный состав — эти счётчики; поле
+    // читает R8-обёртка serve/bench из description.json).
     struct Stats {
         std::uint64_t f16_saturations = 0;      // значений, сатурированных к ±65504
         std::uint64_t groups_dtype_orig_bf16 = 0;  // группы с исходным dtype bf16
