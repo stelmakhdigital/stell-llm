@@ -255,6 +255,69 @@ def test_real_provenance_co_tenancy_flag(synthetic_spec):
     assert prov2["co_tenancy"] is False
 
 
+# ---------------- dtype_orig / полный provenance ([R2] round 6) ----------------
+
+def _spec_with_desc(synthetic_spec, **overrides):
+    """Копия синтетического spec с переопределёнными полями описания."""
+    desc = dict(synthetic_spec.desc)
+    desc.update(overrides)
+    return RealModelSpec(synthetic_spec.desc_path, synthetic_spec.weights_path,
+                         desc, root=synthetic_spec.root,
+                         tokenizer_path=synthetic_spec.tokenizer_path)
+
+
+def test_dtype_orig_read_from_description(synthetic_spec):
+    """[R2] round 6: dtype_orig есть в description.json → значение читается
+    в provenance (полный provenance точки регрессии), пометка не пишется."""
+    spec = _spec_with_desc(synthetic_spec, dtype_orig="bf16")
+    prov = real_provenance(spec, "lib.so", False, None)
+    assert prov["dtype_orig"] == "bf16"
+    assert "dtype_orig_note" not in prov
+    # dtype_weights (профиль) не путается с dtype_orig (источник):
+    assert prov["dtype_weights"] == "NVFP4"
+
+
+def test_dtype_orig_absent_honest_regen_note(synthetic_spec):
+    """[R2] round 6: поле dtype_orig отсутствует (описание round 4 и ранее)
+    → dtype_orig=None ПЛЮС честная пометка dtype_orig_note «описание
+    перегенерировать» — НЕ молчаливое отсутствие; поле не угадывается."""
+    prov = real_provenance(synthetic_spec, "lib.so", False, None)
+    assert prov["dtype_orig"] is None
+    assert "dtype_orig_note" in prov, "молчаливое None запрещено [R2]"
+    note = prov["dtype_orig_note"]
+    assert "перегенерировать" in note
+    assert "provenance" in note
+    # значение не подменено догадкой из dtype_weights/профиля:
+    assert prov["dtype_weights"] == "NVFP4"
+
+
+def test_dtype_orig_blank_is_honest_none(synthetic_spec):
+    """[R2] round 6: пустая/пробельная строка dtype_orig — тоже честное
+    отсутствие с пометкой (артефакт не получает пустую строку как значение)."""
+    spec = _spec_with_desc(synthetic_spec, dtype_orig="   ")
+    prov = real_provenance(spec, "lib.so", False, None)
+    assert prov["dtype_orig"] is None
+    assert "перегенерировать" in prov["dtype_orig_note"]
+
+
+def test_dtype_orig_note_reaches_artifact_log(real_engine_lib, synthetic_model_dir,
+                                              tmp_path):
+    """[R2] round 6 (пометки — в самом артефакте): при живом прогоне без
+    dtype_orig в описании пометка «описание перегенерировать» попадает и в
+    report.json (provenance.dtype_orig_note), и в run.log артефакта."""
+    out = tmp_path / "r8-dtype-note"
+    rc = main(["--real", "--live", "--results-dir", str(out),
+               "--engine-lib", str(real_engine_lib),
+               "--real-model-dir", str(synthetic_model_dir)])
+    assert rc == 0
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    prov = report["provenance"]
+    assert prov["dtype_orig"] is None
+    assert "перегенерировать" in prov["dtype_orig_note"]
+    log_text = (out / "run.log").read_text(encoding="utf-8")
+    assert "перегенерировать" in log_text
+
+
 def test_real_gates_projection_fallback_without_tokenizer(real_engine_lib,
                                                           tmp_path):
     """Каталог без tokenizer.json: честная проекция байта → токен (механи-
