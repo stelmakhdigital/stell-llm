@@ -11,6 +11,7 @@ add_executable(test_parallel
     test_meta_broadcast.cpp
     test_subgroup_token_width.cpp
     test_golden_real_models.cpp
+    test_p2p_retry.cpp
 )
 
 target_include_directories(test_parallel PRIVATE

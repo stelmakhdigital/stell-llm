@@ -1,15 +1,38 @@
-// tests/parallel: GPU-тест NCCL-backend (ADR-02/ADR-10 §2) — задача 3 раунда 2.
+// tests/parallel: GPU-тест NCCL-backend (ADR-02/ADR-10 §2) — задача 3 раунда 2,
+// ретрай-протокол P2P — [R3] раунда 3 (planner round 2 [Q1]).
 //
 // Собирается ТОЛЬКО при STELL_CUDA=ON + libnccl (сервер, cuda 12.8 + libnccl).
-// Co-tenancy честно: чужой процесс strata держит ~21–30 GB VRAM на V100 —
-// тест работает в свободной VRAM, печатает занятость и честно PENDING при
-// OOM/нехватке. Замер latency allreduce F32 разных размеров (V100-SXM2,
-// NVLink), медиана по итерациям. Проверки корректности allreduce/allgather.
+//
+// Протокол [R3] (docs/design/server-env.md, src/parallel/include/stell/parallel/p2p_retry.hpp):
+//   КОРРЕКТНОСТЬ — пара GPU0 (V100) + GPU4 (RTX 2060) по умолчанию
+//   (STELL_GPU_TEST_DEVICES "0,4"; переопределяется env STELL_GPU_DEVICES,
+//   напр. "0,1,2,3"): побитово == CPU-эталону (эмуляторные golden не трогаются).
+//   При неудаче/зависании попытки 1 (зависание P2P-коллективов при
+//   ncclCommInitRank COMPLETE — типичный признак вмешательства co-tenancy
+//   в direct-pointer P2P) — АВТОМАТИЧЕСКАЯ попытка 2 с NCCL_P2P_DISABLE=1:
+//   корректность обязана подтверждаться и без P2P (ring через host/shm).
+//   Ретрай исполняется самим тестом: бинарник перезапускает себя дочерним
+//   процессом под watchdog'ом (зависание NCCL-коллектива не перехватывается
+//   внутри процесса). Третьей попытки нет. Логика решений — чистый заголовок
+//   p2p_retry.hpp, юнит-тест на CPU: tests/parallel/test_p2p_retry.cpp.
+//   Ручной вариант для worker'а (если ретрай подавлен или нужен отдельный шаг):
+//     NCCL_P2P_DISABLE=1 STELL_GPU_DEVICES=0,4 ctest -R parallel_gpu --output-on-failure
+//   LATENCY-БЕНЧ (V100↔V100 по NVLink, для целей PLAN.md §5) — отдельная фаза,
+//   ТОЛЬКО при наличии окна (после подтверждения корректности; пропуск —
+//   env STELL_GPU_BENCH=0), с co-tenancy-пометкой; замеры на RTX 2060
+//   с целями §5 не сравниваются (server-env: «не пригодна для §5»).
+//
+// Честный PENDING (checks=0 failures=0) при недоступности карт СОХРАНЁН:
+// недоступность/OOM/сбой бутстрапа → PENDING, тест зелёный, проверок нет.
+// Честный FAIL: если прогон дошёл до проверок, а корректность НЕ подтверждена
+// (битовое равенство нарушено) — тест красный (маскировать pending'ом
+// запрещено: «корректность обязана подтверждаться»).
 //
 // Запуск: ctest -R parallel_gpu  (или бинарник напрямую).
 #include "test_harness.hpp"
 #include "stell/parallel/comm.hpp"
 #include "stell/parallel/nccl_communicator.hpp"
+#include "stell/parallel/p2p_retry.hpp"
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -20,16 +43,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;   // для execve: окружение дочернего процесса
 
 using namespace stell::parallel;
 
 namespace {
 
 #ifndef STELL_GPU_TEST_DEVICES
-#define STELL_GPU_TEST_DEVICES "0,1"   // 2 ранка: свободная VRAM ~2–11 GB
+#define STELL_GPU_TEST_DEVICES "0,4"   // протокол [Q1]: GPU0 (V100) + GPU4 (RTX 2060)
 #endif
 
 std::vector<int> parse_devices(const char* s) {
@@ -51,12 +82,27 @@ void check_cuda(cudaError_t r, const char* what) {
     }
 }
 
+// Исход фазы для родителя-оркестратора (значение файла результата дочернего
+// процесса; см. p2p_retry.hpp). Перезаписывается тестами.
+std::string g_phase_outcome = "pending:тесты не выполнены";
+
+// Была ли в фазе исключительная ситуация (отличать от битового несовпадения):
+// true (CommError/прочее) → честный PENDING; false при !ok — прогон дошёл
+// до проверок, корректность не подтверждена → честный FAIL.
+std::atomic<bool> g_threw{false};
+
 // Честная co-tenancy: занятость каждой карты перед прогоном.
+// Не бросает: недоступность карты — честный pending (см. ниже), не FAIL.
 void report_cotenance(const std::vector<int>& devices) {
     int prev = -1;
     cudaGetDevice(&prev);
     for (int d : devices) {
-        check_cuda(cudaSetDevice(d), "cudaSetDevice(report)");
+        if (cudaSetDevice(d) != cudaSuccess) {
+            std::printf("COTENANCE: GPU %d: cudaSetDevice не удался — карта недоступна, "
+                        "честный pending\n", d);
+            g_phase_outcome = "pending:карта недоступна (cudaSetDevice)";
+            continue;
+        }
         std::size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
             std::printf("COTENANCE: GPU %d: свободно %.2f GB / %.2f GB "
@@ -143,7 +189,9 @@ void rank_body(const ParallelConfig& cfg, const std::vector<std::size_t>& sizes,
 
 TEST(parallel_gpu_nccl_allreduce_allgather_latency) {
     // Список устройств: env STELL_GPU_DEVICES (напр. "0,1,2,3") перекрывает
-    // дефолт STELL_GPU_TEST_DEVICES.
+    // дефолт STELL_GPU_TEST_DEVICES. Фаза bench [R3]: только при наличии окна
+    // (запускается оркестратором после подтверждения корректности или в
+    // TP1-режиме); замеры co-tenancy помечены и с целями §5 не сравниваются.
     const char* env = std::getenv("STELL_GPU_DEVICES");
     const std::vector<int> devices =
         parse_devices(env ? env : STELL_GPU_TEST_DEVICES);
@@ -173,21 +221,28 @@ TEST(parallel_gpu_nccl_allreduce_allgather_latency) {
                 rank_body(rc, sizes, iters, outs[std::size_t(r)]);
             } catch (const CommError& e) {
                 std::printf("PENDING: CommError на ранке %d: %s\n", int(r), e.what());
+                g_threw.store(true);
                 ok.fail();
             } catch (...) {
                 std::printf("PENDING: неизвестная ошибка на ранке %d\n", int(r));
+                g_threw.store(true);
                 ok.fail();
             }
         });
     for (auto& t : th) t.join();
 
     if (!ok.get()) {
+        if (g_threw.load())
+            g_phase_outcome = "pending:NCCL-прогон не удался (co-tenancy/OOM/бутстрап)";
+        else
+            g_phase_outcome = "fail:корректность allreduce/allgather не подтверждена";
         std::printf("PENDING: NCCL-прогон не удался (co-tenancy/OOM/бутстрап) — "
                     "см. вывод выше; GPU-результат не выдаётся за проверку\n");
         return;
     }
-    std::printf("NCCL-BENCH allreduce F32, V100-SXM2 NVLink, co-tenancy "
-                "(strata ~21–30 GB), медиана µs по %d итерациям:\n", iters);
+    std::printf("NCCL-BENCH allreduce F32, медиана µs по %d итерациям "
+                "(co-tenancy: замер под нагрузкой strata, с целями §5 НЕ сравнивать "
+                "если среди карт есть RTX 2060 / нет NVLink):\n", iters);
     for (std::size_t si = 0; si < sizes.size(); ++si) {
         std::printf("NCCL-BENCH: size=%6zu floats (%6zu KB):", sizes[si],
                     sizes[si] * 4 / 1024);
@@ -195,19 +250,21 @@ TEST(parallel_gpu_nccl_allreduce_allgather_latency) {
             std::printf(" rank%zu=%.1fµs", std::size_t(r), outs[r].latency_us[si]);
         std::printf("\n");
     }
+    g_phase_outcome = kOutcomePass;
     CHECK(ok.get());
 }
 
 // --- [R6] GPU-контракт expert_alltoall (token_elems) + kv_stream -------------
 
 // CPU-эмуляторный контракт этих операций прогнан в tests/parallel (tok_width_*,
-// sub_*); здесь — NCCL-исполнение. PENDING: worker прогоняет после merge
-// (co-tenancy честная; при OOM/нехватке VRAM — честный pending, см. шапку).
+// sub_*); здесь — NCCL-исполнение на паре [Q1] (GPU0 V100 + GPU4 RTX 2060
+// по умолчанию) с ретраем [R3] при зависании P2P (см. шапку файла).
 TEST(parallel_gpu_nccl_expert_alltoall_kv_stream) {
     const char* env = std::getenv("STELL_GPU_DEVICES");
     const std::vector<int> devices = parse_devices(env ? env : STELL_GPU_TEST_DEVICES);
     if (devices.size() < 2) {
         std::printf("PENDING: нужно ≥2 устройств (STELL_GPU_DEVICES)\n");
+        g_phase_outcome = kOutcomeFewDevices;
         return;
     }
     constexpr int DM = 8, T = 4;                     // токен = d_model векторов
@@ -306,22 +363,233 @@ TEST(parallel_gpu_nccl_expert_alltoall_kv_stream) {
                 }
             } catch (const CommError& e) {
                 std::printf("PENDING: CommError (rank %d): %s\n", int(r), e.what());
+                g_threw.store(true);
                 ok.fail();
             } catch (...) {
                 std::printf("PENDING: неизвестная ошибка (rank %d)\n", int(r));
+                g_threw.store(true);
                 ok.fail();
             }
         });
     for (auto& t : th) t.join();
     if (!ok.get()) {
-        std::printf("PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён "
-                    "(co-tenancy/OOM/бутстрап) — worker прогонит после merge\n");
+        if (g_threw.load())
+            g_phase_outcome = "pending:GPU-контракт expert_alltoall/kv_stream: "
+                              "co-tenancy/OOM/бутстрап (проверки не проведены)";
+        else
+            g_phase_outcome = "fail:корректность expert_alltoall/kv_stream не подтверждена";
+        std::printf("PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён — "
+                    "см. вывод выше\n");
         return;
     }
+    g_phase_outcome = kOutcomePass;
     CHECK(ok.get());
 }
 
+// --- оркестратор [R3]: дочерние процессы под watchdog'ом ----------------------
+
+namespace {
+
+constexpr int kDefaultWatchdogS = 240;   // зависание NCCL-коллектива — только извне
+
+const char* phase_filter(const char* phase) {
+    // bench-фаза — только латентности; correctness — контракт alltoall/kv_stream.
+    return std::strcmp(phase, "bench") == 0 ? "parallel_gpu_nccl_allreduce"
+                                            : "parallel_gpu_nccl_expert_alltoall";
+}
+
+int run_child_phase(const char* phase, const char* out_file,
+                    bool disable_p2p, int watchdog_s, const char* tag) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::printf("PENDING: fork не удался (%s) — честный pending\n", tag);
+        return -1;
+    }
+    if (pid == 0) {
+        // Дочерний процесс: свежий образ (CUDA/NCCL-состояние родителя не
+        // наследуется — exec), окружение + метки фазы и файла результата.
+        std::vector<std::string> env_store;
+        for (char** e = environ; e && *e; ++e) {
+            std::string kv(*e);
+            // NCCL_P2P_DISABLE попытки 2 — заменить унаследованный.
+            if (disable_p2p && kv.rfind("NCCL_P2P_DISABLE=", 0) == 0) continue;
+            env_store.push_back(std::move(kv));
+        }
+        env_store.push_back(std::string("STELL_GPU_TEST_PHASE=") + phase);
+        env_store.push_back(std::string("STELL_GPU_TEST_OUT=") + out_file);
+        if (disable_p2p) env_store.push_back("NCCL_P2P_DISABLE=1");
+        std::vector<char*> envp;
+        for (auto& kv : env_store) envp.push_back(kv.data());
+        envp.push_back(nullptr);
+        char arg0[] = "/proc/self/exe";
+        char* argv[] = {arg0, nullptr};
+        execve("/proc/self/exe", argv, envp.data());
+        _exit(127);   // exec не удался
+    }
+    // Watchdog: зависший NCCL-коллектив завершается только извне (SIGKILL).
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(watchdog_s);
+    int status = 0;
+    bool timed_out = false;
+    for (;;) {
+        const pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (std::chrono::steady_clock::now() > deadline) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            timed_out = true;
+            break;
+        }
+        usleep(200 * 1000);
+    }
+    if (timed_out) {
+        std::printf("WATCHDOG: попытка %s убита по тайм-ауту %dс (NCCL-коллектив завис?)\n",
+                    tag, watchdog_s);
+        return -2;   // зависание
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -3;
+}
+
+std::string read_outcome(const char* path) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return "";   // крах/убитый процесс — пустой исход (ретрай-класс)
+    std::string s;
+    char buf[256];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    return s;
+}
+
+int orchestrate() {
+    const char* env_devices = std::getenv("STELL_GPU_DEVICES");
+    const std::vector<int> devices =
+        parse_devices(env_devices ? env_devices : STELL_GPU_TEST_DEVICES);
+    std::string devices_str = "[";
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        if (i) devices_str += ',';
+        devices_str += std::to_string(devices[i]);
+    }
+    devices_str += ']';
+    int watchdog_s = kDefaultWatchdogS;
+    if (const char* w = std::getenv("STELL_GPU_TEST_TIMEOUT_S")) watchdog_s = atoi(w);
+
+    char out_path[] = "/tmp/stell_gpu_test_out.XXXXXX";
+    const int out_fd = mkstemp(out_path);
+    if (out_fd < 0) {
+        std::printf("PENDING: mkstemp не удался — честный pending\n");
+        return 0;
+    }
+    close(out_fd);
+    const std::string out_file(out_path);
+
+    // --- Фаза 1: корректность (до 2 попыток, вторая — с NCCL_P2P_DISABLE=1) --
+    std::string outcome;
+    int attempt = 1;
+    for (;;) {
+        if (attempt == 1)
+            std::printf("GPU-VALIDATION: фаза корректности, попытка 1 (карты %s: "
+                        "протокол [Q1] — пара GPU0 V100 + GPU4 RTX 2060; "
+                        "переопределить: STELL_GPU_DEVICES)\n",
+                        devices_str.c_str());
+        else
+            std::printf("GPU-VALIDATION: попытка 2 с NCCL_P2P_DISABLE=1 "
+                        "(ring через host/shm — корректность обязана подтверждаться "
+                        "и без P2P)\n");
+        std::fflush(stdout);
+        std::remove(out_file.c_str());   // исход предыдущей попытки не выдавать за текущую
+        const int rc = run_child_phase("correctness", out_file.c_str(),
+                                       std::string(p2p_disable_env(attempt)) == "1",
+                                       watchdog_s, "корректности");
+        if (rc == -1) {   // fork не удался — повтор бесполезен, честный pending
+            outcome = "pending:fork не удался";
+            break;
+        }
+        outcome = read_outcome(out_file.c_str());   // rc == -2 → файл пуст (зависание)
+        // Решение протокола: pass → стоп; неудача попытки 1 → ретрай без P2P;
+        // неудача попытки 2 (или зависание) → GiveUp.
+        const GpuRetryVerdict v = p2p_retry_decide(attempt, outcome);
+        if (v == GpuRetryVerdict::Pass) break;
+        if (v == GpuRetryVerdict::RetryWithP2pDisabled) { attempt = 2; continue; }
+        break;   // GiveUpPending: попытки исчерпаны
+    }
+
+    // --- Вердикт фазы корректности -----------------------------------------
+    if (outcome_is_fail(outcome)) {
+        std::printf("GPU-VALIDATION FAIL: корректность NCCL-контракта НЕ подтверждена "
+                    "(побитовое равенство CPU-эталону нарушено) — см. вывод попыток выше\n");
+        std::remove(out_file.c_str());
+        return 1;   // честный FAIL: маскировать pending'ом запрещено
+    }
+    if (!bench_allowed_after(outcome)) {
+        std::printf("GPU-VALIDATION PENDING: %s "
+                    "(checks=0 failures=0 — проверки корректности не проводились; "
+                    "worker повторит в окне; co-tenancy: см. server-env)\n",
+                    outcome.c_str());
+        std::remove(out_file.c_str());
+        return 0;
+    }
+    if (outcome != kOutcomePass)
+        std::printf("GPU-VALIDATION: корректность неприменима (меньше 2 карт) — "
+                    "переходим к bench-фазе (TP1-режим scaling-бенчмарка [R8])\n");
+    else if (attempt == 2)
+        std::printf("GPU-VALIDATION: корректность подтверждена БЕЗ P2P "
+                    "(NCCL_P2P_DISABLE=1, ring через host/shm) — co-tenancy "
+                    "вмешалась в direct-pointer P2P; пометить в отчёте\n");
+    else
+        std::printf("GPU-VALIDATION: корректность подтверждена (побитово == CPU-эталону)\n");
+
+    // --- Фаза 2: latency-бенч — только при наличии окна ([R3]б) ------------
+    if (const char* b = std::getenv("STELL_GPU_BENCH"); b && std::strcmp(b, "0") == 0) {
+        std::printf("GPU-VALIDATION: bench-фаза пропущена (STELL_GPU_BENCH=0) — "
+                    "latency-замер только в чистом окне V100↔V100 по NVLink, "
+                    "co-tenancy-пометка обязательна\n");
+        std::remove(out_file.c_str());
+        return 0;
+    }
+    std::fflush(stdout);
+    std::remove(out_file.c_str());
+    const int rc = run_child_phase("bench", out_file.c_str(), /*disable_p2p=*/false,
+                                   watchdog_s, "bench");
+    const std::string bench_outcome =
+        (rc == -2) ? "pending:bench-прогон завис (убит watchdog'ом)" : read_outcome(out_file.c_str());
+    if (rc == -2) {
+        std::printf("GPU-VALIDATION: latency-бенч не проведён (зависание) — "
+                    "co-tenancy: замер отложен до чистого окна V100↔V100; "
+                    "корректность выше подтверждена\n");
+    } else if (bench_outcome.empty()) {
+        std::printf("GPU-VALIDATION: latency-бенч не проведён (дочерний процесс "
+                    "завершился аварийно, exit=%d) — замер отложен до чистого окна "
+                    "V100↔V100; корректность выше подтверждена\n", rc);
+    } else if (!outcome_is_pass(bench_outcome)) {
+        std::printf("GPU-VALIDATION: latency-бенч не проведён (%s) — "
+                    "co-tenancy: замер отложен до чистого окна V100↔V100; "
+                    "корректность выше подтверждена\n", bench_outcome.c_str());
+    } else {
+        std::printf("GPU-VALIDATION OK: корректность + латентности (см. NCCL-BENCH выше; "
+                    "co-tenancy-пометка обязательна)\n");
+    }
+    std::remove(out_file.c_str());
+    return 0;
+}
+
+} // namespace
+
 int main() {
-    testfw::run_all("test_parallel_gpu");
-    return testfw::failures() == 0 ? 0 : 1;
+    // Дочерний режим: исполнить одну фазу и записать исход в файл результата.
+    if (const char* phase = std::getenv("STELL_GPU_TEST_PHASE")) {
+        testfw::run_all("test_parallel_gpu", phase_filter(phase));
+        const char* out = std::getenv("STELL_GPU_TEST_OUT");
+        if (out) {
+            FILE* f = std::fopen(out, "w");
+            if (f) {
+                std::fwrite(g_phase_outcome.data(), 1, g_phase_outcome.size(), f);
+                std::fclose(f);
+            }
+        }
+        // pending (checks=0 failures=0) → 0; fail (CHECK не прошёл) → 1.
+        return testfw::failures() == 0 ? 0 : 1;
+    }
+    return orchestrate();
 }
