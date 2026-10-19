@@ -1,0 +1,3 @@
+quality-gates REAL: модель=synthetic-realistic-moe, веса=/tmp/tmp.yTgjgpBRTe/model/model.safetensors (130704 B), co-tenancy=False
+точка регрессии R8: PPL + GSM8K-32 + HumanEval-32 через ABI (stell_logits); provenance в report.json
+каталог — синтетический «реалистичный профиль»: stell_bench.synthetic_model.build_realistic_profile(dir, seed=0x5E8E) — воспроизводим (LCG-веса, эталонный tokenizer.json HF); значения — точки регрессии конвейера
