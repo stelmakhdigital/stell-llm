@@ -428,7 +428,8 @@ void OpsInterpreter::layer_body(std::size_t layer, std::vector<float>& hidden,
 
 // --- forward / step ----------------------------------------------------------
 
-std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t token) {
+std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t token,
+                                                 bool with_logits) {
     if (token < 0 || token >= static_cast<std::int32_t>(spec_.vocab_size))
         throw std::invalid_argument("ops runner: токен вне словаря (" +
                                     std::to_string(token) + ")");
@@ -445,6 +446,7 @@ std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t tok
     // токена = st.pos (общий счёт последовательности, не per-layer).
     for (std::size_t l = 0; l < spec_.n_layers; ++l) layer_body(l, hidden, st);
     ++st.pos;
+    if (!with_logits) return {};   // [R1]: projection последней позиции — см. run_prompt_logits
 
     // Финальная норма + logits (группа "norm_final"; голова — "head", при
     // отсутствии — weight tying на embedding, честная пометка).
@@ -485,9 +487,10 @@ std::vector<float> OpsInterpreter::step_logits(SlotId slot,
     SlotState& st = slots_[slot];
     if (!st.inited) {
         reset_slot(st, spec_.n_layers);
-        // Prefill: все токены промпта, кроме последнего (кеш KV слота).
+        // Prefill: все токены промпта, кроме последнего (кеш KV слота);
+        // логиты промежуточных позиций prefill не нужны — [R1] last-only.
         for (std::size_t i = 0; i + 1 < prompt.size(); ++i)
-            (void)forward_token(st, prompt[i]);
+            (void)forward_token(st, prompt[i], /*with_logits=*/false);
         st.inited = true;
     }
     return forward_token(st, token);
@@ -499,14 +502,27 @@ std::vector<std::vector<float>> OpsInterpreter::run_prompt_logits_all(
     reset_slot(st, spec_.n_layers);
     std::vector<std::vector<float>> rows;
     rows.reserve(prompt.size());
-    for (std::int32_t tok : prompt) rows.push_back(forward_token(st, tok));
+    for (std::int32_t tok : prompt) rows.push_back(forward_token(st, tok, /*with_logits=*/true));
     return rows;
 }
 
 std::vector<float> OpsInterpreter::run_prompt_logits(
     const std::vector<std::int32_t>& prompt) {
-    const std::vector<std::vector<float>> rows = run_prompt_logits_all(prompt);
-    return rows.empty() ? std::vector<float>{} : rows.back();
+    // [R1] round 5 (ADR-11 «Уточнение round 5», planner Q1): positions:"last"
+    // вычисляет projection логитов ТОЛЬКО последней позиции — промежуточные
+    // позиции исполняют forward без материализации матрицы логитов O(vocab)
+    // (стоимость projection O(vocab), а не O(prefix×vocab); прежний путь
+    // run_prompt_logits_all(...).back() скрыто материализовал n_positions ×
+    // n_vocab логитов ради одной строки). Результат побитово == прежнему:
+    // projection — чистая функция hidden/KV-состояния, состояние не меняет.
+    // KV-инкрементальность (пересчёт префикса при повторных вызовах) —
+    // отдельная задача (решение planner round 5 [Q1]: ABI-семантику не менять).
+    SlotState st{};
+    reset_slot(st, spec_.n_layers);
+    if (prompt.empty()) return {};
+    for (std::size_t i = 0; i + 1 < prompt.size(); ++i)
+        (void)forward_token(st, prompt[i], /*with_logits=*/false);
+    return forward_token(st, prompt.back(), /*with_logits=*/true);
 }
 
 // --- sampling ----------------------------------------------------------------

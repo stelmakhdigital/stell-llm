@@ -60,7 +60,10 @@ public:
     std::vector<float> step_logits(SlotId slot, const std::vector<std::int32_t>& prompt,
                                    std::int32_t token);
 
-    // Логиты последнего токена промпта на свежем состоянии (golden-тест).
+    // Логиты последнего токена промпта на свежем состоянии (golden-тест;
+    // [R1] round 5, ADR-11 «Уточнение round 5»: positions:"last" вычисляет
+    // projection только последней позиции — O(vocab), не O(prefix×vocab);
+    // результат побитово == run_prompt_logits_all(prompt).back()).
     std::vector<float> run_prompt_logits(const std::vector<std::int32_t>& prompt);
 
     // Логиты ВСЕХ позиций промпта на свежем состоянии ([P][vocab]; режим
@@ -107,7 +110,8 @@ private:
 
     void pin_and_prefetch(std::size_t layer);         // ADR-08 §2/§5 (+ prefetch)
     void unpin_layer(std::size_t layer);              // снятие пина после слоя
-    std::vector<float> forward_token(SlotState& st, std::int32_t token);
+    std::vector<float> forward_token(SlotState& st, std::int32_t token,
+                                     bool with_logits = true);
     static void reset_slot(SlotState& st, std::size_t n_layers);
 
     const PlainGroup* group(const std::string& name) const;         // поиск по имени

@@ -237,3 +237,14 @@ target_include_directories(test_engine_weight_path PRIVATE ../../tests/core)
 target_compile_definitions(test_engine_weight_path PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/weight_path COMMAND test_engine_weight_path)
+
+# --- round 5 (T-20261017200354): [R1] last-only projection -------------------
+
+add_executable(test_engine_prompt_last
+    ../../tests/core/engine/test_prompt_last.cpp
+)
+target_link_libraries(test_engine_prompt_last stell_engine)
+target_include_directories(test_engine_prompt_last PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_prompt_last PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/prompt_last COMMAND test_engine_prompt_last)
