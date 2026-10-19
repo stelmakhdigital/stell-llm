@@ -20,9 +20,24 @@
 - CRC-политика (ADR-12 §2.3 «Уточнение round 3»): reader всегда проверяет
   `header_crc32`; payload-CRC при pin/read — только при
   `STELL_TIER_VERIFY_CRC=1` (env/конфиг, дефолт off в hot path);
-  публичный verify-проход слотов (`ITierManager`/harness-команда) —
-  обязательный механизм периодической целостности вне пути декода.
-  Точка гарантии — writer (CRC при записи).
+  публичный verify-проход слотов — обязательный механизм периодической
+  целостности вне пути декода. Точка гарантии — writer (CRC при записи).
+- Verify-проход — метод `TierManager::verify_slots()` (не harness-команда;
+  интерфейс `ITierManager` ADR-08 не расширяется — прецедент
+  `read_ram_slot`/`set_layer_map`); CRC-once (успешный проход помечает
+  группы; hot path с verify=on не перепроверяет); метрика `crc_checks()`;
+  OR-семантика флага (config || env); сырые reader'ы — verify=true
+  по умолчанию (см. ADR-12 «Уточнение round 3»).
+- Конфигурация тиров под профиль co-tenancy («свободно 2–11 ГБ на V100»,
+  RAM-тир основной, VRAM-тир мал): `tier_config_from_env(base)` — env
+  поверх базового конфига (`STELL_TIER_VRAM_SLOTS`,
+  `STELL_TIER_VRAM_SLOT_BYTES`, `STELL_TIER_RAM_MB`, `STELL_TIER_LOOKAHEAD`,
+  `STELL_TIER_HISTORY_CAP`, `STELL_TIER_VERIFY_CRC`, `STELL_TIER_POLICY`
+  (lru|lcu), `STELL_TIER_NVME_LAYOUT`; нечисловые значения → базовое);
+  `tier_config_co_tenancy(vram_budget_bytes, plan_bytes, slot_bytes)` —
+  именованный профиль: VRAM-слоты = бюджет/slot (мин. 1, больше плана не
+  выделяем), RAM = план целиком, NVMe = весь план; `slot_bytes` не кратен
+  4096 → `TierError(PlanMismatch)`.
 
 ## Объём (из PLAN.md §4, поток B)
 

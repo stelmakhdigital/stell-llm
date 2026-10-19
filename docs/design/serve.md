@@ -21,7 +21,20 @@
   `{"requests_total","errors_total","last_n_vocab","last_positions"}`;
   payload логитов (массивы) в `/metrics` запрещён — только через
   `stell_logits` (ADR-11 §4 «Уточнение round 3»). Тест serve проверяет
-  наличие всех четырёх полей и отсутствие массивов.
+  наличие всех четырёх полей и отсутствие массивов; валидация формата —
+  `is_valid_logits_snapshot` (`LOGITS_SNAPSHOT_FIELDS`); дашборд рендерит
+  строго 4 KV (фиксированная схема `LOGITS_FIELDS` в `app.js`).
+- Quality-gates `--live` (HumanEval-32): исполнение сгенерированного кода —
+  process-sandbox (`src/bench/stell_bench/code_sandbox.py`): RLIMIT_CPU=5с /
+  RLIMIT_AS=512 МиБ / RLIMIT_NOFILE=64, wall-таймаут 10с (kill+reap),
+  изолированный temp-dir, пустой env; классификация исхода ok/timeout/error.
+  **Честная граница: process-sandbox, НЕ security-граница** (права
+  пользователя, сеть не отключается; unprivileged seccomp/namespaces
+  недоступны — контейнерная изоляция вне рамок). Конвейер кейса: жадное
+  декодирование (≤32 токенов) → `extract_code` (первый markdown-fence, иначе
+  весь ответ) → исполнение против test-кейса задачи + `check(entry_point)` →
+  accuracy = доля exit 0; протокол-константы HUMANEVAL_PROMPT_TOKENS=64 /
+  HUMANEVAL_MAX_STEPS=32 фиксируются в report.json.
 
 ## Объём (из PLAN.md §4, поток E)
 

@@ -23,6 +23,27 @@
   `tokenizer.json` в каталоге модели, описан в реестре); инжект в engine —
   `Scheduler::set_tokenizer`; byte-fallback engine остаётся контрактной точкой.
 
+## Уточнения контракта (round 3, T-20261017200354)
+
+- Потоковая конвертация в stell-tier: `StellTierConverter::convert_streaming()`
+  — память O(максимальной группы) (одна группа + source-буфер, не O(размера
+  модели)); flush по группам (порог `flush_group_bytes`, дефолт 8 МиБ);
+  атомарная финализация `tmp → rename` + self-check собственным reader'ом;
+  fixup индекса (CRC-placeholder до данных, перезапись 64-байтовой записи
+  после каждого слота — правило ADR-12 «Уточнение round 3»).
+- `StellTierWriterConfig` — параметры тиров принимаются извне (согласованы
+  с `TierConfig` tiers; границы тиров задаёт tiers-конфиг); writer только
+  валидирует план: группа не влезает в `vram_slot_size` → `SchemaMismatch`
+  (fail-fast); `ram_capacity` в layout семантики не имеет; `slot_align`/
+  `index_align` фиксированы layout v1 (4096/512), кастомные значения →
+  `SchemaMismatch` (новая версия формата — только через ADR-12).
+- Публичный CLI `stell_convert_streaming <desc.json> <source> <out_dir>
+  [--vram-slot-size B] [--ram-capacity B] [--flush-mb N]`; старый
+  материализующий `convert()` не тронут (сравнение/совместимость).
+- Прогон на реальных весах — через env `STELL_R7_REAL_WEIGHTS_DIR`
+  (каталог safetensors-шардов HF) + `STELL_R7_REAL_DESC_JSON` (описание
+  ADR-09 схемы 1.0), без правки кода; веса в git не попадают.
+
 ## Объём (из PLAN.md §4, поток D)
 
 - Реестр архитектур: dense llama/qwen-класс; MoE glm/qwen-moe/deepseek-класс
