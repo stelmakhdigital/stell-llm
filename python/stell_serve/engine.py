@@ -293,11 +293,10 @@ class CtypesEngineBackend(EngineBackend):
 
     def cancel(self, session_id: int) -> None:
         rc = self.lib.stell_cancel(self._require_handle(), ctypes.c_uint64(session_id))
-        # Расхождение кодов возврата (зафиксировано в отчёте round 2; контракт
-        # не меняется): mock — 0 ок / <0 неизвестная сессия; реальный движок —
-        # 1 ок / 0 неизвестная сессия (scheduler.cancel → bool).
-        ok = (rc != 0) if self.kind == "real" else (rc == 0)
-        if not ok:
+        # Конвенция ADR-11 «Уточнение (round 2)» единая для mock и реального
+        # движка: 0 = успех, -1 = ошибка (сессия не найдена/уже закрыта);
+        # прежнее расхождение (real 1/0) устранено в core round 2.
+        if rc != 0:
             raise EngineError(f"cancel failed for session {session_id} (rc={rc})")
 
     def metrics(self) -> Dict[str, Any]:
