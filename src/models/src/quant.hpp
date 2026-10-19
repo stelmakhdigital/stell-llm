@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace stell::models {
@@ -34,6 +35,18 @@ inline std::size_t ggml_block_bytes(const std::string& dtype_str) {
 // --- float16 (IEEE 754 half) -----------------------------------------------
 std::uint16_t f32_to_f16_bits(float v);
 float f16_bits_to_f32(std::uint16_t h);
+
+// --- bfloat16 (round 4, R3-подготовка: BF16-тензора HF-чекпоинтов Qwen/
+// Mixtral/OLMoE) ------------------------------------------------------------
+// BF16 → F32: биты — старшая половина F32 (мантисса усекается, экспонента
+// та же — конверсия точная по значению). Обратная конверсия — f32_to_f16_bits
+// после привязки к F16 (см. plain_fill_slot).
+inline float bf16_bits_to_f32(std::uint16_t h) {
+    std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+    float v;
+    std::memcpy(&v, &bits, 4);
+    return v;
+}
 
 // --- float8 e4m3 (scale NVFP4) ---------------------------------------------
 std::uint8_t f32_to_e4m3(float v);

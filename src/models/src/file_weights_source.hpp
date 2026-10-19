@@ -3,12 +3,15 @@
 // разбор заголовка и заполнение payload.
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
+#include <system_error>
 
 #include "stell/models/description.hpp"
 #include "stell/models/weights.hpp"
@@ -24,6 +27,14 @@ struct TensorInfo {
     std::vector<std::int64_t> shape;
     std::uint64_t offset = 0;                    // абсолютное смещение payload в файле
     std::uint64_t bytes = 0;                     // размер payload
+    // Round 4 (R3-подготовка): BF16-тензора HF-чекпоинтов (Qwen/Mixtral/OLMoE)
+    // маппятся в F16 с флагом: значения декодируются bf16_bits_to_f32, конверсия
+    // BF16→F16 (→f32→F16) выполняется лоадером/конвертером как допустимая
+    // (та же семантика, что F32→F16; см. plain_fill_slot).
+    bool bf16 = false;
+    // Round 4 (R6): индекс шарда в каталоге HF-шардов (0 = одиночный файл);
+    // FILE* шарда — files_[shard_index] источника.
+    std::size_t shard_index = 0;
 };
 
 struct TensorFileMap {
@@ -42,8 +53,125 @@ inline void read_exact(std::FILE* f, std::uint64_t offset, void* dst, std::size_
                               std::to_string(count) + ")");
 }
 
-// Файл + резолюция source_pattern → TensorInfo по GroupId. KV-группы
-// (role=Kv, ADR-09 §1) весов не имеют и не резолвятся.
+// Полезная нагрузка группы plain-dtype (байты, до выравнивания) — общий для
+// лоадеров и конвертера (ADR-03): F16=2Б/эл, F32=4Б/эл, E4M3=1Б/эл; квантованные
+// профили (NVFP4/W4A16) — UnsupportedQuant (квантование — QuantizingSource/конвертер).
+inline std::size_t expected_payload(const stell::tiers::TensorGroup& g) {
+    std::size_t n = 1;
+    for (auto d : g.shape) n *= static_cast<std::size_t>(d);
+    switch (g.dtype) {
+        case stell::tiers::DType::F16: return n * 2;
+        case stell::tiers::DType::F32: return n * 4;
+        case stell::tiers::DType::E4M3: return n;
+        case stell::tiers::DType::NVFP4:
+        case stell::tiers::DType::W4A16:
+            throw LoaderError(LoaderError::Code::UnsupportedQuant,
+                              "квантованный payload — только лоадером NVFP4W4A16 (ADR-03)");
+    }
+    return 0;
+}
+
+// Общая (лоадер + конвертер) конверсия plain-payload источника в целевой dtype
+// группы с записью в слот (хвост до slot_bytes — нули, ADR-09 §3):
+//   F16→F16, F32→F32, E4M3→E4M3  — копия байтов;
+//   F32→F16, BF16→F16            — допустимая конвертация лоадера (не dequant);
+// прочие комбинации — SchemaMismatch/UnsupportedQuant (разрешения — в
+// compatible_plain вызовой стороны; здесь — честная проверка размеров).
+// Побитовая идентичность путей loader/converter — контракт round 4 (R4/R6):
+// слоты layout == слотам прямого лоадера. raw — ровно t.bytes байт тензора.
+inline void plain_fill_slot(const stell::tiers::TensorGroup& g, const TensorInfo& t,
+                            const std::vector<std::uint8_t>& raw, void* dst,
+                            std::size_t dst_bytes) {
+    std::size_t n = 1;
+    for (auto d : g.shape) n *= static_cast<std::size_t>(d);
+    if (raw.size() != t.bytes)
+        throw LoaderError(LoaderError::Code::IoFailure,
+                          "group '" + g.name + "': payload source буфер != t.bytes");
+    std::uint8_t* out = static_cast<std::uint8_t*>(dst);
+    std::size_t payload = 0;
+    const bool src_f32 = t.dtype == stell::tiers::DType::F32;
+    const bool src_bf16 = t.dtype == stell::tiers::DType::F16 && t.bf16;
+    if (g.dtype == stell::tiers::DType::F16 && (src_f32 || src_bf16)) {
+        // F32/BF16 → F16 (допустимая конвертация лоадера, ADR-09 §3).
+        payload = n * 2;
+        if (payload > dst_bytes)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "group '" + g.name + "': payload > dst_bytes");
+        for (std::size_t i = 0; i < n; ++i) {
+            const float v = src_f32
+                                ? [&] { float f; std::memcpy(&f, raw.data() + 4 * i, 4); return f; }()
+                                : bf16_bits_to_f32(static_cast<std::uint16_t>(raw[2 * i]) |
+                                                   (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8));
+            const std::uint16_t h = f32_to_f16_bits(v);
+            out[2 * i] = static_cast<std::uint8_t>(h & 0xFF);
+            out[2 * i + 1] = static_cast<std::uint8_t>((h >> 8) & 0xFF);
+        }
+    } else {
+        // Копия байтов (F16→F16, F32→F32, E4M3→E4M3).
+        payload = raw.size();
+        if (payload > dst_bytes)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "group '" + g.name + "': payload > dst_bytes");
+        std::memcpy(out, raw.data(), payload);
+    }
+    if (payload != expected_payload(g))
+        throw LoaderError(LoaderError::Code::SchemaMismatch,
+                          "group '" + g.name + "': payload size mismatch");
+    std::memset(out + payload, 0, dst_bytes - payload);
+}
+
+// Разбор заголовка safetensors — определение в loader_safetensors.cpp
+// (объявление в tensor_file_formats.hpp; здесь — форвард для
+// merge_safetensors_shards: прямой include циклится с TensorInfo).
+TensorFileMap parse_safetensors_header(std::FILE* f);
+
+// Round 4 (R6/R3-подготовка): каталог safetensors-шардов HF (model-0000X-of-
+// 0000Y.safetensors) — единый источник плана со смешанными dtype-группами.
+// Открывает все шард-файлы (FILE* остаются открытыми — владелец закрывает
+// close()), возвращает объединённую карту тензоров (TensorInfo.shard_index —
+// индекс в *files_out, offset — абсолютный внутри шарда). Порядок шардов —
+// отсортированный по имени (канонический порядок HF). Ошибки: IoFailure (в
+// каталоге нет .safetensors-шардов / шард не открылся), SchemaMismatch (тензор
+// в нескольких шардах).
+inline TensorFileMap merge_safetensors_shards(const std::string& dir,
+                                                      std::vector<std::FILE*>* files_out) {
+    std::error_code ec;
+    std::vector<std::string> shards;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (de.path().extension() == ".safetensors")
+            shards.push_back(de.path().string());
+    }
+    if (ec)
+        throw LoaderError(LoaderError::Code::IoFailure,
+                          "safetensors shards: cannot list '" + dir + "'");
+    std::sort(shards.begin(), shards.end());  // канонический порядок шардов HF
+    if (shards.empty())
+        throw LoaderError(LoaderError::Code::IoFailure,
+                          "safetensors shards: в каталоге '" + dir +
+                              "' нет .safetensors-шардов");
+
+    TensorFileMap merged;
+    for (std::size_t i = 0; i < shards.size(); ++i) {
+        std::FILE* f = std::fopen(shards[i].c_str(), "rb");
+        if (!f)
+            throw LoaderError(LoaderError::Code::IoFailure,
+                              "safetensors shards: cannot open " + shards[i]);
+        files_out->push_back(f);
+        TensorFileMap tfm = parse_safetensors_header(f);
+        for (auto& [name, info] : tfm.by_name) {
+            info.shard_index = i;
+            if (!merged.by_name.emplace(name, info).second)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "safetensors shards: тензор '" + name +
+                                      "' присутствует в нескольких шардах каталога '" +
+                                      dir + "'");
+        }
+    }
+    return merged;
+}
+
+// Файл (или каталог шардов) + резолюция source_pattern → TensorInfo по GroupId.
+// KV-группы (role=Kv, ADR-09 §1) весов не имеют и не резолвятся.
 class FileWeightsSource : public IWeightsSource {
 public:
     FileWeightsSource(std::string path, ModelDescription desc)
@@ -70,7 +198,11 @@ public:
     }
 
     void close() override {
-        if (file_) { std::fclose(file_); file_ = nullptr; }
+        for (std::FILE* f : files_) {
+            if (f) std::fclose(f);
+        }
+        files_.clear();
+        file_ = nullptr;
     }
 
     // Энергичная резолюция всех некешевых групп (fail-fast, ADR-09 §3).
@@ -79,9 +211,19 @@ public:
     // непрерывный блок по старшей размерности (row-major); форма среза =
     // форме группы (проверка — SchemaMismatch).
     void resolve_all() {
-        file_ = std::fopen(path_.c_str(), "rb");
-        if (!file_) throw LoaderError(LoaderError::Code::IoFailure, "cannot open " + path_);
-        tfm_ = parse_header();
+        std::error_code ec;
+        if (std::filesystem::is_directory(path_, ec)) {
+            // Round 4 (R6): каталог safetensors-шардов HF — один IWeightsSource
+            // на весь план (смешанные dtype-группы — атрибут каждой группы,
+            // ADR-09; ветвлений по «профилю» у источника нет).
+            file_ = nullptr;
+            tfm_ = merge_safetensors_shards(path_, &files_);
+        } else {
+            file_ = std::fopen(path_.c_str(), "rb");
+            if (!file_) throw LoaderError(LoaderError::Code::IoFailure, "cannot open " + path_);
+            files_.push_back(file_);
+            tfm_ = parse_header();
+        }
         for (std::size_t i = 0; i < desc_.groups.size(); ++i) {
             const auto& g = desc_.groups[i];
             if (g.role == stell::tiers::Role::Kv) continue;
@@ -152,57 +294,21 @@ protected:
 
     const ModelDescription& desc() const { return desc_; }
 
-    // Чтение payload тензора в буфер (ровно t.bytes байт).
+    // Чтение payload тензора в буфер (ровно t.bytes байт). Шард-aware (R6):
+    // тензора каталога читаются из своего шарда.
     void read_tensor_payload(const TensorInfo& t, void* dst) const {
-        read_exact(file_, t.offset, dst, t.bytes);
+        read_exact(files_.at(t.shard_index), t.offset, dst, t.bytes);
     }
 
-    // Заполнение слота группы plain-dtype: копия payload (с F32→F16 конвертом
-    // при необходимости), хвост слота — нули. Общий путь safetensors/GGUF.
+    // Заполнение слота группы plain-dtype: конверсия/копия payload (общий
+    // путь с конвертером — plain_fill_slot, побитовая идентичность путей),
+    // хвост слота — нули. Общий путь safetensors/GGUF.
     void fill_plain(const stell::tiers::TensorGroup& g, const TensorInfo& t,
                     void* dst, std::size_t dst_bytes) {
         std::vector<std::uint8_t> raw(t.bytes);
         read_tensor_payload(t, raw.data());
-        std::uint8_t* out = static_cast<std::uint8_t*>(dst);
-        std::size_t payload = t.bytes;
-        if (t.dtype == stell::tiers::DType::F32 && g.dtype == stell::tiers::DType::F16) {
-            // F32→F16 — допустимая конвертация лоадера (не dequant, ADR-09 §3).
-            std::size_t n = 1;
-            for (auto d : g.shape) n *= static_cast<std::size_t>(d);
-            std::vector<std::uint8_t> half(n * 2);
-            for (std::size_t i = 0; i < n; ++i) {
-                float v;
-                std::memcpy(&v, raw.data() + 4 * i, 4);
-                const std::uint16_t h = f32_to_f16_bits(v);
-                half[2 * i] = static_cast<std::uint8_t>(h & 0xFF);
-                half[2 * i + 1] = static_cast<std::uint8_t>((h >> 8) & 0xFF);
-            }
-            payload = half.size();
-            std::memcpy(out, half.data(), payload);
-        } else {
-            std::memcpy(out, raw.data(), payload);
-        }
-        if (payload != expected_payload(g))
-            throw LoaderError(LoaderError::Code::SchemaMismatch,
-                              "group '" + g.name + "': payload size mismatch");
-        std::memset(out + payload, 0, dst_bytes - payload);
+        plain_fill_slot(g, t, raw, dst, dst_bytes);
     }
-
-    static std::size_t expected_payload(const stell::tiers::TensorGroup& g) {
-        std::size_t n = 1;
-        for (auto d : g.shape) n *= static_cast<std::size_t>(d);
-        switch (g.dtype) {
-            case stell::tiers::DType::F16: return n * 2;
-            case stell::tiers::DType::F32: return n * 4;
-            case stell::tiers::DType::E4M3: return n;
-            case stell::tiers::DType::NVFP4:
-            case stell::tiers::DType::W4A16:
-                throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                                  "квантованный payload — только лоадером NVFP4W4A16 (ADR-03)");
-        }
-        return 0;
-    }
-
     // Проверка согласованности плана и тензора (ADR-09 §3: mismatch = исключение).
     void check_shape(const stell::tiers::TensorGroup& g, const TensorInfo& t) const {
         if (t.shape != g.shape)
@@ -211,11 +317,15 @@ protected:
                                   " != " + shape_str(g.shape) + ")");
     }
 
-    // Разрешённые dtype источника для целевого dtype группы (без квантования).
+    // Разрешённые dtype источника для целевого dtype группы (без квантования):
+    // F16-цель ← F16/BF16 (конверсия bf16→f32→f16) и F32 (конверсия F32→F16) —
+    // допустимые конвертации лоадера (не dequant), ADR-09 §3; F32/E4M3 — только
+    // точный источник. BF16-флаг: TensorInfo.dtype маппится в F16, декодирование —
+    // bf16_bits_to_f32 (см. plain_fill_slot).
     static bool compatible_plain(stell::tiers::DType target, const TensorInfo& t) {
         if (target == stell::tiers::DType::F16 &&
             (t.dtype == stell::tiers::DType::F16 || t.dtype == stell::tiers::DType::F32))
-            return true;   // F32→F16 — допустимая конвертация лоадера (не dequant)
+            return true;   // F32→F16 / BF16→F16 — допустимые конвертации лоадера
         if (target == stell::tiers::DType::F32 && t.dtype == stell::tiers::DType::F32)
             return true;
         if (target == stell::tiers::DType::E4M3 && t.dtype == stell::tiers::DType::E4M3)
@@ -224,6 +334,7 @@ protected:
     }
 
 private:
+    std::vector<std::FILE*> files_;  // [0] = file_ (одиночный) / шарды каталога
     const stell::tiers::TensorGroup* find_group(const stell::tiers::GroupKey& key) const {
         for (const auto& g : desc_.groups)
             if (g.id == key.id) return &g;
@@ -239,7 +350,7 @@ private:
 
     std::string path_;
     ModelDescription desc_;
-    std::FILE* file_ = nullptr;
+    std::FILE* file_ = nullptr;   // одиночный файл (файл() для parse_header impl)
     TensorFileMap tfm_;
     std::map<std::uint32_t, TensorInfo> tensors_;            // GroupId → инфо
 

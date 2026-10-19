@@ -63,15 +63,16 @@ protected:
             if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
                              *t.dtype != stell::tiers::DType::F32))
                 throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                                  "nvfp4w4a16 loader: источник должен быть F16/F32, получено '" +
+                                  "nvfp4w4a16 loader: источник должен быть F16/F32/BF16, получено '" +
                                       t.dtype_str + "'");
             if (*t.dtype == stell::tiers::DType::F16) {
                 std::vector<std::uint8_t> raw(t.bytes);
                 read_tensor_payload(t, raw.data());
+                const bool bf16 = t.bf16;  // round 4: BF16-флаг (dtype маппится в F16)
                 for (std::size_t i = 0; i < n; ++i) {
                     std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
                                       (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
-                    src[i] = f16_bits_to_f32(h);
+                    src[i] = bf16 ? bf16_bits_to_f32(h) : f16_bits_to_f32(h);
                 }
             } else {
                 read_tensor_payload(t, src.data());
