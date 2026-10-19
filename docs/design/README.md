@@ -29,6 +29,10 @@ ADR-08…ADR-12 (разделы «Уточнение») и продублиро�
 - [serve.md](serve.md) — OpenAI/Anthropic-совместимый API, SSE, tool-calls, CORS,
   health/метрики, дашборд, калибровщик, bench + quality-gates
   (поток E, роль `serve`).
+- [server-env.md](server-env.md) — серверное окружение: карта GPU и разделение
+  ролей (V100-SXM2 — замеры §5, RTX 2060 — контракты/PTX-JIT смоук), PTX
+  SM70 в gencode, смоук dlopen+replay, прогоны только через git-клон,
+  правила co-tenancy-окна.
 
 ## Ссылки
 
