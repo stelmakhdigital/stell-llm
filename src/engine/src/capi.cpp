@@ -15,7 +15,9 @@
 // сами веса материалены из лоадера (см. ops_runner.hpp).
 #include "stell/engine/capi.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -54,6 +56,26 @@ PlainWeightsFormat weights_format_from_name(const std::string& name) {
     throw std::runtime_error("capi: неизвестный weights_format '" + name + "'");
 }
 
+// round 3 [R5] (planner Q5, ADR-11 §4): статистика вызовов stell_logits для
+// снапшота /metrics. Семантика счётчиков — по словарю секции serve
+// (python/stell_serve/metrics.py: record_request только при успехе,
+// record_error при ошибке): requests_total — число УСПЕШНЫХ вызовов
+// (rc==0; ошибочный вызов не даёт payload и в requests не попадает — иначе
+// errors_total дублировал бы те же вызовы), errors_total — число ошибочных
+// (rc==-1). Сумма = полное число вызовов. last_n_vocab / last_positions —
+// параметры последнего успешного вызова (ошибочный вызов валидного ответа
+// не имеет и статистику не двигает); до первого успеха — «нет данных».
+// last_positions хранится как код (0=нет данных, 1=last, 2=all) — потокобез-
+// опасно без мьютекса; в JSON выдаётся строкой в словаре ABI-запроса
+// stell_logits (ADR-11 §1: "positions":"last"|"all") — стиль ADR-11: строковые
+// enum'ы в наружном JSON ("state":"serving", "kv_quant":"F16").
+struct LogitsStats {
+    std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> errors{0};
+    std::atomic<std::int64_t> last_n_vocab{-1};   // -1 — успешных вызовов не было
+    std::atomic<int> last_positions{0};           // 0 — вызовов не было
+};
+
 struct EngineCtx {
     FixedSlotPool* pool = nullptr;
     Scheduler* sched = nullptr;
@@ -61,6 +83,7 @@ struct EngineCtx {
     std::unique_ptr<stell::tiers::TierManager> tiers;
     ByteTokenizer tok;
     std::string last_error;
+    LogitsStats lstats;                            // round 3 [R5]: /metrics "logits"
 };
 
 } // namespace
@@ -267,13 +290,26 @@ void stell_step(stell_engine_t* e) {
 int stell_metrics(stell_engine_t* e, char** out_json) {
     auto* ctx = reinterpret_cast<EngineCtx*>(e);
     if (!ctx || !out_json) return -1;
-    // минимальный снапшот (ADR-11 §4): engine.sessions_active/slots_busy
-    char buf[512];
+    // минимальный снапшот (ADR-11 §4): engine.sessions_active/slots_busy;
+    // round 3 [R5]: секция "logits" — строгий формат (planner Q5): статистика
+    // вызовов stell_logits БЕЗ payload (массивы логитов в /metrics не выдаются
+    // никогда — размер). До первого успешного вызова last_* — null («честно:
+    // нет данных», как в serve-секции).
+    const auto pos = ctx->lstats.last_positions.load();
+    char buf[768];
     std::snprintf(buf, sizeof buf,
                   "{\"engine\":{\"state\":\"serving\",\"sessions_active\":%zu,"
-                  "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16}}",
+                  "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16},"
+                  "\"logits\":{\"requests_total\":%llu,\"errors_total\":%llu,"
+                  "\"last_n_vocab\":%s,\"last_positions\":%s}}",
                   ctx->sched->active(), ctx->pool->busy(),
-                  (unsigned)ctx->pool->capacity());
+                  (unsigned)ctx->pool->capacity(),
+                  (unsigned long long)ctx->lstats.requests.load(),
+                  (unsigned long long)ctx->lstats.errors.load(),
+                  // -1 → null (успешных вызовов ещё не было)
+                  [&]{ const auto v = ctx->lstats.last_n_vocab.load();
+                       return v < 0 ? std::string("null") : std::to_string(v); }().c_str(),
+                  pos == 2 ? "\"all\"" : pos == 1 ? "\"last\"" : "null");
     *out_json = strdup(buf);
     return 0;
 }
@@ -288,11 +324,13 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
 int stell_logits(stell_engine_t* e, const char* request_json, char** out_json) {
     auto* ctx = reinterpret_cast<EngineCtx*>(e);
     auto fail = [&](const std::string& what) -> int {
+        ctx->lstats.errors++;          // [R5]: ошибочный вызов (rc==-1)
         if (out_json)
             *out_json = strdup(("{\"error\":\"" + json_escape(what) + "\"}").c_str());
         return -1;
     };
-    if (!ctx || !request_json || !out_json) return -1;
+    if (!ctx) return -1;
+    if (!request_json || !out_json) { ctx->lstats.errors++; return -1; }
     try {
         Json req = json_parse(request_json);
         std::vector<std::int32_t> prompt;
@@ -320,6 +358,7 @@ int stell_logits(stell_engine_t* e, const char* request_json, char** out_json) {
         } else {
             rows.push_back(interp.run_prompt_logits(prompt));
         }
+        const unsigned n_vocab = static_cast<unsigned>(interp.spec().vocab_size);
 
         std::string out = "{\"logits\":[";
         char buf[40];
@@ -335,10 +374,13 @@ int stell_logits(stell_engine_t* e, const char* request_json, char** out_json) {
             out += ']';
         }
         std::snprintf(buf, sizeof buf, "],\"n_positions\":%zu,\"n_vocab\":%u}",
-                      rows.size(),
-                      static_cast<unsigned>(interp.spec().vocab_size));
+                      rows.size(), n_vocab);
         out += buf;
         *out_json = strdup(out.c_str());
+        // [R5]: успешный вызов — обновляем статистику для /metrics
+        ctx->lstats.requests++;
+        ctx->lstats.last_n_vocab = n_vocab;
+        ctx->lstats.last_positions = (positions == "all") ? 2 : 1;
         return 0;
     } catch (const std::exception& ex) {
         return fail(ex.what());

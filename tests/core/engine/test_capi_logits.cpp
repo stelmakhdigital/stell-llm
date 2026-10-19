@@ -85,6 +85,13 @@ Json call_logits(stell_engine_t* e, const std::string& req, int* rc_out) {
     return json_parse(std::string(out.get()));
 }
 
+// снапшот stell_metrics + разбор (для тестов строгого формата "logits", [R5])
+Json get_metrics(stell_engine_t* e) {
+    StrOut out;
+    STELL_CHECK(stell_metrics(e, &out.p) == 0);
+    return json_parse(std::string(out.get()));
+}
+
 double max_rel(const std::vector<double>& a, const std::vector<double>& b) {
     double m = 0.0;
     for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
@@ -218,6 +225,34 @@ void run_case(const char* golden_name) {
         STELL_CHECK(err.find("error") != nullptr);
     }
 
+    // --- round 3 [R5]: строгий формат "logits" в /metrics (ADR-11 §4, Q5) --
+    // серия выше: успешных = 3 (last, дефолт last, all), ошибочных = 3
+    // (неизвестный positions, пустой промпт, prompt_tokens не массив).
+    {
+        const Json snap = get_metrics(e);
+        const Json* lg = snap.find("logits");
+        STELL_CHECK_MSG(lg != nullptr && lg->t == Json::T::Object,
+                        "в /metrics есть объект logits");
+        // строго 4 поля; значения — скаляры, без массивов (payload логитов
+        // в /metrics не выдаётся никогда)
+        STELL_CHECK(lg->obj.size() == 4);
+        for (const auto& kv : lg->obj)
+            STELL_CHECK_MSG(kv.second.t != Json::T::Array,
+                            ("logits." + kv.first + " — не массив").c_str());
+        STELL_CHECK(lg->find("requests_total")->as_int() == 3);   // успешные
+        STELL_CHECK(lg->find("errors_total")->as_int() == 3);     // rc==-1
+        // последний успешный вызов — "all" на полном промпте
+        const Json* nv = lg->find("last_n_vocab");
+        STELL_CHECK(nv != nullptr && nv->t == Json::T::Number);
+        STELL_CHECK(nv->as_int() == n_vocab);
+        const Json* lp = lg->find("last_positions");
+        STELL_CHECK(lp != nullptr && lp->t == Json::T::String);
+        STELL_CHECK(lp->str == "all");
+        std::printf("%s: /metrics logits — requests_total=3 errors_total=3 "
+                    "last_n_vocab=%lld last_positions=all\n",
+                    golden_name, (long long)n_vocab);
+    }
+
     stell_engine_destroy(e);
 }
 
@@ -230,14 +265,39 @@ void run_demo_error_case() {
     const Json err = call_logits(e, "{\"prompt_tokens\":[1,2]}", &rc);
     STELL_CHECK(rc == -1);
     STELL_CHECK(err.find("error") != nullptr);
+
+    // [R5]: после ошибочного вызова — requests_total=0, errors_total=1,
+    // last_* — null («честно: нет данных», успешных вызовов не было)
+    {
+        const Json snap = get_metrics(e);
+        const Json* lg = snap.find("logits");
+        STELL_CHECK(lg != nullptr && lg->t == Json::T::Object);
+        STELL_CHECK(lg->find("requests_total")->as_int() == 0);
+        STELL_CHECK(lg->find("errors_total")->as_int() == 1);
+        STELL_CHECK(lg->find("last_n_vocab")->t == Json::T::Null);
+        STELL_CHECK(lg->find("last_positions")->t == Json::T::Null);
+        std::printf("demo: /metrics logits — requests_total=0 errors_total=1 "
+                    "last_n_vocab=null last_positions=null\n");
+    }
     stell_engine_destroy(e);
 
     // деградация аргументов
-    STELL_CHECK(stell_logits(nullptr, "{}", nullptr) == -1);
+    STELL_CHECK(stell_logits(nullptr, "{}", nullptr) == -1);   // ctx null — статистики нет
     stell_engine_t* e2 = nullptr;
     STELL_CHECK(stell_engine_create(
         "{\"runner\":\"demo\",\"engine\":{\"max_slots\":4}}", &e2) == 0);
-    STELL_CHECK(stell_logits(e2, nullptr, nullptr) == -1);
+    STELL_CHECK(stell_logits(e2, nullptr, nullptr) == -1);     // bad-args: rc==-1 — ошибка
+    // [R5]: bad-args тоже ошибочный вызов (rc==-1), счётчик двигается;
+    // stell_logits(nullptr, ...) не считает — статистика принадлежит engine
+    {
+        const Json snap = get_metrics(e2);
+        const Json* lg = snap.find("logits");
+        STELL_CHECK(lg != nullptr && lg->t == Json::T::Object);
+        STELL_CHECK(lg->find("requests_total")->as_int() == 0);
+        STELL_CHECK(lg->find("errors_total")->as_int() == 1);
+        STELL_CHECK(lg->find("last_n_vocab")->t == Json::T::Null);
+        STELL_CHECK(lg->find("last_positions")->t == Json::T::Null);
+    }
     stell_engine_destroy(e2);
 }
 
