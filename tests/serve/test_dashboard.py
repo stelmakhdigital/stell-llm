@@ -27,6 +27,20 @@ def test_dashboard_renders_cancel_and_logits_sections(client):
     assert "id=\"logits-stats\"" in index.text
 
 
+def test_dashboard_renders_strict_logits_kv_fields(client):
+    """[R5] round 3, планировщик [Q5]: дашборд рендерит СТРОГО 4 поля
+    logits-снапшота (ADR-11 §4): requests_total, errors_total,
+    last_n_vocab, last_positions; generic-рендер «каково придёт» заменён
+    фиксированной схемой (лишние ключи игнорируются)."""
+    js = client.get("/ui/app.js").text
+    for field in ("requests_total", "errors_total", "last_n_vocab",
+                  "last_positions"):
+        assert f'"{field}"' in js, f"нет строгого поля {field} в renderLogits"
+    # generic-рендер по Object.entries(logits) больше не используется —
+    # формат фиксирован ADR, payload в /metrics не приходит
+    assert "Object.entries(logits)" not in js
+
+
 def test_dashboard_absent_logits_block_does_not_break_render(client):
     """У mock/реального движка pre-merge блока snap.logits нет: рендер
     подставляет честную пометку об отсутствии данных (JS не падает)."""

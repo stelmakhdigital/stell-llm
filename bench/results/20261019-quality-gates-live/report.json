@@ -33,14 +33,17 @@
     {
       "gate": "quality-gate",
       "dataset": "humaneval_32[mini_dense]",
-      "pending": true,
-      "value": null,
+      "pending": false,
+      "value": 0.0,
       "unit": "score",
       "items": 32,
       "notes": [
         "модель=mini_dense",
         "источник логитов=abi:stell_logits",
-        "генерация через логиты возможна (жадное декодирование), но проверка корректности HumanEval = ИСПОЛНЕНИЕ сгенерированного кода против unit-тестов — исполнения кода в runner нет (песочница/изоляция не входят в раунд); честный pending"
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "механический базовый референс пайплайна: mini-фикстуры не являются языковыми моделями — значение фиксируется как точка регрессии, а не оценка качества LLM"
       ]
     },
     {
@@ -75,14 +78,17 @@
     {
       "gate": "quality-gate",
       "dataset": "humaneval_32[mini_moe]",
-      "pending": true,
-      "value": null,
+      "pending": false,
+      "value": 0.0,
       "unit": "score",
       "items": 32,
       "notes": [
         "модель=mini_moe",
         "источник логитов=abi:stell_logits",
-        "генерация через логиты возможна (жадное декодирование), но проверка корректности HumanEval = ИСПОЛНЕНИЕ сгенерированного кода против unit-тестов — исполнения кода в runner нет (песочница/изоляция не входят в раунд); честный pending"
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "механический базовый референс пайплайна: mini-фикстуры не являются языковыми моделями — значение фиксируется как точка регрессии, а не оценка качества LLM"
       ]
     }
   ],
@@ -98,6 +104,17 @@
     "ppl_max_tokens": 128,
     "gsm8k_prompt_tokens": 64,
     "gsm8k_max_steps": 16,
+    "humaneval_prompt_tokens": 64,
+    "humaneval_max_steps": 32,
+    "humaneval_sandbox": {
+      "class": "process-sandbox (НЕ security-граница)",
+      "rlimit_cpu_s": 5,
+      "wall_timeout_s": 10,
+      "rlimit_as_bytes": 536870912,
+      "rlimit_nofile": 64,
+      "env": "пустой",
+      "cwd": "изолированный temp-dir"
+    },
     "projection": "byte % vocab, detok: id<10 → цифра"
   },
   "env": {

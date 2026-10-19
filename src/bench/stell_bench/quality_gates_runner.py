@@ -1,8 +1,17 @@
-"""Runner quality-gates (PLAN.md §5): GSM8K-32, HumanEval-32, PPL (round 2).
+"""Runner quality-gates (PLAN.md §5): GSM8K-32, HumanEval-32, PPL (round 3).
 
 Round 2 (интеграция, поток E): датасеты РЕАЛЬНЫЕ (см. stell_bench.fetch_quality_gates
 — фиксированная выборка 32 задач seed=42 из открытых датасетов OpenAI) и добавлен
-ЖИВОЙ прогон (`--live`) поверх логитов движка:
+ЖИВОЙ прогон (`--live`) поверх логитов движка.
+
+Round 3 ([R4], решение планировщика [Q4]): HumanEval-32 больше НЕ pending —
+корректность проверяется ИСПОЛНЕНИЕМ сгенерированного кода в песочнице
+(code_sandbox.run_code: process-sandbox с RLIMIT_CPU/AS/NOFILE, wall-таймаут,
+изолированный temp-dir, пустой env; **не security-граница** — честная пометка
+в докстринге песочницы). Конвейер кейса: жадное декодирование движка →
+детокенизация ответа → извлечение кода (первый markdown-fence, иначе весь
+ответ) → candidate = prompt + completion → исполнение против test-кейса
+задачи в песочнице → accuracy по 32 кейсам.
 
 - источник логитов — `stell_logits` ([R1], планировщик Q1: request
   {"prompt_tokens":[…], "positions":"last"|"all"}, возврат 0/-1, malloc/free
@@ -15,9 +24,10 @@ Round 2 (интеграция, поток E): датасеты РЕАЛЬНЫЕ 
 - GSM8K-32: генерация жадным декодированием (argmax, ничья → меньший индекс —
   конвенция golden), проверка корректности — сопоставление чисел (без
   исполнения чего-либо — выполнимо честно, реализовано);
-- HumanEval-32: проверка корректности ТРЕБУЕТ ИСПОЛНЕНИЯ сгенерированного
-  кода (unit-тесты HumanEval) — исполнения кода в runner нет (песочница/
-  изоляция не входят в раунд) → честный pending с причиной.
+- HumanEval-32 ([R4] round 3): корректность через песочницу кода
+  (code_sandbox.py, process-sandbox — не security-граница); у mini-фикстур
+  генерация — механическая проекция байта → токен, поэтому accuracy —
+  точка регрессии пайплайна (как у GSM8K), а не оценка качества LLM.
 
 Честные пометки:
 - у mini-фикстур vocab=16 и byte-токенизатор движка не может отобразить
@@ -48,6 +58,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+from .code_sandbox import run_code
 from .quality_gates import GateResult, gsm8k_32, humaneval_32, ppl_text
 from .report import results_local_dir_for, results_dir_for, write_report
 
@@ -67,6 +78,8 @@ _GOLDEN_REF = _REPO_ROOT / "tests" / "models" / "golden" / "generate_golden.py"
 PPL_MAX_TOKENS = 128          # первые 128 токенов фиксированного текста
 GSM8K_PROMPT_TOKENS = 64      # проекция вопроса → не более 64 токенов
 GSM8K_MAX_STEPS = 16          # жадное декодирование: до 16 токенов ответа
+HUMANEVAL_PROMPT_TOKENS = 64  # проекция сигнатуры+docstring → ≤ 64 токенов
+HUMANEVAL_MAX_STEPS = 32      # жадное декодирование: до 32 токенов ответа
 DEFAULT_MODELS = ("mini_dense", "mini_moe")
 
 
@@ -283,19 +296,67 @@ def run_gsm8k_gate(source: LogitsSource, model: str) -> GateResult:
                 "точка регрессии, а не оценка качества LLM")])
 
 
+def extract_code(answer: str) -> Optional[str]:
+    """Извлечение кода из ответа модели ([R4]): первый markdown-fence
+    ```...``` (метка языка после маркера вырезается); БЕЗ fence — весь
+    ответ трактуется как код (модель может отвечать без разметки).
+    None — если непустого кода в ответе нет."""
+    m = re.search(r"```[\w+-]*[ \t]*\r?\n(.*?)```", answer, re.S)
+    code = m.group(1) if m else answer
+    return code if code.strip() else None
+
+
+def humaneval_program(item: Dict[str, Any], answer: str) -> str:
+    """candidate-программа кейса: prompt задачи + извлечённый completion
+    (completion-контракт HumanEval)."""
+    code = extract_code(answer)
+    return item["prompt"] + (code or "")
+
+
+def humaneval_exec_script(item: Dict[str, Any], program: str) -> str:
+    """Скрипт для песочницы: candidate + test-кейс задачи + вызов check().
+    exit 0 ⇔ все ассерты тест-кейса прошли на сгенерированном коде."""
+    return (program + "\n\n\n" + item["test"]
+            + f"\n\ncheck({item['entry_point']})\n")
+
+
 def run_humaneval_gate(source: LogitsSource, model: str) -> GateResult:
-    """HumanEval-32: ЧЕСТНЫЙ pending — корректность требует исполнения
-    сгенерированного кода (unit-тесты HumanEval), а исполнения кода в
-    runner нет (песочница/изоляция — вне раунда)."""
+    """HumanEval-32 [R4]: жадное декодирование → извлечение кода →
+    исполнение в песочнице (process-sandbox, НЕ security-граница — см.
+    code_sandbox) против test-кейса задачи. accuracy = доля кейсов, где
+    песочница завершилась с exit 0."""
     items = humaneval_32()
+    vocab = _vocab_size(model)
+    correct = 0
+    outcomes: Dict[str, int] = {}
+    for item in items:
+        prompt = project_to_vocab(item["prompt"], vocab)[:HUMANEVAL_PROMPT_TOKENS]
+        seq = list(prompt)
+        for _ in range(HUMANEVAL_MAX_STEPS):
+            row = source.logits_last(seq)
+            seq.append(greedy_token(row))
+        answer = detokenize_ids(seq[len(prompt):])
+        script = humaneval_exec_script(item, humaneval_program(item, answer))
+        res = run_code(script)
+        outcomes[res.outcome] = outcomes.get(res.outcome, 0) + 1
+        if res.outcome == "ok":
+            correct += 1
+    accuracy = correct / len(items)
     return GateResult(
-        "quality-gate", "humaneval_32", pending=True, value=None,
+        "quality-gate", "humaneval_32", pending=False, value=round(accuracy, 4),
         unit="score", items=len(items),
         notes=[f"модель={model}", f"источник логитов={source.name}",
-               ("генерация через логиты возможна (жадное декодирование), но "
-                "проверка корректности HumanEval = ИСПОЛНЕНИЕ сгенерированного "
-                "кода против unit-тестов — исполнения кода в runner нет "
-                "(песочница/изоляция не входят в раунд); честный pending")])
+               f"верно={correct}/{len(items)}",
+               "исходы песочницы: " + ", ".join(
+                   f"{k}={v}" for k, v in sorted(outcomes.items())),
+               ("конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → "
+                "извлечение кода (первый markdown-fence, иначе весь ответ) → "
+                "исполнение в песочнице против test-кейса (process-sandbox: "
+                "RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, "
+                "пустой env; НЕ security-граница — честная пометка)"),
+               ("механический базовый референс пайплайна: mini-фикстуры не "
+                "являются языковыми моделями — значение фиксируется как "
+                "точка регрессии, а не оценка качества LLM")])
 
 
 def _vocab_size(model: str) -> int:
@@ -336,8 +397,9 @@ def run_gates_live(models: List[str] = list(DEFAULT_MODELS),
                    engine_lib: Optional[str] = None,
                    prefer: str = "auto") -> List[GateResult]:
     """Живой прогон гейтов против mini-фикстур (реальные веса): PPL +
-    GSM8K через логиты; HumanEval — честный pending (нужно исполнение кода).
-    По каждой модели — свой комплект гейтов (dataset суффиксируется)."""
+    GSM8K через логиты; HumanEval-32 — исполнение сгенерированного кода
+    в песочнице ([R4] round 3). По каждой модели — свой комплект гейтов
+    (dataset суффиксируется)."""
     gates: List[GateResult] = []
     for model in models:
         source = open_logits_source(model, engine_lib, prefer=prefer)
@@ -390,14 +452,23 @@ def main(argv=None) -> int:
             "protocol": {"ppl_max_tokens": PPL_MAX_TOKENS,
                          "gsm8k_prompt_tokens": GSM8K_PROMPT_TOKENS,
                          "gsm8k_max_steps": GSM8K_MAX_STEPS,
+                         "humaneval_prompt_tokens": HUMANEVAL_PROMPT_TOKENS,
+                         "humaneval_max_steps": HUMANEVAL_MAX_STEPS,
+                         "humaneval_sandbox": {
+                             "class": "process-sandbox (НЕ security-граница)",
+                             "rlimit_cpu_s": 5, "wall_timeout_s": 10,
+                             "rlimit_as_bytes": 512 * 1024 * 1024,
+                             "rlimit_nofile": 64,
+                             "env": "пустой", "cwd": "изолированный temp-dir"},
                          "projection": "byte % vocab, detok: id<10 → цифра"},
             "env": {"co_tenancy": False, "gpu": "none (CPU-local)"},
         })
         log_lines = [
             f"quality-gates LIVE: модели={models}, "
             f"источник логитов={snapshot.extra['logits_source']}",
-            "HumanEval — честный pending (проверка корректности требует "
-            "исполнения сгенерированного кода; песочницы в раунде нет)",
+            "HumanEval-32 — accuracy через песочницу кода ([R4] round 3: "
+            "process-sandbox с RLIMIT_CPU/AS/NOFILE, wall 10с, temp-dir, "
+            "пустой env; НЕ security-граница — честная пометка в докстринге)",
         ]
         if args.results_dir:
             out_dir = Path(args.results_dir)
