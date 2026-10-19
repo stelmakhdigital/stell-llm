@@ -30,6 +30,10 @@ std::string sanitize(std::string s) {
 
 // Слот группы = payload (при квантованном профиле — квантованный) + нулевой
 // хвост до slot_bytes; CRC32 — по слоту как записан (ADR-12 §2.3).
+// Plain-ветка использует общий с лоадерами plain_fill_slot (round 4: побитовая
+// идентичность слотов конвертера и прямого лоадера — F32/BF16→F16 конверсии
+// включены; ранее конвертер копировал байты без конверсии — расхождение с
+// fill_plain было бы при F32/BF16-источнике F16-группы).
 std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
                                     const TensorInfo& t, std::FILE* f) {
     std::vector<std::uint8_t> slot(static_cast<std::size_t>(g.slot_bytes), 0);
@@ -37,11 +41,11 @@ std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
     for (auto d : g.shape) numel *= static_cast<std::size_t>(d);
 
     if (g.dtype == stell::tiers::DType::NVFP4 || g.dtype == stell::tiers::DType::W4A16) {
-        // Квантованный профиль: источник F16/F32, квантование — здесь (ADR-03).
+        // Квантованный профиль: источник F16/F32/BF16, квантование — здесь (ADR-03).
         if (!t.dtype || (*t.dtype != stell::tiers::DType::F16 &&
                          *t.dtype != stell::tiers::DType::F32))
             throw LoaderError(LoaderError::Code::UnsupportedQuant,
-                              "converter: источник должен быть F16/F32, получено '" +
+                              "converter: источник должен быть F16/F32/BF16, получено '" +
                                   t.dtype_str + "'");
         std::vector<float> src(numel);
         if (*t.dtype == stell::tiers::DType::F16) {
@@ -49,10 +53,11 @@ std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
             if (std::fseek(f, static_cast<long>(t.offset), SEEK_SET) != 0 ||
                 std::fread(raw.data(), 1, raw.size(), f) != raw.size())
                 throw LoaderError(LoaderError::Code::IoFailure, "converter: truncated tensor");
+            const bool bf16 = t.bf16;  // round 4: BF16-флаг (dtype маппится в F16)
             for (std::size_t i = 0; i < numel; ++i) {
                 std::uint16_t h = static_cast<std::uint16_t>(raw[2 * i]) |
                                   (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8);
-                src[i] = f16_bits_to_f32(h);
+                src[i] = bf16 ? bf16_bits_to_f32(h) : f16_bits_to_f32(h);
             }
         } else {
             if (std::fseek(f, static_cast<long>(t.offset), SEEK_SET) != 0 ||
@@ -71,13 +76,17 @@ std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
         else
             quantize_w4a16(src.data(), numel, slot.data());
     } else {
-        if (t.bytes > slot.size())
+        if (t.bytes > slot.size() && t.bytes != expected_payload(g))
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "converter: tensor bytes > slot_bytes for group '" + g.name + "'");
+        // Plain-ветка — общий путь с лоадерами (plain_fill_slot): копия либо
+        // допустимая конвертация F32/BF16→F16, хвост слота — нули.
+        std::vector<std::uint8_t> raw(t.bytes);
         if (std::fseek(f, static_cast<long>(t.offset), SEEK_SET) != 0 ||
-            std::fread(slot.data(), 1, t.bytes, f) != t.bytes)
+            std::fread(raw.data(), 1, t.bytes, f) != t.bytes)
             throw LoaderError(LoaderError::Code::IoFailure,
                               "converter: truncated tensor for group '" + g.name + "'");
+        plain_fill_slot(g, t, raw, slot.data(), slot.size());
     }
     return slot;
 }
@@ -86,6 +95,15 @@ std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
 
 void StellTierConverter::convert(const ModelDescription& desc, const std::string& source_uri,
                                  const std::string& out_dir) {
+    // Round 4: каталог шардов — материализующий convert() не поддержан
+    // (работает с одним файлом); используйте convert_streaming (R7/R6).
+    {
+        std::error_code ec;
+        if (std::filesystem::is_directory(source_uri, ec))
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "converter: вход — каталог шардов; используйте "
+                              "convert_streaming (поддержка каталога — в потоковой конвертации)");
+    }
     // Выбор лоадера: квантованный профиль — NVFP4W4A16-вариант (ADR-03);
     // иначе — по формату файла.
     const WeightsFormat fmt = detect_format(source_uri);
@@ -211,25 +229,23 @@ void StellTierConverter::convert(const ModelDescription& desc, const std::string
 namespace {
 
 // Набор источников: один файл (safetensors/GGUF) ИЛИ каталог safetensors-
-// шардов (HF-чекпоинт). Карты шардов разбираются СРАЗУ по метаданным (малые);
-// payload читается по требованию, FILE* кешируется на один шард — чтение
-// идёт последовательно шард за шардом в порядке групп плана.
+// шардов (HF-чекпоинт). Round 4 (R6): слияние шардов — общая функция с
+// лоадерами (merge_safetensors_shards): один источник обслуживает весь план
+// (смешанные dtype-группы — атрибут каждой группы, ветвлений по «профилю»
+// нет); FILE* шардов открыты на время конвертации, payload читается по
+// требованию последовательно шард за шардом в порядке групп плана (R7).
 class ShardWeightsSource {
 public:
     explicit ShardWeightsSource(const std::string& uri) {
         std::error_code ec;
         if (std::filesystem::is_directory(uri, ec)) {
-            for (const auto& de : std::filesystem::directory_iterator(uri, ec)) {
-                if (de.path().extension() == ".safetensors")
-                    files_.push_back(de.path().string());
-            }
-            std::sort(files_.begin(), files_.end());  // канонический порядок шардов HF
-            if (files_.empty())
-                throw LoaderError(LoaderError::Code::IoFailure,
-                                  "converter: в каталоге '" + uri + "' нет .safetensors-шардов");
             format_ = WeightsFormat::Safetensors;
+            tfm_ = merge_safetensors_shards(uri, &files_);
         } else {
-            files_.push_back(uri);
+            std::FILE* f = std::fopen(uri.c_str(), "rb");
+            if (!f) throw LoaderError(LoaderError::Code::IoFailure,
+                                      "converter: cannot open " + uri);
+            files_.push_back(f);
             format_ = detect_format(uri);
             if (format_ == WeightsFormat::StellTier)
                 throw LoaderError(LoaderError::Code::UnsupportedQuant,
@@ -237,58 +253,35 @@ public:
             if (format_ != WeightsFormat::Safetensors && format_ != WeightsFormat::GGUF)
                 throw LoaderError(LoaderError::Code::UnsupportedQuant,
                                   "converter: вход должен быть safetensors/GGUF (ADR-03)");
-        }
-
-        for (std::size_t i = 0; i < files_.size(); ++i) {
-            std::FILE* f = std::fopen(files_[i].c_str(), "rb");
-            if (!f) throw LoaderError(LoaderError::Code::IoFailure,
-                                      "converter: cannot open " + files_[i]);
-            TensorFileMap tfm = (format_ == WeightsFormat::Safetensors)
-                                    ? parse_safetensors_header(f)
-                                    : parse_gguf_header(f);
-            std::fclose(f);  // метаданные прочитаны; payload — по требованию
-            for (auto& [name, info] : tfm.by_name)
-                by_name_[name] = {i, info};
+            tfm_ = (format_ == WeightsFormat::Safetensors)
+                       ? parse_safetensors_header(f)
+                       : parse_gguf_header(f);
         }
     }
 
     ~ShardWeightsSource() { close(); }
     void close() {
-        if (cur_) { std::fclose(cur_); cur_ = nullptr; cur_idx_ = 0; }
+        for (std::FILE* f : files_) {
+            if (f) std::fclose(f);
+        }
+        files_.clear();
     }
 
     const TensorInfo* find(const std::string& pattern) const {
-        auto it = by_name_.find(pattern);
-        return it == by_name_.end() ? nullptr : &it->second.info;
-    }
-    std::size_t shard_of(const std::string& pattern) const {
-        return by_name_.at(pattern).shard;
+        auto it = tfm_.by_name.find(pattern);
+        return it == tfm_.by_name.end() ? nullptr : &it->second;
     }
 
-    // FILE* шарда с тензором pattern (кешируется один открытый шард;
-    // переключение = закрыть предыдущий — источник читается последовательно).
+    // FILE* шарда с тензором pattern (файлы уже открыты; чтение идёт
+    // последовательно шард за шардом в порядке групп плана — R7).
     std::FILE* file_for(const std::string& pattern) {
-        const std::size_t idx = shard_of(pattern);
-        if (!cur_ || cur_idx_ != idx) {
-            close();
-            cur_ = std::fopen(files_[idx].c_str(), "rb");
-            if (!cur_) throw LoaderError(LoaderError::Code::IoFailure,
-                                         "converter: cannot open shard " + files_[idx]);
-            cur_idx_ = idx;
-        }
-        return cur_;
+        return files_.at(tfm_.by_name.at(pattern).shard_index);
     }
 
 private:
-    struct Ref {
-        std::size_t shard = 0;
-        TensorInfo info;
-    };
     WeightsFormat format_ = WeightsFormat::Safetensors;
-    std::vector<std::string> files_;
-    std::map<std::string, Ref> by_name_;
-    std::FILE* cur_ = nullptr;
-    std::size_t cur_idx_ = 0;
+    std::vector<std::FILE*> files_;
+    TensorFileMap tfm_;
 };
 
 }  // namespace

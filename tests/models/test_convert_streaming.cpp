@@ -585,8 +585,13 @@ void body() {
             const ModelDescription real = Registry().load(std::string(real_desc));
             const std::string real_out = "/tmp/stell_stream_real_out";
             StellTierWriterConfig rcfg;  // профиль co-tenancy: границы задаёт tiers-конфиг
-            rcfg.vram_slot_size = 64u << 20;   // 64 МиБ VRAM-слот (пример деплоя)
-            rcfg.ram_capacity = 2u << 30;      // 2 ГиБ RAM-тира (пример деплоя)
+            // Round 4 (R3-подготовка): нижняя граница профиля co-tenancy
+            // «свободно 2–11 ГБ на V100»: VRAM-слот 2 ГиБ — план реального
+            // чекпоинта (embed F32/F16 [vocab,d_model] ~0.3–0.6 ГиБ, экспертные
+            // группы-срезы ~десятки МиБ) помещается; ram_capacity — верхняя
+            // граница профиля (в layout семантики не имеет, ADR-12).
+            rcfg.vram_slot_size = 2u << 30;    // 2 ГиБ VRAM-слот (co-tenancy, низ профиля)
+            rcfg.ram_capacity = 11u << 30;     // 11 ГиБ RAM-тира (co-tenancy, верх профиля)
             StellTierConverter conv;
             conv.convert_streaming(real, std::string(real_dir), real_out, rcfg);
             const std::string layout = real_out + "/" + real.name + ".stelltier";

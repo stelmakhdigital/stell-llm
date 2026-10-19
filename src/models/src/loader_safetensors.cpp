@@ -19,7 +19,11 @@ struct SafetensorsDtypeEntry {
 const SafetensorsDtypeEntry kSafetensorsDtypes[] = {
     {"F16",      stell::tiers::DType::F16, 2},
     {"F32",      stell::tiers::DType::F32, 4},
-    {"BF16",     std::nullopt,             2},  // конвертация BF16 вне раунда 1
+    // Round 4 (R3-подготовка): BF16-чекпоинты Qwen/Mixtral/OLMoE — маппинг в
+    // F16 с флагом TensorInfo::bf16 (декодирование bf16_bits_to_f32, конверсия
+    // BF16→F16 — допустимая конвертация лоадера, см. plain_fill_slot); целевой
+    // F32 из BF16 — UnsupportedQuant (честный отказ, диапазон/точность).
+    {"BF16",     stell::tiers::DType::F16, 2},
     {"F64",      std::nullopt,             8},
     {"I8",       std::nullopt,             1},
     {"U8",       std::nullopt,             1},
@@ -74,6 +78,7 @@ TensorFileMap parse_safetensors_header(std::FILE* f) {
         info.dtype_str = dtype_str;
         info.dtype = de->dtype;
         info.itemsize = de->itemsize;
+        info.bf16 = (dtype_str == "BF16");  // round 4: флаг BF16 (dtype маппится в F16)
         for (const auto& dim : val.get_array("shape").array_v) {
             if (dim.type != JsonValue::Type::Int || dim.int_v < 0)
                 throw LoaderError(LoaderError::Code::SchemaMismatch,

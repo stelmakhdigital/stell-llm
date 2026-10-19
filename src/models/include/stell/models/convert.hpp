@@ -105,4 +105,30 @@ public:
 // ----------------------------------------------------------------------------
 std::string gguf_to_description(const std::string& gguf_uri);
 
+// ----------------------------------------------------------------------------
+// Конвертер HF-чекпоинта → описание модели (round 4, [R4]; ADR-09; по прецеденту
+// gguf_to_description): вход — каталог модели HF (config.json + safetensors-
+// шарды; канонический порядок шардов — отсортированный) или одиночный
+// .safetensors; выход — JSON-текст описания (схема "1.0") с НАТИВНЫМИ именами
+// тензоров HF (model.embed_tokens.weight, model.layers.{layer}.self_attn.
+// q_proj.weight, …), source_pattern — те же нативные имена, лоадер/конвертер
+// сравнивают их буквально (ADR-09 §3).
+// Профиль dtype_weights — аргумент profile ("F16" по умолчанию; "NVFP4"/
+// "W4A16" — квантование выполняет отдельный проход конвертера/лоадера;
+// канон ADR-09 block32: линейные веса — dtype профиля, нормы/роутер —
+// dtype источника F32/F16, embed/head/kv — F16).
+// Архитектуры (subset): LlamaForCausalLM / Qwen2ForCausalLM (dense);
+// Qwen2MoeForCausalLM / Qwen1.5MoeForCausalLM / OlmoeForCausalLM (MoE,
+// поэертельные тензоры экспертов; роутер mlp.router|mlp.gate — по факту в
+// шардах); MixtralForCausalLM (MoE, стековные block_sparse_moe.w1/w2/w3,
+// source_slice "{expert}", канон R9).
+// rope-параметры config.json (rope_theta) → параметр ops attention.
+// Ошибки — LoaderError: нет config.json → SchemaMismatch; шард не соответствует
+// плану (тензора нет у группы) → TensorNotFound; форма/dtype — SchemaMismatch/
+// UnsupportedQuant; валидация энергичная — все некешевые группы расширенного
+// плана резолвятся по метаданным шардов (fail-fast, ADR-09 §3).
+// ----------------------------------------------------------------------------
+std::string hf_to_description(const std::string& hf_dir,
+                              const std::string& profile = "F16");
+
 }  // namespace stell::models
