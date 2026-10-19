@@ -9,6 +9,16 @@
   `allgather(CommDType::F32)`; отдельный `CommDType::Meta` отклонён —
   parallel остаётся семантически нейтральным, формат слотов знает только engine.
 
+## Уточнения контракта (round 2, T-20261017200354)
+
+- `expert_alltoall` получает `token_elems` (элементов dtype на токен; для
+  hidden `= d_model`) — ADR-10 «Уточнение round 2»; мета-структура без изменений.
+- `ICommunicator::subgroup(ranks)` — подгруппа редуцирует только по своим
+  ранкам (per-stage TP при pp>1); владение у родителя; эмулятор — фильтрация
+  ранков, NCCL — communicator split (до GPU-окна — заготовка).
+- Эмулятор при нехватке recv-ёмкости → `BufferTooSmall` (без молчаливого
+  сокращения пересылки).
+
 ## Объём (из PLAN.md §4, поток C)
 
 - NCCL TP (dense), EP-шардирование экспертов по NVLink, PP для dense > VRAM.

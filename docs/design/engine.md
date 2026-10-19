@@ -12,6 +12,19 @@
 - Sampling: «T=1» = `temperature=1.0` (не greedy); greedy — отдельный явный
   режим golden-контракта (ADR-09 «Уточнение»).
 
+## Уточнения контракта (round 2, T-20261017200354)
+
+- `stell_logits` (ADR-11 «Уточнение round 2»): ABI-совместимое расширение —
+  request `{"prompt_tokens":[...], "positions":"last"|"all"}`, ответ
+  `{"logits":[[...]], "n_positions", "n_vocab"}` (финальный слой, до softmax);
+  возврат 0/-1; malloc-строки, free() — на вызывающем.
+- `stell_cancel` — конвенция create/submit: 0 = успех, -1 = ошибка
+  (сессия не найдена/закрыта); маппинг из `Scheduler::cancel → bool` — в
+  capi-слое.
+- Прод-токенизатор — byte-level BPE в `src/models` (токенизатор не знает
+  `tokenizer.json`); byte-fallback engine остаётся контрактной точкой;
+  инжект — существующий `Scheduler::set_tokenizer`.
+
 ## Объём (из PLAN.md §4, поток A)
 
 - Планировщик continuous batching на ≥8 сессий; пулы слотов фиксированного размера.

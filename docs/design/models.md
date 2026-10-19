@@ -12,6 +12,16 @@
 - Известное упрощение: конвертер пишет `n_tensors = n_groups` (см. ADR-12
   «Уточнение»); `header_crc32` конвертера — байты [0x00..0x2C) (канон ADR-12).
 
+## Уточнения контракта (round 2, T-20261017200354)
+
+- Канон NVFP4/W4A16 — **block32** (ADR-09 «Уточнение round 2»): квантованные
+  группы — только линейные веса; F32/F16-группы — норм/router/layernorm;
+  dtype — атрибут `tensor_group`, лоадер читает dtype из группы без
+  fallback-догадок. Group-16-фикстуры kernels — legacy (не-контракт).
+- Прод-токенизатор: byte-level BPE реализуется здесь (`ITokenizer`,
+  `tokenizer.json` в каталоге модели, описан в реестре); инжект в engine —
+  `Scheduler::set_tokenizer`; byte-fallback engine остаётся контрактной точкой.
+
 ## Объём (из PLAN.md §4, поток D)
 
 - Реестр архитектур: dense llama/qwen-класс; MoE glm/qwen-moe/deepseek-класс
