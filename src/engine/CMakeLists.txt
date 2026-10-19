@@ -271,6 +271,17 @@ target_compile_definitions(test_engine_ops_shared PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/ops_shared COMMAND test_engine_ops_shared)
 
+# --- round 6: [R1] скалярный сигмоид-гейт ffn.shared.gate_scalar --------------
+
+add_executable(test_engine_ops_gate
+    ../../tests/core/engine/test_ops_gate.cpp
+)
+target_link_libraries(test_engine_ops_gate stell_engine)
+target_include_directories(test_engine_ops_gate PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_gate PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_gate COMMAND test_engine_ops_gate)
+
 # --- round 5: [R6] source_slice через мост (fused qkv, одно открытие) ---------
 
 add_executable(test_engine_weights_slice
