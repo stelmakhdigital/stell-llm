@@ -48,3 +48,13 @@ target_compile_definitions(stell_models PRIVATE
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(stell_models PRIVATE -Wall -Wextra)
 endif()
+
+# ============================================================================
+# Round 3 (R7): публичный CLI потоковой конвертации в stell-tier layout —
+# tools/convert_streaming (writer без полной загрузки модели в RAM; параметры
+# тиров принимает извне — согласовано с TierConfig). Целевой модуль — models,
+# CMakeLists модуля — свой; корневой CMakeLists не трогается.
+# ============================================================================
+add_executable(stell_convert_streaming tools/convert_streaming.cpp)
+target_link_libraries(stell_convert_streaming PRIVATE stell_models)
+target_compile_options(stell_convert_streaming PRIVATE -Wall -Wextra)
