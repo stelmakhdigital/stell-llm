@@ -287,6 +287,11 @@ std::string hf_to_description(const std::string& hf_dir,
 
     std::vector<std::string> groups;
 
+    // Op "ffn" (dense-ветвь; [R3] round 5: та же строка — dense-слои
+    // per-layer смешанного плана). Единый литерал — без дублей.
+    const std::string kFfnOpJson =
+        ",{\"op\":\"ffn\",\"io\":[\"hidden\"],\"params\":{\"activation\":\"silu_mul\"}}";
+
     // --- общие группы ----------------------------------------------------------
     groups.push_back(make_group("embed", "attn",
                                 {static_cast<std::int64_t>(vocab_size), dm}, "F16",
@@ -365,8 +370,7 @@ std::string hf_to_description(const std::string& hf_dir,
             groups.push_back(make_group(lt.group, "attn", shape, dtype,
                                         lp + lt.pattern, {{card_key, L}}));
         }
-        ffn_op_json =
-            ",{\"op\":\"ffn\",\"io\":[\"hidden\"],\"params\":{\"activation\":\"silu_mul\"}}";
+        ffn_op_json = kFfnOpJson;
     } else if (moe_per_expert) {
         // --- 4b. MoE, поэертельные тензоры (Qwen2Moe/Qwen1.5Moe/Olmoe) --------
         // [R3] round 5 (ADR-09 round 5, per-layer план): классификация КАЖДОГО
@@ -601,8 +605,7 @@ std::string hf_to_description(const std::string& hf_dir,
             // Смешанный план: op-граф содержит ОБЕ ветви ffn — маршрутизация
             // per-layer по наличию MoE-групп слоя (ADR-09 round 5: слой с
             // mlp.router → MoE-контур, без → dense ffn; интерпретатор плана).
-            ffn_op_json =
-                ",\"op\":\"ffn\",\"io\":[\"hidden\"],\"params\":{\"activation\":\"silu_mul\"}}";
+            ffn_op_json = kFfnOpJson;
         }
 
         // --- [R4] round 5: shared-expert (Qwen2Moe/OLMoE: mlp.shared_expert.*)
