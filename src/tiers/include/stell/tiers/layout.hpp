@@ -114,7 +114,12 @@ private:
 // --- читатель ---------------------------------------------------------------
 class TierLayoutReader {
 public:
-    explicit TierLayoutReader(std::string path); // TierError(IoFailure) при порче
+    // TierError(IoFailure) при порче. header_crc32 проверяется ВСЕГДА
+    // (ADR-12 §2.3, round 3); payload-CRC групп — только при
+    // verify_payload_crc=true (дефолт true: сырой читатель — вне горячего
+    // пути, используется тестами/интеграцией с models; менеджер горячего
+    // пути передаёт явный флаг из TierConfig/STELL_TIER_VERIFY_CRC).
+    explicit TierLayoutReader(std::string path, bool verify_payload_crc = true);
     ~TierLayoutReader();
     TierLayoutReader(const TierLayoutReader&) = delete;
     TierLayoutReader& operator=(const TierLayoutReader&) = delete;
@@ -124,8 +129,11 @@ public:
     const TierGroupIndexEntry* find(std::uint32_t group_id) const;
 
     // Читает слот группы целиком в dst (size ≥ slot_bytes).
-    // CRC проверяется при первом чтении группы (ADR-12 §2.3) — один раз
-    // за жизнь файла в кеше tiers; повторные чтения не перепроверяют.
+    // Payload-CRC — при первом чтении группы (ADR-12 §2.3) и только при
+    // verify_payload_crc (round 3: hot path менеджера по умолчанию НЕ
+    // пересчитывает CRC — writer считает CRC при записи, верификация —
+    // на границах: verify-проход/STELL_TIER_VERIFY_CRC); повторные чтения
+    // не перепроверяют.
     void read_group(std::uint32_t group_id, void* dst);
 
     int fd() const { return fd_; }
@@ -137,6 +145,7 @@ private:
     int fd_ = -1;
     TierLayoutHeader header_;
     std::vector<TierGroupIndexEntry> entries_;
+    bool verify_crc_ = true;                // payload-CRC при чтении (см. ctor)
     std::vector<std::uint32_t> verified_;   // группы с проверенной CRC
     std::uint64_t io_bytes_ = 0;
     std::uint64_t io_ops_ = 0;

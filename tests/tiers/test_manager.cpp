@@ -2,8 +2,11 @@
 // коды ошибок (PlanMismatch/SlotExhausted/IoFailure/NotPinned), ResetPlan.
 #include <stell/tiers/tier_manager.hpp>
 
+#include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "harness.hpp"
@@ -334,6 +337,143 @@ T_CASE(manager_ram_capacity_eviction) {
     }
     const TierStats st = mgr.stats();
     T_REQUIRE(st.tier_bytes[1] <= cfg.ram_capacity, "RAM-тир не превышает capacity");
+}
+
+// --- R1 (раунд 3): CRC-политика ----------------------------------------------
+
+static std::string write_layout_payloads(const std::string& path,
+                                         const std::vector<TensorGroup>& groups,
+                                         std::size_t slot) {
+    TierLayoutHeader h;
+    h.n_groups = groups.size();
+    TierLayoutWriter w(path, h);
+    std::vector<std::uint8_t> payload(slot);
+    for (const auto& g : groups) {
+        for (std::size_t k = 0; k < slot; ++k)
+            payload[k] = std::uint8_t((g.id.value * 131 + k * 7 + 5) & 0xFF);
+        w.add_group(g, 1, payload.data(), payload.size());
+    }
+    w.finalize();
+    return path;
+}
+
+static void corrupt_byte(const std::string& path, std::uint64_t offset) {
+    std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    T_REQUIRE(f.is_open(), "corrupt_byte: файл открыт");
+    f.seekp(static_cast<std::streamoff>(offset));
+    f.write("\x5a", 1);
+    f.close();
+}
+
+T_CASE(manager_verify_crc_off_hot_path) {
+    // R1-а (ADR-12 §2.3, round 3): pin при verify=off НЕ пересчитывает
+    // payload-CRC — фиксация по метрике crc_checks() (0 = hot path без CRC;
+    // header_crc32 reader проверяет всегда — отдельно в test_layout).
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr_r1a.stelltier", groups);
+    TierConfig cfg = ram_cfg(path, 3);
+    T_REQUIRE(cfg.verify_crc == false,
+              "дефолт конфига — payload-CRC off (hot path без CRC)");
+    TierManager mgr(cfg);
+    mgr.set_plan(groups);
+    for (const auto& g : groups) {
+        auto a = mgr.pin(GroupKey{g.id, g.role});
+        a->wait(); // холодная загрузка NVMe→RAM→VRAM
+        mgr.unpin(GroupKey{g.id, g.role});
+    }
+    T_REQUIRE(mgr.stats().io_ops > 0, "загрузки были (контроль негатива)");
+    T_REQUIRE(mgr.crc_checks() == 0,
+              "verify=off: payload-CRC не пересчитывался ни разу за все pin");
+}
+
+T_CASE(manager_verify_crc_on_catches_corruption) {
+    // R1-б: verify=on ловит испорченный байт payload при первом pin —
+    // TierError(IoFailure, ровно "layout: payload CRC mismatch").
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr_r1b.stelltier", groups);
+    {
+        TierLayoutReader probe(path);
+        const auto& e1 = probe.index()[1];
+        corrupt_byte(path, e1.data_offset + e1.slot_bytes / 2); // середина слота
+    }
+    TierConfig cfg = ram_cfg(path, 3);
+    cfg.verify_crc = true; // явное включение (эквивалент STELL_TIER_VERIFY_CRC=1)
+    TierManager mgr(cfg);
+    mgr.set_plan(groups); // индекс цел: сверка slot_bytes/dtype/role проходит
+    bool thrown = false;
+    std::string msg;
+    try {
+        auto a = mgr.pin(GroupKey{GroupId{1}, Role::Expert});
+        a->wait();
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::IoFailure;
+        msg = e.what();
+    }
+    T_REQUIRE(thrown, "испорченный байт payload → IoFailure в wait()");
+    T_REQUIRE(msg == "layout: payload CRC mismatch",
+              "сообщение ровно \"layout: payload CRC mismatch\"");
+}
+
+T_CASE(manager_verify_slots_pass_marks_groups) {
+    // R1: публичный verify-проход — внепутевая сверка всех слотов layout;
+    // успех помечает группы: последующий горячий путь (verify=on) не
+    // пересчитывает CRC повторно (CRC-once за жизнь файла в кеше tiers).
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr_r1v.stelltier", groups);
+    TierConfig cfg = ram_cfg(path, 3);
+    cfg.verify_crc = true;
+    TierManager mgr(cfg);
+    mgr.set_plan(groups);
+
+    T_REQUIRE(mgr.verify_slots() == groups.size(),
+              "verify-проход покрыл все слоты layout");
+    T_REQUIRE(mgr.crc_checks() == groups.size(),
+              "метрика: по одному пересчёту payload-CRC на слот");
+
+    for (const auto& g : groups) {
+        auto a = mgr.pin(GroupKey{g.id, g.role});
+        a->wait();
+        mgr.unpin(GroupKey{g.id, g.role});
+    }
+    T_REQUIRE(mgr.crc_checks() == groups.size(),
+              "после verify-прохода hot path (verify=on) не перепроверяет");
+    // NVMe-тира нет → verify-проход невозможен (PlanMismatch).
+    TierConfig no_nvme = ram_cfg("", 2);
+    no_nvme.nvme_layout.clear();
+    TierManager mgr2(no_nvme);
+    mgr2.set_plan({make_group(0, "g0", Role::Attn, DType::F16, kSlot)});
+    bool thrown = false;
+    try {
+        mgr2.verify_slots();
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "verify_slots без NVMe-тира → PlanMismatch");
+}
+
+T_CASE(manager_verify_slots_catches_corruption) {
+    // R1: verify-проход ловит испорченный байт payload вне пути декода.
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr_r1v2.stelltier", groups);
+    {
+        TierLayoutReader probe(path);
+        const auto& e2 = probe.index()[2];
+        corrupt_byte(path, e2.data_offset + e2.slot_bytes / 2); // середина слота группы
+    }
+    TierConfig cfg = ram_cfg(path, 3);
+    TierManager mgr(cfg); // verify=off — порчу ловит именно verify-проход
+    mgr.set_plan(groups);
+    bool thrown = false;
+    std::string msg;
+    try {
+        mgr.verify_slots();
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::IoFailure;
+        msg = e.what();
+    }
+    T_REQUIRE(thrown, "verify-проход → IoFailure при порче payload");
+    T_REQUIRE(msg == "layout: payload CRC mismatch",
+              "сообщение ровно \"layout: payload CRC mismatch\"");
 }
 
 T_CASE(manager_vram_slot_accounting_under_churn) {

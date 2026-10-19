@@ -219,7 +219,8 @@ void TierLayoutWriter::finalize() {
 }
 
 // --- читатель ----------------------------------------------------------------
-TierLayoutReader::TierLayoutReader(std::string path) : path_(std::move(path)) {
+TierLayoutReader::TierLayoutReader(std::string path, bool verify_payload_crc)
+    : path_(std::move(path)), verify_crc_(verify_payload_crc) {
     fd_ = ::open(path_.c_str(), O_RDONLY);
     if (fd_ < 0)
         throw TierError(TierError::Code::IoFailure,
@@ -302,11 +303,15 @@ void TierLayoutReader::read_group(std::uint32_t group_id, void* dst) {
     ++io_ops_;
     if (r != static_cast<std::int64_t>(e->slot_bytes))
         throw TierError(TierError::Code::IoFailure, "layout: short group read");
-    // CRC — при первом чтении группы (ADR-12 §2.3).
-    if (std::find(verified_.begin(), verified_.end(), group_id) == verified_.end()) {
+    // Payload-CRC — при первом чтении группы и только при явном флаге
+    // (ADR-12 §2.3, round 3: hot path по умолчанию без CRC; writer считает
+    // CRC при записи, целостность NVMe-данных проверяется вне пути декода —
+    // verify-проход TierManager::verify_slots или STELL_TIER_VERIFY_CRC=1).
+    if (verify_crc_ &&
+        std::find(verified_.begin(), verified_.end(), group_id) == verified_.end()) {
         if (crc32(dst, e->slot_bytes) != e->crc32)
             throw TierError(TierError::Code::IoFailure,
-                            "layout: group CRC mismatch (payload corrupted)");
+                            "layout: payload CRC mismatch");
         verified_.push_back(group_id);
     }
 }

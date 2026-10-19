@@ -37,6 +37,13 @@ struct TierConfig {
     EvictionPolicy policy       = EvictionPolicy::Lru;
     std::size_t lookahead       = 2;   // сколько групп предсказывать на обращение
     std::size_t history_cap     = 4096;// предел истории предиктора
+    // CRC-политика (ADR-12 §2.3, round 3, planner [Q2]): payload-CRC при
+    // pin/read — только при явном флаге (конфиг ИЛИ env STELL_TIER_VERIFY_CRC=1
+    // — итоговое значение = config || env), по умолчанию off — hot path без
+    // CRC (writer считает CRC при записи; целостность NVMe-данных проверяется
+    // вне пути декода: verify_slots() или периодический проход калибровщика).
+    // header_crc32 файла layout reader проверяет всегда.
+    bool verify_crc             = false;
 };
 
 // Асинхронный handle с семантикой ошибки: wait() бросает TierError,
@@ -126,6 +133,25 @@ public:
     // Для тестов/дашборда: resident-наличие группы в VRAM.
     bool resident_in_vram(GroupId id) const;
 
+    // --- расширение R1 (раунд 3; интерфейс ITierManager, ADR-08 §2,
+    // --- НЕ расширяется — тот же прецедент, что set_layer_map/read_ram_slot)
+
+    // R1 (ADR-12 §2.3, round 3): публичный verify-проход слотов NVMe-тира —
+    // внепутевая сверка payload-CRC ВСЕХ групп layout с индексом. Выбор в
+    // пользу метода TierManager (а не harness-команды): verify работает с тем
+    // же открытым NVMe-файлом и состоянием «проверенных групп», что и горячий
+    // путь (единый кодовый путь, без второго канала доступа к layout), а
+    // вызвать его может кто угодно — калибровщик, harness, тесты, стартовый
+    // проход. Дисциплина «холодной» операции (как set_plan): НЕ вызывать
+    // параллельно с pin/prefetch. Возвращает число проверенных слотов;
+    // при порче → TierError(IoFailure, "layout: payload CRC mismatch").
+    std::size_t verify_slots();
+
+    // Метрика R1: сколько раз payload-CRC фактически пересчитывался (по всем
+    // путям: горячий путь при verify=on + verify-проход). При verify=off и без
+    // verify-прохода — 0: фиксация «hot path без CRC» (тест R1-а).
+    std::uint64_t crc_checks() const;
+
 private:
     struct Job {
         GroupId id;
@@ -170,6 +196,7 @@ private:
 
     // NVMe-тир.
     std::unique_ptr<TierNvmeFile> nvme_;
+    bool verify_crc_ = false;        // итоговый флаг R1: config || env (см. TierConfig)
 
 #if defined(STELL_CUDA)
     // CUDA/DMA-путь (ADR-08, серверная сборка SM70):

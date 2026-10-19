@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -40,6 +41,12 @@ void free_ram_buffer(std::uint8_t* p) { if (p) cudaFreeHost(p); }
 std::uint8_t* alloc_ram_buffer(std::size_t n) { return new std::uint8_t[n]; }
 void free_ram_buffer(std::uint8_t* p) { delete[] p; }
 #endif
+
+// R1 (ADR-12 §2.3, round 3): env-флаг поверх конфига — итог = config || env.
+bool env_verify_crc() {
+    const char* v = std::getenv("STELL_TIER_VERIFY_CRC");
+    return v && std::strcmp(v, "1") == 0; // явное включение только "1"
+}
 } // namespace
 
 // --- TierAwaiter -------------------------------------------------------------
@@ -106,7 +113,8 @@ std::unique_ptr<Awaiter> TierAwaiter::all(
 
 // --- TierManager -------------------------------------------------------------
 TierManager::TierManager(TierConfig cfg)
-    : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead) {
+    : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead),
+      verify_crc_(cfg.verify_crc || env_verify_crc()) { // R1: config || env
     if (cfg_.vram_slots == 0 || cfg_.ram_capacity == 0)
         throw TierError(TierError::Code::PlanMismatch, "tiers: vram_slots/ram_capacity must be > 0");
 #if defined(STELL_CUDA)
@@ -234,7 +242,9 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     // NVMe-тир: открытие layout и сверка с планом (ADR-12 §2.2/§4).
     nvme_.reset();
     if (!cfg_.nvme_layout.empty()) {
-        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout);
+        // R1: флаг verify_crc_ пробрасывается в NVMe-тир (payload-CRC при
+        // pin/read — только при явном флаге; ADR-12 §2.3, round 3).
+        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout, verify_crc_);
         for (const auto& g : plan_) {
             const auto* e = file->find(g.id.value);
             if (!e)
@@ -640,6 +650,31 @@ void TierManager::process_job(const Job& job) {
         waiters.insert(waiters.end(), ws.begin(), ws.end());
     }
     for (auto& a : waiters) a->complete();
+}
+
+// --- расширение R1 (раунд 3) --------------------------------------------------
+
+// R1: публичный verify-проход слотов NVMe-тира (ADR-12 §2.3, round 3).
+std::size_t TierManager::verify_slots() {
+    TierNvmeFile* f = nvme_.get();
+    if (!f)
+        throw TierError(TierError::Code::PlanMismatch,
+                        "verify_slots: NVMe-тир не настроен (set_plan с nvme_layout)");
+    std::size_t n = 0;
+    // Дисциплина «холодной» операции (как set_plan, ADR-08 §4): вызывающий
+    // не должен иметь параллельных pin/prefetch — состояние verified_ NVMe-
+    // файла не синхронизировано с горячим путём.
+    for (const auto& e : f->index()) {
+        f->verify_group(e.group_id);
+        ++n;
+    }
+    return n;
+}
+
+// R1: метрика пересчётов payload-CRC (0 при verify=off и без verify-прохода).
+std::uint64_t TierManager::crc_checks() const {
+    const TierNvmeFile* f = nvme_.get();
+    return f ? f->crc_checks() : 0;
 }
 
 // --- stats -------------------------------------------------------------------

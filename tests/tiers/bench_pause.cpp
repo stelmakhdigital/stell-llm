@@ -153,11 +153,14 @@ int main(int argc, char** argv) {
     std::printf(
         "bench_pause: backend=%s path=%s groups=%d slot=%zu layers=%d passes=%d mode=%s\n"
         "  pause p50=%.3f ms p95=%.3f ms p99=%.3f ms (цель PLAN.md §4: p95 ≤ 5 мс)\n"
-        "  io_bytes=%llu (%.2f GiB) io_ops=%llu throughput=%.2f GiB/s total=%.0f ms\n",
+        "  io_bytes=%llu (%.2f GiB) io_ops=%llu throughput=%.2f GiB/s total=%.0f ms\n"
+        "  payload-CRC пересчётов=%llu (verify=off по умолчанию — hot path без CRC, [R1];\n"
+        "    STELL_TIER_VERIFY_CRC=1 включает; verify-проход — TierManager::verify_slots)\n",
         nvme_io_backend().c_str(), path.c_str(), groups, slot, layers, passes,
         mode.c_str(),
         st.layer_pause.p50_ms, st.layer_pause.p95_ms, st.layer_pause.p99_ms,
         (unsigned long long)st.io_bytes, io_gb, (unsigned long long)st.io_ops,
-        io_gb / (total_ms / 1000.0), total_ms);
+        io_gb / (total_ms / 1000.0), total_ms,
+        (unsigned long long)mgr.crc_checks());
     return 0;
 }
