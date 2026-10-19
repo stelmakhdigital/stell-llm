@@ -15,6 +15,15 @@
   `layout_version` — величина engine (`ExecutionPlan`, детерминированный хэш
   плана) — см. ADR-08 «Уточнение».
 
+## Уточнения контракта (round 3, T-20261017200354)
+
+- CRC-политика (ADR-12 §2.3 «Уточнение round 3»): reader всегда проверяет
+  `header_crc32`; payload-CRC при pin/read — только при
+  `STELL_TIER_VERIFY_CRC=1` (env/конфиг, дефолт off в hot path);
+  публичный verify-проход слотов (`ITierManager`/harness-команда) —
+  обязательный механизм периодической целостности вне пути декода.
+  Точка гарантии — writer (CRC при записи).
+
 ## Объём (из PLAN.md §4, поток B)
 
 - Tier Manager: VRAM-slots / pinned RAM / NVMe (io_uring).
