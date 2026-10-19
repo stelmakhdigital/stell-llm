@@ -52,7 +52,17 @@ public:
     void convert(const ModelDescription& desc, const std::string& source_uri,
                  const std::string& out_dir) override;
 
-    // ----------------------------------------------------------------------
+    // ------------------------------------------------------------
+    // R5 ([Q6], ADR-03 round 5): статистика/провенанс конвертации — заполняется
+    // convert_streaming, печатается в лог CLI конвертера (счётчик сатураций
+    // clamp-сатурации F32/BF16→F16; исходные dtype групп — dtype_orig: bf16/f32,
+    // честность профиля: точка регрессии/замер знает о сжатии из BF16).
+    struct Stats {
+        std::uint64_t f16_saturations = 0;      // значений, сатурированных к ±65504
+        std::uint64_t groups_dtype_orig_bf16 = 0;  // группы с исходным dtype bf16
+        std::uint64_t groups_dtype_orig_f32 = 0;   // группы с исходным dtype f32
+    };
+
     // Потоковая конвертация (round 3, R7 — подготовка среза 3): writer БЕЗ
     // полной загрузки модели в RAM. Источник (safetensors-файл / каталог
     // safetensors-шардов HF / GGUF) читается ПОСЛЕДОВАТЕЛЬНО по группам плана;
@@ -86,7 +96,8 @@ public:
     // экспертов смежны — чтение последовательное и в этом случае.
     void convert_streaming(const ModelDescription& desc, const std::string& source_uri,
                            const std::string& out_dir,
-                           const StellTierWriterConfig& cfg = {});
+                           const StellTierWriterConfig& cfg = {},
+                           Stats* stats = nullptr);
 };
 
 // ----------------------------------------------------------------------------
