@@ -15,6 +15,14 @@
   в `/metrics` (`cancelled_total`), не в семантике finish_reason
   (см. ADR-11 «Уточнение»).
 
+## Уточнения контракта (round 3, T-20261017200354)
+
+- Формат поля `logits` снапшота `/metrics` — строго
+  `{"requests_total","errors_total","last_n_vocab","last_positions"}`;
+  payload логитов (массивы) в `/metrics` запрещён — только через
+  `stell_logits` (ADR-11 §4 «Уточнение round 3»). Тест serve проверяет
+  наличие всех четырёх полей и отсутствие массивов.
+
 ## Объём (из PLAN.md §4, поток E)
 
 - Оба API в одном процессе на порту 8080: /v1/chat/completions + /v1/messages;
