@@ -38,8 +38,17 @@ std::uint8_t* alloc_ram_buffer(std::size_t n) {
 }
 void free_ram_buffer(std::uint8_t* p) { if (p) cudaFreeHost(p); }
 #else
-std::uint8_t* alloc_ram_buffer(std::size_t n) { return new std::uint8_t[n]; }
-void free_ram_buffer(std::uint8_t* p) { delete[] p; }
+// [R2a] round 4: RAM-буферы менеджера выровнены на 4096 (posix_memalign):
+// O_DIRECT-чтение слота идёт ПРЯМО в RAM-буфер (без staging-копии).
+// cudaHostAlloc (ветка выше) page-aligned — то же свойство, зафиксировано.
+std::uint8_t* alloc_ram_buffer(std::size_t n) {
+    void* p = nullptr;
+    if (posix_memalign(&p, 4096, n) != 0)
+        throw TierError(TierError::Code::IoFailure,
+                        "tiers: posix_memalign RAM-тира failed");
+    return static_cast<std::uint8_t*>(p);
+}
+void free_ram_buffer(std::uint8_t* p) { std::free(p); }
 #endif
 
 // R1 (ADR-12 §2.3, round 3): env-флаг поверх конфига — итог = config || env.
@@ -56,6 +65,13 @@ std::size_t env_size_or(const char* name, std::size_t dflt) {
     const unsigned long long x = std::strtoull(v, &end, 10);
     if (end == v) return dflt;
     return static_cast<std::size_t>(x);
+}
+
+// [R2a] round 4: env-флаг O_DIRECT поверх конфига — итог = config || env
+// (та же OR-семантика, что у verify_crc).
+bool env_odirect() {
+    const char* v = std::getenv("STELL_TIER_ODIRECT");
+    return v && std::strcmp(v, "1") == 0; // явное включение только "1"
 }
 } // namespace
 
@@ -123,8 +139,11 @@ std::unique_ptr<Awaiter> TierAwaiter::all(
 
 // --- TierManager -------------------------------------------------------------
 TierManager::TierManager(TierConfig cfg)
-    : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead),
-      verify_crc_(cfg.verify_crc || env_verify_crc()) { // R1: config || env
+    : cfg_(cfg),
+      verify_crc_(cfg.verify_crc || env_verify_crc()), // R1: config || env
+      policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead),
+      batch_depth_(cfg.deep_prefetch_depth ? cfg.deep_prefetch_depth : 1), // [R2b]: k в полёте, мин. 1
+      odirect_(cfg.odirect || env_odirect()) { // [R2a]: config || env (OR-семантика R1)
     if (cfg_.vram_slots == 0 || cfg_.ram_capacity == 0)
         throw TierError(TierError::Code::PlanMismatch, "tiers: vram_slots/ram_capacity must be > 0");
 #if defined(STELL_CUDA)
@@ -200,6 +219,45 @@ void TierManager::read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) co
     std::memcpy(dst, it->second, slot_size_);
 }
 
+// [R5] round 4: чтение содержимого VRAM-слота группы (побитовая сверка с
+// эталоном прямого лоадера — инвариант «одна группа = один слот», класс
+// aliasing-багов ba42267). CPU-эмуляция: слот в vram_storage_ (тот же кодовый
+// путь, что и VRAM в CPU-конфигурации); STELL_CUDA: cudaMemcpy D2H из
+// device-слота.
+void TierManager::read_vram_slot(GroupId id, void* dst, std::size_t dst_bytes) const {
+    std::int32_t slot = -1;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const GroupState* st = find(id);
+        if (!st)
+            throw TierError(TierError::Code::PlanMismatch,
+                            "read_vram_slot: unknown GroupId");
+        if (dst_bytes < slot_size_)
+            throw TierError(TierError::Code::PlanMismatch,
+                            "read_vram_slot: dst_bytes < slot_bytes плана");
+        if (!st->in_vram || st->slot < 0)
+            throw TierError(TierError::Code::IoFailure,
+                            "read_vram_slot: группа не resident в VRAM (pin→wait до чтения)");
+        slot = st->slot;
+#if !defined(STELL_CUDA)
+        // CPU-эмуляция: слот в host-памяти (тот же кодовый путь, что и VRAM
+        // в CPU-конфигурации) — копия под mu_ (защита от гонки с eviction).
+        std::memcpy(dst, vram_slots_[(std::size_t)slot], slot_size_);
+#endif
+    }
+#if defined(STELL_CUDA)
+    // D2H вне mu_ (синхронный cudaMemcpy — не горячий путь).
+    const cudaError_t ce = cudaMemcpy(dst, vram_slots_[(std::size_t)slot],
+                                      slot_size_, cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess)
+        throw TierError(TierError::Code::IoFailure,
+                        std::string("read_vram_slot: cudaMemcpy D2H failed: ") +
+                            cudaGetErrorString(ce));
+#else
+    (void)slot;
+#endif
+}
+
 void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     // Безопасный ResetPlan: воркер мог взять job из очереди (queue пуста,
     // а process_job ещё идёт) — дожидаемся дренажа in-flight job'ов ДО mu_
@@ -254,7 +312,10 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     if (!cfg_.nvme_layout.empty()) {
         // R1: флаг verify_crc_ пробрасывается в NVMe-тир (payload-CRC при
         // pin/read — только при явном флаге; ADR-12 §2.3, round 3).
-        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout, verify_crc_);
+        // [R2a] round 4: флаг odirect_ пробрасывается вниз (O_DIRECT-тракт
+        // данных; при неудаче открытия — честный откат на buffered,
+        // TierNvmeFile::odirect_active() == false).
+        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout, verify_crc_, odirect_);
         for (const auto& g : plan_) {
             const auto* e = file->find(g.id.value);
             if (!e)
@@ -461,18 +522,28 @@ void TierManager::enqueue_load(GroupId id, const std::shared_ptr<TierAwaiter>&) 
 
 void TierManager::worker_loop() {
     for (;;) {
-        Job job;
+        std::vector<Job> batch;
         {
             std::unique_lock<std::mutex> qk(qmu_);
             qcv_.wait(qk, [&] { return shutdown_ || !queue_.empty(); });
             if (shutdown_ && queue_.empty()) return;
-            job = queue_.front();
+            // [R2b] deep-prefetch: дренаж очереди БАТЧЕЙ до k групп (k в
+            // полёте): k SQE io_uring — один submit, k чтений NVMe параллельно.
+            // k=1 → прежнее поведение (группа за раз, batch_depth_ ≥ 1 из ctor).
+            batch.push_back(queue_.front());
             queue_.pop_front();
+            while (batch.size() < batch_depth_ && !queue_.empty()) {
+                batch.push_back(queue_.front());
+                queue_.pop_front();
+            }
         }
-        // Дренаж-счётчик для безопасного ResetPlan (set_plan ждёт 0; см. hpp).
-        active_jobs_.fetch_add(1, std::memory_order_acq_rel);
-        process_job(job);
-        active_jobs_.fetch_sub(1, std::memory_order_release);
+        // Дренаж-счётчик для безопасного ResetPlan (set_plan ждёт 0; см. hpp)
+        // — на весь батч (каждый job батча считается in-flight).
+        active_jobs_.fetch_add(static_cast<int>(batch.size()),
+                               std::memory_order_acq_rel);
+        process_batch(batch);
+        active_jobs_.fetch_sub(static_cast<int>(batch.size()),
+                               std::memory_order_release);
     }
 }
 
@@ -548,118 +619,187 @@ void TierManager::release_slot(std::int32_t slot) {
     free_slots_.push_back(slot);
 }
 
-void TierManager::process_job(const Job& job) {
-    const GroupId gid = job.id;
-    std::vector<std::shared_ptr<TierAwaiter>> waiters;
+// [R2b] round 4: батч-обработка до k групп (k в полёте). Фазы прежние
+// (A: RAM-тир; B: NVMe→RAM; C: RAM→VRAM), но фаза B — ОДИН батч-чтение k
+// групп (k SQE io_uring одним submit — параллельный I/O). Промах/ошибка
+// одной группы НЕ роняет соседние по батчу (изоляция исходов).
+void TierManager::process_batch(const std::vector<Job>& batch) {
+    struct Entry {
+        GroupId gid;
+        std::vector<std::shared_ptr<TierAwaiter>> waiters;
+        bool need_read = false;
+        std::uint8_t* ram_buf = nullptr;
+        std::exception_ptr err;   // ошибка фаз A/B этой группы
+    };
+    std::vector<Entry> ents;
+    ents.reserve(batch.size());
 
-    // Завершить всех ждущих с ошибкой (включая прибывших позже).
-    auto fail_all = [&](std::exception_ptr err) {
-        std::vector<std::shared_ptr<TierAwaiter>> more;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            GroupState* st = find(gid);
-            if (st) {
-                st->loading = false;
-                more = st->waiters;
-                st->waiters.clear();
+    // Фаза A (под mu_, по группам): готовим RAM-тир.
+    for (const Job& job : batch) {
+        Entry e;
+        e.gid = job.id;
+        std::lock_guard<std::mutex> lk(mu_);
+        GroupState* st = find(job.id);
+        if (!st) continue; // ResetPlan — job устарел
+        e.waiters = st->waiters;
+        st->waiters.clear();
+        e.need_read = !st->in_ram;
+        try {
+            if (e.need_read) update_ram_tier(job.id, slot_size_);
+            auto it = ram_.find(job.id.value);
+            e.ram_buf = it->second;
+            if (!e.ram_buf)
+                e.err = std::make_exception_ptr(TierError(
+                    TierError::Code::IoFailure,
+                    "tiers: RAM-буфер группы отсутствует"));
+        } catch (...) {
+            e.err = std::current_exception();
+        }
+        ents.push_back(std::move(e));
+    }
+
+    // Фаза B: NVMe → RAM. ОДИН батч-чтение всех нуждающихся групп ([R2b]):
+    // k SQE io_uring — один submit (k чтений в полёте, параллельный I/O).
+    // Диагностический крюк io_delay_ms: латентность ОДНОЙ группы; батч из k
+    // в полёте перекрывает её (детерминизм тестов deep-prefetch; прод: 0).
+    std::vector<std::size_t> to_read;
+    for (std::size_t i = 0; i < ents.size(); ++i)
+        if (!ents[i].err && ents[i].need_read) to_read.push_back(i);
+    if (!to_read.empty()) {
+        if (!nvme_) {
+            for (std::size_t i : to_read)
+                ents[i].err = std::make_exception_ptr(TierError(
+                    TierError::Code::IoFailure,
+                    "nvme: tier not configured (no stell-tier layout)"));
+        } else {
+            if (cfg_.io_delay_ms)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(cfg_.io_delay_ms));
+            std::vector<std::pair<std::uint32_t, void*>> reqs;
+            reqs.reserve(to_read.size());
+            for (std::size_t i : to_read)
+                reqs.emplace_back(ents[i].gid.value, ents[i].ram_buf);
+            // read_groups НИЧЕГО не бросает по отдельным группам — исходы в
+            // BatchOutcome.err (изоляция промаха одной группы в батче);
+            // TierError возможен только на отказ кольца/файла — тогда падают
+            // ВСЕ группы батча (честная семантика отказа носителя).
+            const std::vector<TierNvmeFile::BatchOutcome> out =
+                nvme_->read_groups(reqs);
+            for (std::size_t j = 0; j < to_read.size(); ++j) {
+                Entry& e = ents[to_read[j]];
+                if (!out[j].err.empty()) {
+                    e.err = std::make_exception_ptr(TierError(
+                        TierError::Code::IoFailure, out[j].err));
+                } else {
+                    io_ops_.fetch_add(1);
+                    io_bytes_.fetch_add(slot_size_);
+                }
             }
         }
-        for (auto& a : waiters) a->fail(err);
-        for (auto& a : more) a->fail(err);
-    };
-
-    // Фаза A: готовим RAM-тир (под mu_).
-    bool need_read = false;
-    std::uint8_t* ram_buf = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        GroupState* st = find(gid);
-        if (!st) return; // ResetPlan — job устарел
-        waiters = st->waiters;
-        st->waiters.clear();
-        need_read = !st->in_ram;
-        if (need_read) update_ram_tier(gid, slot_size_);
-        auto it = ram_.find(gid.value);
-        ram_buf = it->second;
-        if (!ram_buf)
-            throw TierError(TierError::Code::IoFailure, "tiers: RAM-буфер группы отсутствует");
     }
 
-    // Фаза B: NVMe → RAM (io_uring, вне mu_).
-    if (need_read) {
-        if (!nvme_) {
-            fail_all(std::make_exception_ptr(
-                TierError(TierError::Code::IoFailure,
-                          "nvme: tier not configured (no stell-tier layout)")));
-            return;
+    // Фаза C: RAM → VRAM-слот (DMA при STELL_CUDA; memcpy в CPU-эмуляции),
+    // по группам батча; ошибка одной группы (SlotExhausted/DMA) — изолирована.
+    for (Entry& e : ents) {
+        if (e.err) {
+            // Завершить всех ждущих с ошибкой (включая прибывших позже).
+            std::vector<std::shared_ptr<TierAwaiter>> more;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                GroupState* st = find(e.gid);
+                if (st) {
+                    st->loading = false;
+                    more = st->waiters;
+                    st->waiters.clear();
+                }
+            }
+            for (auto& a : e.waiters) a->fail(e.err);
+            for (auto& a : more) a->fail(e.err);
+            continue;
         }
-        try {
-            nvme_->read_group(gid.value, ram_buf);
+        std::int32_t slot = -1;
+        std::exception_ptr slot_err = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            try {
+                slot = acquire_slot(e.gid); // TierError(SlotExhausted) при отсутствии жертв
+            } catch (...) {
+                slot_err = std::current_exception();
+            }
+        }
+        if (slot_err) {
+            std::vector<std::shared_ptr<TierAwaiter>> more;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                GroupState* st = find(e.gid);
+                if (st) {
+                    st->loading = false;
+                    more = st->waiters;
+                    st->waiters.clear();
+                }
+            }
+            for (auto& a : e.waiters) a->fail(slot_err);
+            for (auto& a : more) a->fail(slot_err);
+            continue;
+        }
+        // Копирование вне mu_ (может быть тяжёлым).
+#if defined(STELL_CUDA)
+        // DMA RAM(pinned)→VRAM(device): cudaMemcpyAsync на выделенном стриме;
+        // Awaiter группы завершается после синхронизации стрима (fan-in по
+        // событиям CUDA — развитие следующего раунда, см. отчёт о честности).
+        {
+            cudaStream_t s = static_cast<cudaStream_t>(dma_stream_);
+            cudaError_t ce = cudaMemcpyAsync(vram_slots_[(size_t)slot], e.ram_buf,
+                                             slot_size_, cudaMemcpyHostToDevice, s);
+            if (ce != cudaSuccess) {
+                slot_err = std::make_exception_ptr(TierError(
+                    TierError::Code::IoFailure,
+                    std::string("tiers: DMA RAM→VRAM failed: ") + cudaGetErrorString(ce)));
+            } else {
+                ce = cudaStreamSynchronize(s);
+                if (ce != cudaSuccess) {
+                    slot_err = std::make_exception_ptr(TierError(
+                        TierError::Code::IoFailure,
+                        std::string("tiers: DMA stream sync failed: ") + cudaGetErrorString(ce)));
+                }
+            }
+        }
+#else
+        std::memcpy(vram_slots_[(size_t)slot], e.ram_buf, slot_size_);
+#endif
+        if (slot_err) {
+            std::vector<std::shared_ptr<TierAwaiter>> more;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                GroupState* st = find(e.gid);
+                if (st) {
+                    st->loading = false;
+                    more = st->waiters;
+                    st->waiters.clear();
+                }
+            }
+            for (auto& a : e.waiters) a->fail(slot_err);
+            for (auto& a : more) a->fail(slot_err);
+            continue;
+        }
+        std::vector<std::shared_ptr<TierAwaiter>> all_waiters;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            GroupState* st = find(e.gid);
+            if (!st) { release_slot(slot); continue; } // ResetPlan
+            st->in_vram = true;
+            st->slot = slot;
+            st->in_ram = true;
+            st->loading = false;
             io_ops_.fetch_add(1);
             io_bytes_.fetch_add(slot_size_);
-        } catch (...) {
-            fail_all(std::current_exception());
-            return;
+            auto ws = st->waiters;
+            st->waiters.clear();
+            all_waiters = e.waiters;
+            all_waiters.insert(all_waiters.end(), ws.begin(), ws.end());
         }
+        for (auto& a : all_waiters) a->complete();
     }
-
-    // Фаза C: RAM → VRAM-слот (DMA при STELL_CUDA; memcpy в CPU-эмуляции).
-    std::int32_t slot = -1;
-    std::exception_ptr slot_err = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        try {
-            slot = acquire_slot(gid); // TierError(SlotExhausted) при отсутствии жертв
-        } catch (...) {
-            slot_err = std::current_exception();
-        }
-    }
-    if (slot_err) {
-        fail_all(slot_err);
-        return;
-    }
-    // Копирование вне mu_ (может быть тяжёлым).
-#if defined(STELL_CUDA)
-    // DMA RAM(pinned)→VRAM(device): cudaMemcpyAsync на выделенном стриме;
-    // Awaiter группы завершается после синхронизации стрима (fan-in по
-    // событиям CUDA — развитие следующего раунда, см. отчёт о честности).
-    {
-        cudaStream_t s = static_cast<cudaStream_t>(dma_stream_);
-        cudaError_t e = cudaMemcpyAsync(vram_slots_[(size_t)slot], ram_buf,
-                                        slot_size_, cudaMemcpyHostToDevice, s);
-        if (e != cudaSuccess) {
-            fail_all(std::make_exception_ptr(TierError(
-                TierError::Code::IoFailure,
-                std::string("tiers: DMA RAM→VRAM failed: ") + cudaGetErrorString(e))));
-            return;
-        }
-        e = cudaStreamSynchronize(s);
-        if (e != cudaSuccess) {
-            fail_all(std::make_exception_ptr(TierError(
-                TierError::Code::IoFailure,
-                std::string("tiers: DMA stream sync failed: ") + cudaGetErrorString(e))));
-            return;
-        }
-    }
-#else
-    std::memcpy(vram_slots_[(size_t)slot], ram_buf, slot_size_);
-#endif
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        GroupState* st = find(gid);
-        if (!st) { release_slot(slot); return; } // ResetPlan
-        st->in_vram = true;
-        st->slot = slot;
-        st->in_ram = true;
-        st->loading = false;
-        io_ops_.fetch_add(1);
-        io_bytes_.fetch_add(slot_size_);
-        auto ws = st->waiters;
-        st->waiters.clear();
-        waiters.insert(waiters.end(), ws.begin(), ws.end());
-    }
-    for (auto& a : waiters) a->complete();
 }
 
 // --- расширения R1/R7 (раунд 3) ----------------------------------------------
@@ -687,6 +827,12 @@ std::uint64_t TierManager::crc_checks() const {
     return f ? f->crc_checks() : 0;
 }
 
+// [R2a] round 4: честная фиксация режима I/O данных (для bench/отчётов).
+bool TierManager::nvme_odirect_active() const {
+    const TierNvmeFile* f = nvme_.get();
+    return f && f->odirect_active();
+}
+
 // --- R7: конфигурируемые границы тиров ---------------------------------------
 TierConfig tier_config_from_env(TierConfig base) {
     base.vram_slots     = env_size_or("STELL_TIER_VRAM_SLOTS", base.vram_slots);
@@ -705,6 +851,16 @@ TierConfig tier_config_from_env(TierConfig base) {
     }
     if (const char* v = std::getenv("STELL_TIER_NVME_LAYOUT"))
         base.nvme_layout = v;
+    // [R2a] round 4: O_DIRECT-бэкенд NVMe-тира ("1" → on, иное → off,
+    // консервативно — buffered-дефолт).
+    if (const char* v = std::getenv("STELL_TIER_ODIRECT"))
+        base.odirect = std::strcmp(v, "1") == 0;
+    // [R2b] round 4: k групп в полёте (deep-prefetch батч-глубина; 0/нечисловое
+    // → базовое;TierManager клампит в мин. 1).
+    base.deep_prefetch_depth = env_size_or("STELL_TIER_PREFETCH_DEPTH",
+                                           base.deep_prefetch_depth);
+    // Диагностический крюк латентности загрузки (тесты deep-prefetch; прод: 0).
+    base.io_delay_ms = env_size_or("STELL_TIER_IO_DELAY_MS", base.io_delay_ms);
     return base;
 }
 

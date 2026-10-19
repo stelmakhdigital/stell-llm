@@ -50,6 +50,32 @@
 #                  удалён по spec; флаг оставлен только для честной пометки
 #                  тёплого замера в отчёте).
 #   PASSES, N_GROUPS, LAYERS, SLOT — параметры прогона (ниже).
+#   MATRIX=1 — [R2] round 4: СЕРВЕРНАЯ МАТРИЦА slot {16,4} МиБ × I/O
+#              {buffered, O_DIRECT} × k {1,4} (8 прогонов; см. ниже).
+#
+# ==================== [R2] round 4: СЕРВЕРНАЯ МАТРИЦА ======================
+# Матрица slot size {16 МиБ, 4 МиБ} × I/O {buffered, O_DIRECT} × k {1, 4}.
+# ТОЧНАЯ КОМАНДА ПРОГОНА МАТРИЦЫ (worker, после merge, в клоне ~/Code/stell-llm):
+#   export PATH=~/.local/stell-conda/envs/stell/bin:$PATH
+#   export CC=x86_64-conda-linux-gnu-gcc CXX=x86_64-conda-linux-gnu-g++
+#   cmake -S . -B build/cpu -G Ninja && cmake --build build/cpu
+#   ./src/tiers/bench_p95_nvme.sh build/cpu ~/tiers_bench          # одиночный
+#   MATRIX=1 ./src/tiers/bench_p95_nvme.sh build/cpu ~/tiers_bench # матрица
+# Требования/пометки (planner [R2]/[Q2]):
+#   - данные layout — на реальном NVMe (~/tiers_bench; tmpfs отсечён guard'ом);
+#   - каждый прогон: fadvise-DONTNEED cold (userspace) + co-tenancy-пометка
+#     (nvidia-smi в логе; strata НЕ трогать; NVMe общий с серверной нагрузкой);
+#   - O_DIRECT: режим фиксируется в логе строкой 'bench io mode:
+#     odirect_requested=... odirect_active=...' — если odirect_active=false
+#     (FS не поддерживает), прогон ЧЕСТНО помечается откатом на buffered;
+#   - профиль остатка: сырые паузы (BENCH_DEBUG 'raw pauses') в логах каждой
+#     ячейки матрицы;
+#   - ВНИМАНИЕ-пометка в отчёте bench/results: замер под co-tenancy —
+#     «НЕ ВЕРДИКТ ПО ЦЕЛИ §4 (p95 ≤ 5 мс) — вердикт только по чистому окну»;
+#     цель не отменяется. Целевой профиль [Q2]: «слоты 4 МиБ + k≥4 + O_DIRECT».
+#   - суммарный файл layout: 32 группы × 16 МиБ = 512 МиБ + 128 МиБ (4 МиБ)
+#     — диск ~/tiers_bench; перезаписывается между ячейками матрицы.
+# ============================================================================
 
 set -euo pipefail
 
@@ -128,12 +154,55 @@ fi
 run_mode() { # $1 = prefetch|cold, $2 = метка лога
     echo "== режим $1 ($2) =="
     BENCH_DEBUG=1 "$BIN" "$LAYOUT" "$N_GROUPS" "$SLOT" "$LAYERS" "$PASSES" "$1" 2>&1 \
-        | grep -E 'bench-side pause|raw pauses|^bench_pause' | tee "$2"
+        | grep -E 'bench-side pause|raw pauses|^bench_pause|bench io mode' | tee "$2"
 }
 
 # Warmup: 1 проход — прогрев page cache И creation layout. CRC-once больше
 # НЕ доминирует проход 1: payload-CRC из hot path удалён ([R1], дефолт off) —
 # холодная пауза прохода 1 = честное NVMe-чтение (профиль остатка без CRC).
+# ============================================================================
+# [R2] round 4: МАТРИЦА slot {16,4} МиБ × I/O {buffered, O_DIRECT} × k {1,4}.
+# Каждая ячейка — cold через fadvise (userspace) + co-tenancy-пометка;
+# фактический режим I/O фиксируется в логе ячейки строкой 'bench io mode:'
+# (odirect_active=false → ЧЕСТНАЯ пометка отката на buffered).
+# Матрица — ТОЧКИ РЕГРЕССИИ и профиль остатка (сырые паузы в логе);
+# «НЕ ВЕРДИКТ ПО ЦЕЛИ §4 (p95 ≤ 5 мс)» — вердикт только по чистому окну
+# (planner [Q2]); цель не отменяется. Целевой профиль [Q2]: «слоты 4 МиБ +
+# prefetch k≥4 + O_DIRECT» — последняя ячейка матрицы.
+# ============================================================================
+if [ "${MATRIX:-0}" = "1" ]; then
+    echo "=== [R2] МАТРИЦА: slot {16,4 МиБ} × I/O {buffered, O_DIRECT} × k {1,4} ==="
+    echo "    пометка: co-tenancy (NVMe/GPU общие; strata НЕ трогать)"
+    echo "    НЕ ВЕРДИКТ ПО ЦЕЛИ §4 — вердикт только по чистому окну"
+    for SLOT in $((16*1024*1024)) $((4*1024*1024)); do
+        for OD in 0 1; do
+            for K in 1 4; do
+                rm -f "$LAYOUT"  # layout перезаписывается под размер слота ячейки
+                evict_tier_pages || true
+                IO_LABEL=$([ "$OD" = "1" ] && echo odirect || echo buffered)
+                echo "--- ячейка: slot=$((SLOT/1024/1024))МиБ I/O=$IO_LABEL k=$K ---"
+                echo "co-tenancy: $(nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader 2>/dev/null | head -4 || echo 'GPU не видны')"
+                LOG="$DATA_DIR/matrix_slot$((SLOT/1024/1024))_io${IO_LABEL}_k${K}.log"
+                # 1) создать layout ячейки (перезаписывается под размер слота);
+                STELL_TIER_ODIRECT=$OD STELL_TIER_PREFETCH_DEPTH=$K\
+                    "$BIN" "$LAYOUT" "$N_GROUPS" "$SLOT"\
+                    "$LAYERS" 1 prefetch >/dev/null 2>&1 || true
+                # 2) cold-eviction page cache (userspace fadvise, [Q3]);
+                evict_tier_pages || true
+                # 3) замер ячейки (сырые паузы — в лог, профиль остатка).
+                STELL_TIER_ODIRECT=$OD STELL_TIER_PREFETCH_DEPTH=$K\
+                    BENCH_DEBUG=1 "$BIN" "$LAYOUT" "$N_GROUPS" "$SLOT"\
+                    "$LAYERS" "$PASSES" prefetch 2>&1\
+                    | tee "$LOG" | grep -E 'bench io mode|bench-side pause|raw pauses'
+                echo "    лог ячейки: $LOG"
+            done
+        done
+    done
+    echo "=== конец матрицы [R2] — сохранить логи в bench/results/ с пометкой"
+    echo "    co-tenancy; НЕ вердикт по цели §4 (вердикт — только по чистому окну)"
+    exit 0
+fi
+
 "$BIN" "$LAYOUT" "$N_GROUPS" "$SLOT" "$LAYERS" 1 prefetch >/dev/null
 echo "warmup: layout $LAYOUT готов (${N_GROUPS} групп × ${SLOT} байт); CRC-once в hot path off ([R1])"
 

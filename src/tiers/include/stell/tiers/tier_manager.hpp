@@ -44,6 +44,43 @@ struct TierConfig {
     // вне пути декода: verify_slots() или периодический проход калибровщика).
     // header_crc32 файла layout reader проверяет всегда.
     bool verify_crc             = false;
+
+    // [R2a] round 4 (planner [Q6]): O_DIRECT-бэкенд NVMe-тира — данные слотов
+    // читаются на fd, открытом с O_DIRECT (детерминированный cold: page cache
+    // не искажает замер под co-tenancy, нет двойного буферирования). Дефолт
+    // buffered — fallback-прецедент сохранён. Если FS/ядро не поддерживают
+    // O_DIRECT (напр. tmpfs) — честный откат на buffered:
+    // TierNvmeFile::odirect_active() == false (тест проверяет активность;
+    // bench обязан помечать прогон фактическим режимом). Выравнивание —
+    // 4096 (= kTierSlotAlign, консервативно покрывает логический блок
+    // распространённых FS; лsb кодом НЕ запрашивается — честно зафиксировано
+    // в докстринге nvme_file.hpp): RAM-буферы менеджера выделяются
+    // выровненно — O_DIRECT читает прямо в них; произвольные dst — через
+    // минимальное выровненное staging-чтение (контракт read_group цел).
+    // Итоговый флаг = config || env (STELL_TIER_ODIRECT=1) — та же
+    // OR-семантика, что у verify_crc.
+    bool odirect                = false;
+
+    // [R2b] round 4 (planner [Q2]): deep-prefetch — глубина k групп в полёте.
+    // Воркер тира дренажит очередь загрузок БАТЧАМИ до k групп: k SQE
+    // io_uring подаются ОДНИМ submit (k чтений NVMe параллельно — глубина
+    // очереди носителя) и завершаются вместе; пауза между слоями
+    // перекрывается чтением k слоёв вперёд. k=1 — прежнее поведение
+    // (группа за раз). Заделка в tier-профиле: tier_config_from_env
+    // (STELL_TIER_PREFETCH_DEPTH) / tier_config_co_tenancy — профиль
+    // фиксирует границы тиров, k задаётся поверх (from_env). Честная
+    // семантика: батч из k групп материализуется параллельно; при
+    // fallback-бэкенде (нет io_uring) батч деградирует до k
+    // последовательных pread (фиксировано в докстринге nvme_file.hpp).
+    std::size_t deep_prefetch_depth = 1;
+
+    // Диагностический крюк (НЕ прод-параметр): искусственная латентность
+    // одной загрузки батча (мс) — только для детерминистических тестов
+    // deep-prefetch (k групп в полёте материализуются за ~латентность ОДНОЙ
+    // группы, а не k×). Прод/дефолт: 0. env: STELL_TIER_IO_DELAY_MS
+    // (tier_config_from_env). Честно: крюк моделирует латентность загрузки;
+    // батч-параллелизм с ним детерминирован.
+    std::size_t io_delay_ms     = 0;
 };
 
 // Асинхронный handle с семантикой ошибки: wait() бросает TierError,
@@ -133,6 +170,19 @@ public:
     // Для тестов/дашборда: resident-наличие группы в VRAM.
     bool resident_in_vram(GroupId id) const;
 
+    // [R5] round 4: чтение содержимого VRAM-СЛОТА группы (после pin→wait)
+    // в dst (dst_bytes ≥ slot_bytes). Назначение — побитовая сверка VRAM-
+    // слотов с эталоном прямого лоадера (TierLayoutReader): инвариант
+    // «одна группа = один слот» (класс aliasing-багов ba42267 не ловился
+    // тестами логитов). Расширение на конкретной реализации — интерфейс
+    // ITierManager (ADR-08 §2) НЕ расширяется; тот же прецедент, что
+    // read_ram_slot/set_layer_map. Не горячий путь: копия под mu_
+    // (защита от гонки с eviction); для верификации/тестов. Ошибки:
+    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes;
+    //   - IoFailure: группа не resident в VRAM (pin→wait обязателен до
+    //     чтения). При STELL_CUDA — cudaMemcpy D2H из device-слота.
+    void read_vram_slot(GroupId id, void* dst, std::size_t dst_bytes) const;
+
     // --- расширения R1/R7 (раунд 3; интерфейс ITierManager, ADR-08 §2,
     // --- НЕ расширяется — тот же прецедент, что set_layer_map/read_ram_slot)
 
@@ -152,6 +202,14 @@ public:
     // verify-прохода — 0: фиксация «hot path без CRC» (тест R1-а).
     std::uint64_t crc_checks() const;
 
+    // [R2a] round 4: O_DIRECT-тракт данных NVMe-тира РЕАЛЬНО активен (fd
+    // открыт с O_DIRECT). false → отката на buffered (FS/ядро не поддерживают
+    // O_DIRECT, напр. tmpfs) — bench/отчёты обязаны честно помечать прогон
+    // фактическим режимом. Без NVMe-тира — false. Для тестов/дашборда/bench
+    // (расширение на конкретной реализации, ITierManager не расширяется —
+    // прецедент crc_checks).
+    bool nvme_odirect_active() const;
+
 private:
     struct Job {
         GroupId id;
@@ -169,7 +227,7 @@ private:
 
     void enqueue_load(GroupId id, const std::shared_ptr<TierAwaiter>& a);
     void worker_loop();
-    void process_job(const Job& job);
+    void process_batch(const std::vector<Job>& batch); // [R2b]: до k групп в полёте
     std::int32_t acquire_slot(GroupId id);        // под mu_; TierError(SlotExhausted)
     void release_slot(std::int32_t slot);         // под mu_
     void run_predictor(GroupId id);               // под mu_: observe + prefetch
@@ -220,6 +278,8 @@ private:
     EvictionPolicy policy_;
     MarkovPredictor predictor_;
     std::size_t lookahead_;
+    std::size_t batch_depth_;        // [R2b]: k групп в полёте (deep-prefetch)
+    bool odirect_;                   // [R2a]: итоговый флаг O_DIRECT (config || env)
 
     // Рабочие потоки.
     std::vector<std::thread> workers_;
@@ -252,7 +312,10 @@ std::string nvme_io_backend();
 //   STELL_TIER_HISTORY_CAP      — предел истории предиктора;
 //   STELL_TIER_VERIFY_CRC       — 1 → payload-CRC при pin/read (см. TierConfig);
 //   STELL_TIER_POLICY           — "lru" | "lcu";
-//   STELL_TIER_NVME_LAYOUT      — путь stell-tier файла.
+//   STELL_TIER_NVME_LAYOUT      — путь stell-tier файла;
+//   STELL_TIER_ODIRECT          — 1 → O_DIRECT-бэкенд NVMe-тира ([R2a]);
+//   STELL_TIER_PREFETCH_DEPTH   — k групп в полёте ([R2b]; 1 — дефолт);
+//   STELL_TIER_IO_DELAY_MS      — диагностическая латентность загрузки (тесты).
 // Нечисловые/некорректные значения → берётся базовое значение (консервативно).
 // Профиль co-tenancy задаётся комбинацией: напр. свободно 2–11 ГБ на V100 →
 // STELL_TIER_VRAM_SLOTS небольшим, STELL_TIER_RAM_MB — под основной тир.

@@ -77,7 +77,10 @@ int main(int argc, char** argv) {
     if (probe) std::fclose(probe);
     if (!exists) build_layout(path, groups, slot);
 
-    TierConfig cfg;
+    // [R2] round 4: env-профиль поверх bench-базы (STELL_TIER_ODIRECT,
+    // STELL_TIER_PREFETCH_DEPTH, STELL_TIER_IO_DELAY_MS и др. — матрица
+    // [R2] прогоняется bench_p95_nvme.sh через эти env).
+    TierConfig cfg = tier_config_from_env();
     cfg.vram_slots = 2;                    // churn: слои > VRAM-слотов
     cfg.vram_slot_size = slot;
     cfg.ram_capacity = 4 * slot;
@@ -138,6 +141,13 @@ int main(int argc, char** argv) {
         for (double p : raw_ms) std::printf("%.1f ", p);
         std::printf("\n");
     }
+    // [R2] round 4: честная фиксация режима I/O и глубины k в строке прогона
+    // (odirect_active() — O_DIRECT-тракт действительно активен; иначе отката
+    // на buffered — прогон обязан быть помечен).
+    std::printf("bench io mode: odirect_requested=%d odirect_active=%s k_in_flight=%zu io_delay_ms=%zu\n",
+                (int)cfg.odirect,
+                (mgr.nvme_odirect_active() ? "true" : "false"),
+                cfg.deep_prefetch_depth, cfg.io_delay_ms);
     const double io_gb = double(st.io_bytes) / double(1 << 30);
     // Двойной замер: bench-side percentiles по raw_ms (независимы от tiers).
     std::vector<double> sorted(raw_ms);

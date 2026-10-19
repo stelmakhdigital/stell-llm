@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -152,6 +153,34 @@ std::int64_t IoUring::submit_and_wait(std::uint64_t user_data) {
                                 std::strerror(errno));
         }
     }
+}
+
+std::vector<std::int64_t> IoUring::submit_and_wait_all(
+        const std::vector<std::uint64_t>& tags) {
+    submit(abi::IORING_ENTER_GETEVENTS); // один enter на весь батч
+    std::unordered_map<std::uint64_t, std::int64_t> done;
+    done.reserve(tags.size());
+    while (done.size() < tags.size()) {
+        for (const auto& r : poll())
+            done.emplace(r.user_data, r.res); // чужие SQE тоже собираем
+        if (done.size() >= tags.size()) break;
+        // Блокирующее ожидание оставшихся завершений.
+        const long r = sys_uring_enter(fd_, 0,
+            static_cast<unsigned>(tags.size() - done.size()),
+            abi::IORING_ENTER_GETEVENTS);
+        if (r < 0 && errno != EINTR) {
+            throw TierError(TierError::Code::IoFailure,
+                            std::string("io_uring_enter(wait_all) failed: ") +
+                                std::strerror(errno));
+        }
+    }
+    std::vector<std::int64_t> out;
+    out.reserve(tags.size());
+    for (const std::uint64_t t : tags) {
+        const auto it = done.find(t);
+        out.push_back(it == done.end() ? -EIO : it->second); // не должен случаться
+    }
+    return out;
 }
 
 std::vector<IoResult> IoUring::poll() {

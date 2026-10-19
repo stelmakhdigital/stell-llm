@@ -37,6 +37,14 @@ public:
     // (блокирующе через io_uring_enter GETEVENTS). Возвращает res.
     std::int64_t submit_and_wait(std::uint64_t user_data);
 
+    // [R2] round 4, deep-prefetch: подаёт ВСЕ готовые SQE одним
+    // io_uring_enter (k запросов в полёте — батч-глубина очереди тира) и
+    // дожидается завершения ВСЕХ тегов из `tags`. Возвращает res параллельно
+    // tags (порядок сохранён). Результаты других поданных SQE не теряются
+    // (в отличие от submit_and_wait, который дропает чужие CQE).
+    std::vector<std::int64_t> submit_and_wait_all(
+        const std::vector<std::uint64_t>& tags);
+
     // Неблокирующий сбор завершений (для потокобезопасных снапшотов).
     std::vector<IoResult> poll();
 
