@@ -1,7 +1,9 @@
-"""Живой runner quality-gates (round 2, поток E): PPL по logprob позиций
+"""Живой runner quality-gates (round 2/3, поток E): PPL по logprob позиций
 ("positions":"all"), GSM8K-32 через жадное декодирование (корректность —
-сопоставление чисел, без исполнения), HumanEval-32 — честный pending
-(проверка корректности требует исполнения кода).
+сопоставление чисел, без исполнения), HumanEval-32 — через песочницу
+([R4] round 3): жадное декодирование → извлечение кода (markdown-fence/
+первый блок) → исполнение против test-кейса в process-sandbox (НЕ
+security-граница — честная пометка в докстринге code_sandbox).
 
 Математика PPL/декодирования проверяется на синтетических логитах с
 известными значениями; источники логитов — stub-.so с `stell_logits`
@@ -19,11 +21,13 @@ import pytest
 pytest.importorskip("numpy", reason="golden-ref источник логитов требует numpy")
 
 from stell_bench.quality_gates_runner import (  # noqa: E402
-    GSM8K_MAX_STEPS, GSM8K_PROMPT_TOKENS, PPL_MAX_TOKENS,
-    AbiLogitsSource, GoldenRefLogitsSource, _GatesSnapshot, _vocab_size,
-    detokenize_ids, extract_answer_number, greedy_token, logprob_of,
-    open_logits_source, ppl_from_logits, project_to_vocab, run_gates_live,
-    run_gsm8k_gate, run_humaneval_gate, run_ppl_gate,
+    GSM8K_MAX_STEPS, GSM8K_PROMPT_TOKENS, HUMANEVAL_MAX_STEPS,
+    HUMANEVAL_PROMPT_TOKENS, PPL_MAX_TOKENS, AbiLogitsSource,
+    GoldenRefLogitsSource, _GatesSnapshot, _vocab_size, detokenize_ids,
+    extract_answer_number, extract_code, greedy_token, humaneval_exec_script,
+    humaneval_program, logprob_of, open_logits_source, ppl_from_logits,
+    project_to_vocab, run_gates_live, run_gsm8k_gate, run_humaneval_gate,
+    run_ppl_gate,
 )
 
 try:
@@ -146,12 +150,44 @@ def test_run_gsm8k_gate_live(golden_ref_dense):
     assert gate.value is not None and 0.0 <= gate.value <= 1.0
 
 
-def test_run_humaneval_gate_stays_pending(golden_ref_dense):
+def test_run_humaneval_gate_live(golden_ref_dense):
+    """[R4] round 3: HumanEval-32 — НЕ pending; accuracy через песочницу
+    (process-sandbox, честная пометка в notes)."""
     gate = run_humaneval_gate(golden_ref_dense, "mini_dense")
-    assert gate.pending is True
-    assert gate.value is None
+    assert gate.pending is False
+    assert gate.value is not None and 0.0 <= gate.value <= 1.0
     assert gate.items == 32
-    assert any("исполнени" in n for n in gate.notes)   # честная причина
+    assert any("песочниц" in n for n in gate.notes)    # механизм в notes
+    assert any("process-sandbox" in n for n in gate.notes)
+    assert any("исходы песочницы" in n for n in gate.notes)  # исходы в отчёте
+
+
+def test_humaneval_pipeline_extraction_and_exec():
+    """Конвейер [R4] на синтетическом ответе с fence: извлечение кода →
+    candidate = prompt + completion → исполнение против test-кейса —
+    pass/fail определяется песочницей (process-sandbox)."""
+    item = {
+        "prompt": "def add(a, b):\n    '''sum of two ints'''\n",
+        "test": "def check(candidate):\n    assert candidate(2, 3) == 5\n",
+        "entry_point": "add",
+    }
+    # ответ с markdown-fence (как у реальной LLM) — берётся первый блок
+    answer = "Вот решение:\n```python\n    return a + b\n```"
+    script = humaneval_exec_script(item, humaneval_program(item, answer))
+    assert "return a + b" in script and "check(add)" in script
+    from stell_bench.code_sandbox import run_code
+    assert run_code(script).outcome == "ok"          # корректный candidate
+    # неверный candidate — кейс некорректен, но прогон не падает
+    bad = "Вот решение:\n```python\n    return a - b\n```"
+    res = run_code(humaneval_exec_script(
+        item, humaneval_program(item, bad)))
+    assert res.outcome == "error" and "AssertionError" in res.stderr_tail
+
+
+def test_humaneval_protocol_constants():
+    """Протокол декодирования HumanEval ([R4]) зафиксирован константами."""
+    assert HUMANEVAL_PROMPT_TOKENS == 64
+    assert HUMANEVAL_MAX_STEPS == 32
 
 
 def test_run_gates_live_full_set():
@@ -163,7 +199,7 @@ def test_run_gates_live_full_set():
                         "humaneval_32[mini_moe]"]
     assert all(g.pending is False for g in gates if g.dataset.startswith("ppl"))
     assert all(g.pending is False for g in gates if g.dataset.startswith("gsm8k"))
-    assert all(g.pending is True for g in gates if g.dataset.startswith("humaneval"))
+    assert all(g.pending is False for g in gates if g.dataset.startswith("humaneval"))
     snap = _GatesSnapshot(gates).to_dict()
     assert snap["pending"] is False                    # живые гейты: не все pending
 
