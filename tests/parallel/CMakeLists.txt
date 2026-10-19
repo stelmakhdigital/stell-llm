@@ -9,6 +9,7 @@ add_executable(test_parallel
     test_ep_registry_glm.cpp
     test_stress_multi_rank.cpp
     test_meta_broadcast.cpp
+    test_subgroup_token_width.cpp
     test_golden_real_models.cpp
 )
 

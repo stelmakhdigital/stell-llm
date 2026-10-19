@@ -35,7 +35,7 @@ public:
             last_batch = static_cast<std::uint32_t>(m[1]);
         }
     }
-    void expert_alltoall(void*, void*, void*, void*, std::size_t,
+    void expert_alltoall(void*, void*, void*, void*, std::size_t, std::size_t,
                          stell::parallel::CommDType) override { ++ea_calls; }
     void chain_send(void*, std::size_t, stell::parallel::CommDType,
                     stell::parallel::rank_t) override { ++cs_calls; }
@@ -46,6 +46,13 @@ public:
         (void)dst; (void)bytes;
         ++pop_calls;
         return false;
+    }
+    // Подгруппа (ADR-10 round 2): world=1 — единственная валидная подгруппа
+    // {0}; возвращаем сам объект (владение у родителя — это и есть родитель).
+    stell::parallel::ICommunicator* subgroup(const std::vector<stell::parallel::rank_t>& ranks) override {
+        if (ranks.size() == 1 && ranks[0] == 0) return this;
+        throw stell::parallel::CommError(stell::parallel::CommError::Code::RankMismatch,
+                                         "FakeComm: подгруппа world=1 — только {0}");
     }
 
     int allreduce_calls = 0, allgather_calls = 0, ea_calls = 0;

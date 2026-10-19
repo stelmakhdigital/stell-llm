@@ -95,21 +95,50 @@ public:
     virtual void allgather(void* send, void* recv, std::size_t count, CommDType t) = 0;
 
     // EP: токены (индексы экспертов + эмбеддинги) уезжают к владельцам экспертов
-    // и возвращаются после FFN. Семантика: send_tokens[i] уходит на ранок
+    // и возвращаются после FFN. Семантика: send-токен i уходит на ранок
     // owner(expert_id[i]); recv_tokens возвращают локальные токены других ранков.
     //
-    // Буферы: send_tokens/send_meta — ровно max_tokens элементов; записи с
-    // meta.expert_id < 0 не отправляются (пустые слоты). recv_tokens/recv_meta
-    // — ёмкость max_tokens * world_size элементов: входящие токены складываются
+    // Ширина токена (уточнение ADR-10, round 2): token_elems — количество
+    // элементов dtype на ОДИН токен (для hidden = d_model). Токен i занимает
+    // элементы send_tokens[i*token_elems .. (i+1)*token_elems); token_elems = 1
+    // — совместимость со скалярной семантикой раунда 1. Мета-структура
+    // (expert_id + слот ADR-08) — одна на токен, без изменений.
+    //
+    // Буферы: send_tokens — max_tokens * token_elems элементов; send_meta —
+    // ровно max_tokens записей; записи с meta.expert_id < 0 не отправляются
+    // (пустые слоты). recv_tokens — ёмкость max_tokens * world_size ТОКЕНОВ
+    // (т.е. max_tokens * world_size * token_elems элементов), recv_meta —
+    // max_tokens * world_size записей: входящие токены складываются
     // в детерминированном порядке (по возрастанию ранка-источника, затем по
-    // индексу), остаток ёмкости заполняется TokenMeta{expert_id = -1}.
-    // Переполнение ёмкости приёма — CommError(BufferTooSmall).
+    // индексу), остаток ёмкости заполняется нулями и TokenMeta{expert_id = -1}.
+    // Переполнение ёмкости приёма — CommError(BufferTooSmall); молчаливое
+    // сокращение пересылки запрещено (ADR-10, round 2).
     // При TP внутри EP-группы (tp > 1) токен уезжает на ВСЕ tp-ранки
     // группы-владельца эксперта (fan-out, см. plan.hpp::expert_alltoall_route).
     virtual void expert_alltoall(
         void* send_tokens, void* send_meta,   // meta: expert_id, слот (ADR-08)
         void* recv_tokens, void* recv_meta,
-        std::size_t max_tokens, CommDType t) = 0;
+        std::size_t max_tokens, std::size_t token_elems, CommDType t) = 0;
+
+    // Подгруппа (уточнение ADR-10, round 2): коллективы (allreduce/allgather/
+    // expert_alltoall) и p2p (chain_*, kv_stream_*) внутри возвращаемого
+    // комм-объекта исполняются ТОЛЬКО по ранкам из ranks — чужие ранки родителя
+    // не участвуют и не затрагиваются. Ранки в подгруппе ПЕРЕНУМЕРОВАНЫ:
+    // ранок i подгруппы — i-й (по возрастанию) глобальный ранок из ranks;
+    // world_size() подгруппы = ranks.size().
+    //
+    // ranks: глобальные ранки родителя, уникальные, из [0, world_size());
+    // ranks ОБЯЗАН содержать собственный ранок (иначе CommError(RankMismatch);
+    // не-члены подгруппу не создают). Все члены обязаны вызвать subgroup с
+    // ОДИНАКОВЫМ ranks (как ncclCommSplit по цвету) — иначе члены не сойдутся
+    // в одном состоянии и получат Timeout.
+    // Подмножество допустимо: subgroup можно вызывать и на подгруппе (вложенно).
+    //
+    // ВЛАДЕНИЕ У РОДИТЕЛЯ: возвращённый объект принадлежит родительскому
+    // комм-объекту, живёт до его уничтожения и НЕ удаляется вызывающим
+    // (удаление родителем). Повторный вызов с тем же ranks возвращает тот же
+    // под-комм (состояние коллективов у подгруппы общее между членами).
+    virtual ICommunicator* subgroup(const std::vector<rank_t>& ranks) = 0;
 
     // PP: point-to-point по цепочке (peer = rank±1). send кладёт данные в канал
     // (буферизуется), recv блокирует до появления (Timeout по ParallelConfig).

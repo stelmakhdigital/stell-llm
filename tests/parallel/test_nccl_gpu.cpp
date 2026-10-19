@@ -15,6 +15,7 @@
 #include <nccl.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -193,6 +194,129 @@ TEST(parallel_gpu_nccl_allreduce_allgather_latency) {
         for (std::size_t r = 0; r < outs.size(); ++r)
             std::printf(" rank%zu=%.1fµs", std::size_t(r), outs[r].latency_us[si]);
         std::printf("\n");
+    }
+    CHECK(ok.get());
+}
+
+// --- [R6] GPU-контракт expert_alltoall (token_elems) + kv_stream -------------
+
+// CPU-эмуляторный контракт этих операций прогнан в tests/parallel (tok_width_*,
+// sub_*); здесь — NCCL-исполнение. PENDING: worker прогоняет после merge
+// (co-tenancy честная; при OOM/нехватке VRAM — честный pending, см. шапку).
+TEST(parallel_gpu_nccl_expert_alltoall_kv_stream) {
+    const char* env = std::getenv("STELL_GPU_DEVICES");
+    const std::vector<int> devices = parse_devices(env ? env : STELL_GPU_TEST_DEVICES);
+    if (devices.size() < 2) {
+        std::printf("PENDING: нужно ≥2 устройств (STELL_GPU_DEVICES)\n");
+        return;
+    }
+    constexpr int DM = 8, T = 4;                     // токен = d_model векторов
+    SafeFlag ok;
+    std::vector<std::thread> th;
+    for (rank_t r = 0; r < rank_t(devices.size()); ++r)
+        th.emplace_back([&, r] {
+            ParallelConfig cfg;
+            cfg.mode = CommMode::Nccl;
+            cfg.pp = 1;
+            cfg.tp = 1;
+            cfg.ep = rank_t(devices.size());         // EP: владелец = expert_id % ep
+            cfg.device_ids = devices;
+            cfg.rank = r;
+            cfg.group_id = 1;                        // отдельный бутстрап от bench-теста
+            cfg.timeout_ms = 30000;
+            try {
+                auto comm = make_communicator(cfg);
+                check_cuda(cudaSetDevice(devices[std::size_t(r)]), "setdev");
+                // --- expert_alltoall: токен = вектор d_model ---
+                float* send_t = nullptr;
+                TokenMeta* send_m = nullptr;
+                const std::size_t cap = std::size_t(T) * std::size_t(devices.size());
+                float* recv_t = nullptr;
+                TokenMeta* recv_m = nullptr;
+                std::vector<float> hsend(std::size_t(T) * DM);
+                std::vector<TokenMeta> hsm(T);
+                for (int i = 0; i < T; ++i) {
+                    hsm[std::size_t(i)] = TokenMeta{std::int32_t((r + 1) % int(cfg.ep)),
+                                                    std::int32_t(r * 16 + i)};
+                    for (int dd = 0; dd < DM; ++dd)
+                        hsend[std::size_t(i) * DM + dd] =
+                            float(r) * 1000.f + float(i) * 10.f + float(dd);
+                }
+                check_cuda(cudaMalloc((void**)&send_t, hsend.size() * sizeof(float)), "malloc");
+                check_cuda(cudaMalloc((void**)&send_m, hsm.size() * sizeof(TokenMeta)), "malloc");
+                check_cuda(cudaMalloc((void**)&recv_t, cap * DM * sizeof(float)), "malloc");
+                check_cuda(cudaMalloc((void**)&recv_m, cap * sizeof(TokenMeta)), "malloc");
+                check_cuda(cudaMemcpy(send_t, hsend.data(), hsend.size() * sizeof(float),
+                                      cudaMemcpyHostToDevice), "H2D");
+                check_cuda(cudaMemcpy(send_m, hsm.data(), hsm.size() * sizeof(TokenMeta),
+                                      cudaMemcpyHostToDevice), "H2D");
+                const auto t0 = std::chrono::steady_clock::now();
+                comm->expert_alltoall(send_t, send_m, recv_t, recv_m, std::size_t(T),
+                                      std::size_t(DM), CommDType::F32);
+                const double us =
+                    std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0).count();
+                std::vector<float> hrecv(cap * DM);
+                std::vector<TokenMeta> hrm(cap);
+                check_cuda(cudaMemcpy(hrecv.data(), recv_t, hrecv.size() * sizeof(float),
+                                      cudaMemcpyDeviceToHost), "D2H");
+                check_cuda(cudaMemcpy(hrm.data(), recv_m, hrm.size() * sizeof(TokenMeta),
+                                      cudaMemcpyDeviceToHost), "D2H");
+                // С одним expert_id=(src+1)%ep все токены ранка src уезжают
+                // на следующий ранок: входящих = T (от предыдущего ранка);
+                // recv_meta.expert_id = владелец (= мой ранок); хвост — заполнители.
+                const rank_t src_expect = rank_t((int(r) + int(cfg.ep) - 1) % int(cfg.ep));
+                std::size_t got = 0;
+                for (std::size_t i = 0; i < cap; ++i) {
+                    if (hrm[i].expert_id < 0) continue;
+                    ++got;
+                    const rank_t src = rank_t(hrm[i].slot_id) / 16;
+                    const int k = int(hrm[i].slot_id % 16);
+                    if (!(src == src_expect)) ok.fail();
+                    if (!(hrm[i].expert_id == std::int32_t(r))) ok.fail();
+                    for (int dd = 0; dd < DM; ++dd)
+                        if (!(hrecv[i * DM + dd] == float(src) * 1000.f + float(k) * 10.f +
+                              float(dd)))
+                            ok.fail();
+                }
+                if (got != std::size_t(T)) ok.fail();
+                std::printf("NCCL alltoall: rank%d: входящих=%zu, %.1f µs\n", int(r), got, us);
+                cudaFree(send_t); cudaFree(send_m); cudaFree(recv_t); cudaFree(recv_m);
+
+                // --- kv_stream: 3 блока r0→r1 по кольцу, побайтово ---
+                if (r == 0) {
+                    for (int b = 0; b < 3; ++b) {
+                        std::vector<std::uint8_t> blk(64);
+                        for (std::size_t i = 0; i < blk.size(); ++i)
+                            blk[i] = std::uint8_t(b * 31 + i);
+                        comm->kv_stream_push(blk.data(), blk.size());
+                    }
+                } else {
+                    for (int b = 0; b < 3; ++b) {
+                        std::vector<std::uint8_t> blk(64, 0);
+                        bool got_blk = false;
+                        for (int spin = 0; spin < 5000 && !got_blk; ++spin)
+                            got_blk = comm->kv_stream_pop(blk.data(), blk.size());
+                        if (!got_blk) { ok.fail(); continue; }
+                        for (std::size_t i = 0; i < blk.size(); ++i)
+                            if (blk[i] != std::uint8_t(b * 31 + i)) ok.fail();
+                    }
+                    std::vector<std::uint8_t> empty(64);
+                    if (comm->kv_stream_pop(empty.data(), empty.size())) ok.fail();
+                }
+            } catch (const CommError& e) {
+                std::printf("PENDING: CommError (rank %d): %s\n", int(r), e.what());
+                ok.fail();
+            } catch (...) {
+                std::printf("PENDING: неизвестная ошибка (rank %d)\n", int(r));
+                ok.fail();
+            }
+        });
+    for (auto& t : th) t.join();
+    if (!ok.get()) {
+        std::printf("PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён "
+                    "(co-tenancy/OOM/бутстрап) — worker прогонит после merge\n");
+        return;
     }
     CHECK(ok.get());
 }

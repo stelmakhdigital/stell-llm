@@ -44,12 +44,24 @@ TP4 на 1 MB: 96 µs (лучший прогон) против ~68 µs TP2 — �
 под контенансом нелинейно; чистый прогон возможен только вне co-tenancy
 (доступен только RTX 2060 без NVLink — для TP-латентности не годится).
 
-## Что НЕ сделано (честно)
+## Что НЕ сделано (честно, по состоянию раунда 2 задачи T-20261017200354)
 
-- expert_alltoall (NCCL): реализация-заготовка бросает NcclFailure
-  («завершить при серверной валидации») — ncclSend/ncclRecv парами + метки
-  отдельным проходом; требует контракта о ширине токена (см. CONTRACT_ENGINE.md
-  §A3b) — pending следующего раунда.
-- kv_stream (NCCL): аналогично pending.
+- expert_alltoall (NCCL): **реализован в раунде 2** (обмен счётчиками через
+  ncclAllGather + байтовый p2p ncclSend/ncclRecv, token_elems = ширина токена);
+  GPU-валидация — pending: worker прогонит после merge (co-tenancy — честная).
+- kv_stream (NCCL): **реализован в раунде 2** (ncclSend/ncclRecv по кольцу на
+  отдельной kv-комме, фоновый приёмник, неблокирующий pop); GPU-валидация —
+  pending: worker прогонит после merge.
 - E4M3-редукция через F32-стадию: host-конвертация реализована, но не гонялась
   на GPU (нужны device-ядра kernels).
+
+## Дополнение раунда 2: реализация R6 (код) — ожидание серверного окна
+
+Код `expert_alltoall`/`kv_stream`/`subgroup` в `nccl_communicator.cpp` готов;
+контракт прогнан на CPU-эмуляторе (tests/parallel: tok_width_*, sub_* — 6
+новых кейсов; ctest 40/40, golden TP2/TP4/EP2 побитово == TP1). GPU-тест
+`parallel_gpu_nccl_expert_alltoall_kv_stream` добавлен в test_nccl_gpu.cpp и
+БУДЕТ прогнан worker'ом после merge (push в ветку запрещён; co-tenancy: strata
+~21–30 GB на V100, свободная VRAM ~2–11 GB; при нехватке — честный PENDING).
+NCCL-файл синтакс-проверен локально (g++ -fsyntax-only, стубы
+cuda_runtime.h/nccl.h с сигнатурами серверного nccl.h 2.26.2).
