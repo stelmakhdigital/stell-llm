@@ -1,0 +1,1 @@
+quality-gates REAL: pending — веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]

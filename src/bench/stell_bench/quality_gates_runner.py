@@ -42,6 +42,21 @@ Round 3 ([R4], решение планировщика [Q4]): HumanEval-32 бо�
   самый, что сгенерировал golden-фикстуры; сверен с HF 1.5e-7) — числа
   помечены provenance "golden-ref (fallback)".
 
+Round 4 ([R8], режим «реальная модель»): `--real` принимает каталог модели —
+description.json (ADR-09, после hf_to_description [R4]) + model.safetensors
+(+ опциональный tokenizer.json — РЕАЛЬНЫЙ byte-level BPE, порт R10:
+bpe_tokenizer.py, сверено с fixtures/tokenizer/tokenizer_ref.json, расхожде-
+ние 0) — или явные файлы (--model-desc/--model-weights); env-переключатель
+STELL_R8_REAL_MODEL_DIR — по прецеденту R7 (без правки кода). Токенизация —
+BPE каталога; без tokenizer.json — честная проекция байта (значения —
+механические точки регрессии). Источник логитов — ТОЛЬКО ABI (golden-ref
+умеет только mini-фикстуры; подмена источника запрещена). Provenance точки
+регрессии — модель, размер весов, дата, co-tenancy (bench/results/). Без
+источника — честный pending «веса не предоставлены»; явно битый источник —
+громкая ошибка. До появления настоящих весов ([R3]/[R4]) конвейер отработан
+на синтетическом каталоге «реалистичного профиля» (synthetic_model.py:
+MoE 4×8, vocab=350, LCG-веса — воспроизводимо).
+
 Запуск: python -m stell_bench.quality_gates_runner [--live] [--engine-lib PATH]
 [--results-dir DIR]; отчёты — bench/results/<date>-<slug>/; локальные — в
 bench/results/local/ (gitignored).
@@ -50,14 +65,17 @@ bench/results/local/ (gitignored).
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib.util
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from .bpe_tokenizer import BpeTokenizer
 from .code_sandbox import run_code
 from .quality_gates import GateResult, gsm8k_32, humaneval_32, ppl_text
 from .report import results_local_dir_for, results_dir_for, write_report
@@ -81,6 +99,122 @@ GSM8K_MAX_STEPS = 16          # жадное декодирование: до 16
 HUMANEVAL_PROMPT_TOKENS = 64  # проекция сигнатуры+docstring → ≤ 64 токенов
 HUMANEVAL_MAX_STEPS = 32      # жадное декодирование: до 32 токенов ответа
 DEFAULT_MODELS = ("mini_dense", "mini_moe")
+
+# Режим «реальная модель» (R8, round 4): каталог с описанием ADR-09 (после
+# hf_to_description [R4]) и весами (+ опциональный tokenizer.json — РЕАЛЬНЫЙ
+# byte-level BPE); контракт одного файла весов (см. resolve_real_model).
+ENV_REAL_MODEL_DIR = "STELL_R8_REAL_MODEL_DIR"   # по прецеденту R7 (env без правки кода)
+REAL_DESCRIPTION_NAME = "description.json"       # вывод hf_to_description [R4]
+REAL_WEIGHTS_NAME = "model.safetensors"          # один файл (см. honest error при шардах)
+REAL_TOKENIZER_NAME = "tokenizer.json"           # опционально; иначе проекция байта
+
+
+class RealModelSpec:
+    """Разрешённый каталог реальной модели (R8): описание ADR-09 + веса
+    (+ tokenizer.json). Строится resolve_real_model(); используется
+    run_gates_real (живой прогон гейтов через ABI)."""
+
+    def __init__(self, desc_path: Path, weights_path: Path,
+                 desc: Dict[str, Any], root: Optional[Path] = None,
+                 tokenizer_path: Optional[Path] = None) -> None:
+        self.desc_path = Path(desc_path)
+        self.weights_path = Path(weights_path)
+        self.desc = desc
+        self.root = Path(root) if root is not None else None
+        self.tokenizer_path = Path(tokenizer_path) if tokenizer_path is not None else None
+
+    @property
+    def name(self) -> str:
+        """Метка модели в отчёте: name описания, иначе имя каталога."""
+        return str(self.desc.get("name") or (self.root or self.desc_path.parent).name)
+
+    @property
+    def vocab_size(self) -> int:
+        vocab = self.desc.get("vocab_size")
+        if not isinstance(vocab, int) or vocab <= 0:
+            raise ValueError(f"description.json: vocab_size должен быть int > 0"
+                             f" ({self.desc_path})")
+        return vocab
+
+
+def resolve_real_model(model_dir: Optional[str] = None,
+                       desc_json: Optional[str] = None,
+                       weights: Optional[str] = None) -> Optional[RealModelSpec]:
+    """Разрешение каталога реальной модели (R8).
+
+    Приоритет: явные файлы (--model-desc + --model-weights, оба обязательны
+    вместе) → каталог (--real-model-dir / env STELL_R8_REAL_MODEL_DIR):
+    description.json обязателен, model.safetensors обязателен (ровно один
+    файл — HF-шарды сначала склеиваются/конвертируются: plain-лоадер
+    safetensors открывает один файл, честная ошибка вместо догадок);
+    tokenizer.json — опционален.
+
+    Возвращает None, если источник не задан ни аргументами, ни env —
+    вызывающий честно помечает прогон pending («веса не предоставлены»).
+    Явно заданный, но битый источник — честная ошибка (не pending).
+    """
+    if (desc_json is None) != (weights is None):
+        raise RuntimeError("--model-desc и --model-weights задаются вместе")
+    if desc_json is not None:
+        d_path, w_path = Path(desc_json), Path(weights)
+        root = None
+    else:
+        src = model_dir or os.environ.get(ENV_REAL_MODEL_DIR)
+        if not src:
+            return None
+        root = Path(src)
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"каталог модели не найден ({ENV_REAL_MODEL_DIR}/{model_dir}): {root}")
+        d_path = root / REAL_DESCRIPTION_NAME
+        w_path = root / REAL_WEIGHTS_NAME
+    if not d_path.is_file():
+        raise FileNotFoundError(
+            f"описание ADR-09 не найдено: {d_path} (ожидался {REAL_DESCRIPTION_NAME} "
+            "— вывод hf_to_description [R4])")
+    if not w_path.is_file():
+        raise FileNotFoundError(
+            f"веса не найдены: {w_path} (ожидался {REAL_WEIGHTS_NAME}; HF-шарды "
+            "сначала склеиваются в один safetensors или конвертируются в "
+            "stell-tier — plain-лоадер safetensors открывает ровно один файл)")
+    try:
+        desc = json.loads(d_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{d_path}: битый JSON ({e})") from e
+    if not isinstance(desc, dict) or not desc.get("name"):
+        raise ValueError(f"{d_path}: описание без name (не ADR-09?)")
+    tok_path = root / REAL_TOKENIZER_NAME if root is not None\
+        else d_path.parent / REAL_TOKENIZER_NAME
+    return RealModelSpec(d_path, w_path, desc, root=root,
+                         tokenizer_path=tok_path if tok_path.is_file() else None)
+
+
+def real_provenance(spec: RealModelSpec, engine_lib: str, co_tenancy: bool,
+                    tokenizer: Optional[BpeTokenizer]) -> Dict[str, Any]:
+    """Provenance точки регрессии (модель, размер, дата, co-tenancy) — R8."""
+    moe = spec.desc.get("moe") or {}
+    return {
+        "mode": "real-model",
+        "model": spec.name,
+        "model_class": spec.desc.get("class"),
+        "description": str(spec.desc_path),
+        "weights": str(spec.weights_path),
+        "weights_bytes": spec.weights_path.stat().st_size,
+        "weights_format": "safetensors",
+        "vocab_size": spec.vocab_size,
+        "n_layers": spec.desc.get("n_layers"),
+        "n_experts": moe.get("n_experts"),
+        "tokenizer_json": (str(spec.tokenizer_path)
+                           if spec.tokenizer_path else None),
+        "tokenization": ("byte-level BPE (tokenizer.json)" if tokenizer
+                         else "проекция байта → токен b % vocab (tokenizer.json "
+                              "в каталоге отсутствует)"),
+        "date_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"),
+        "co_tenancy": bool(co_tenancy),
+        "engine_lib": str(engine_lib),
+        "logits_source": "abi:stell_logits",
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -244,37 +378,61 @@ def open_logits_source(model: str, engine_lib: Optional[str],
 # Гейты
 # ----------------------------------------------------------------------------
 
-def run_ppl_gate(source: LogitsSource, model: str) -> GateResult:
+def _tokens_for_text(text: str, vocab: int, tokenizer: Optional[BpeTokenizer],
+                     limit: int) -> List[int]:
+    """Токенизация текста: РЕАЛЬНЫЙ byte-level BPE (tokenizer.json каталога,
+    R8) или детерминированная проекция байта → токен b % vocab (mini-фикстуры
+    и каталоги без tokenizer.json — честная пометка в notes)."""
+    if tokenizer is not None:
+        return list(tokenizer.encode(text))[:limit]
+    return project_to_vocab(text, vocab)[:limit]
+
+
+def _decode_ids(ids: List[int], tokenizer: Optional[BpeTokenizer]) -> str:
+    """Обратная карта: BPE-детокенизатор или проекция (id<10 → цифра)."""
+    if tokenizer is not None:
+        return tokenizer.decode_ids(ids)
+    return detokenize_ids(ids)
+
+
+def run_ppl_gate(source: LogitsSource, model: str, *, vocab: Optional[int] = None,
+                 tokenizer: Optional[BpeTokenizer] = None,
+                 notes_extra: Optional[List[str]] = None) -> GateResult:
     """PPL фиксированного текста по logprob позиций ("positions":"all")."""
-    vocab = _vocab_size(model)
-    tokens = project_to_vocab(ppl_text(), vocab)[:PPL_MAX_TOKENS]
+    vocab = _vocab_size(model) if vocab is None else vocab
+    tokens = _tokens_for_text(ppl_text(), vocab, tokenizer, PPL_MAX_TOKENS)
     rows = source.logits_all(tokens)
     stats = ppl_from_logits(rows, tokens)
+    tok_note = (f"токенизация: byte-level BPE tokenizer.json, токенов={len(tokens)} "
+                f"(первые {PPL_MAX_TOKENS} фиксированного текста)" if tokenizer else
+                f"токенов={len(tokens)} (первые {PPL_MAX_TOKENS} фиксированного "
+                "текста, проекция байта → токен b % vocab, vocab=" + str(vocab) +
+                "; механический базовый референс, а не языковая PPL)")
     return GateResult(
         "quality-gate", "ppl_fixed_text", pending=False,
         value=round(stats["ppl"], 4), unit="ppl",
         items=stats["n_pred_positions"],
-        notes=[f"модель={model}", f"источник логитов={source.name}",
-               f"токенов={len(tokens)} (первые {PPL_MAX_TOKENS} фиксированного "
-               "текста, проекция байта → токен b % vocab — vocab mini-"
-               "фикстуры=16; это механический базовый референс, а не "
-               "языковая PPL)",
-               f"mean_nll={stats['mean_nll']:.6f}"])
+        notes=[f"модель={model}", f"источник логитов={source.name}", tok_note,
+               f"mean_nll={stats['mean_nll']:.6f}"] + (notes_extra or []))
 
 
-def run_gsm8k_gate(source: LogitsSource, model: str) -> GateResult:
+def run_gsm8k_gate(source: LogitsSource, model: str, *,
+                   vocab: Optional[int] = None,
+                   tokenizer: Optional[BpeTokenizer] = None,
+                   notes_extra: Optional[List[str]] = None) -> GateResult:
     """GSM8K-32: жадное декодирование через логиты + сопоставление чисел
     (корректность проверяется БЕЗ исполнения — вычислимо честно)."""
     items = gsm8k_32()
-    vocab = _vocab_size(model)
+    vocab = _vocab_size(model) if vocab is None else vocab
     correct = 0
     for item in items:
-        prompt = project_to_vocab(item["question"], vocab)[:GSM8K_PROMPT_TOKENS]
+        prompt = _tokens_for_text(item["question"], vocab, tokenizer,
+                                  GSM8K_PROMPT_TOKENS)
         seq = list(prompt)
         for _ in range(GSM8K_MAX_STEPS):
             row = source.logits_last(seq)
             seq.append(greedy_token(row))
-        text = detokenize_ids(seq[len(prompt):])
+        text = _decode_ids(seq[len(prompt):], tokenizer)
         predicted = extract_answer_number(text)
         try:
             gold = int(item["answer"])
@@ -288,12 +446,15 @@ def run_gsm8k_gate(source: LogitsSource, model: str) -> GateResult:
         unit="score", items=len(items),
         notes=[f"модель={model}", f"источник логитов={source.name}",
                f"верно={correct}/{len(items)}",
-               ("жадное декодирование (argmax, ≤16 шагов); проверка "
-                "корректности — последнее число в декодированном тексте "
-                "(без исполнения; вычислимо честно)"),
-               ("механический базовый референс пайплайна: mini-фикстуры не "
-                "являются языковыми моделями — значение фиксируется как "
-                "точка регрессии, а не оценка качества LLM")])
+               "жадное декодирование (argmax, ≤16 шагов); проверка "
+               "корректности — последнее число в декодированном тексте "
+               "(без исполнения; вычислимо честно)"]
+               + ([] if tokenizer else [
+                   "механический базовый референс пайплайна: проекция байта "
+                   "→ токен — mini-фикстуры/каталоги без tokenizer.json — не "
+                   "языковые модели; значение — точка регрессии, а не "
+                   "оценка качества LLM"])
+               + (notes_extra or []))
 
 
 def extract_code(answer: str) -> Optional[str]:
@@ -320,22 +481,26 @@ def humaneval_exec_script(item: Dict[str, Any], program: str) -> str:
             + f"\n\ncheck({item['entry_point']})\n")
 
 
-def run_humaneval_gate(source: LogitsSource, model: str) -> GateResult:
+def run_humaneval_gate(source: LogitsSource, model: str, *,
+                       vocab: Optional[int] = None,
+                       tokenizer: Optional[BpeTokenizer] = None,
+                       notes_extra: Optional[List[str]] = None) -> GateResult:
     """HumanEval-32 [R4]: жадное декодирование → извлечение кода →
     исполнение в песочнице (process-sandbox, НЕ security-граница — см.
     code_sandbox) против test-кейса задачи. accuracy = доля кейсов, где
     песочница завершилась с exit 0."""
     items = humaneval_32()
-    vocab = _vocab_size(model)
+    vocab = _vocab_size(model) if vocab is None else vocab
     correct = 0
     outcomes: Dict[str, int] = {}
     for item in items:
-        prompt = project_to_vocab(item["prompt"], vocab)[:HUMANEVAL_PROMPT_TOKENS]
+        prompt = _tokens_for_text(item["prompt"], vocab, tokenizer,
+                                  HUMANEVAL_PROMPT_TOKENS)
         seq = list(prompt)
         for _ in range(HUMANEVAL_MAX_STEPS):
             row = source.logits_last(seq)
             seq.append(greedy_token(row))
-        answer = detokenize_ids(seq[len(prompt):])
+        answer = _decode_ids(seq[len(prompt):], tokenizer)
         script = humaneval_exec_script(item, humaneval_program(item, answer))
         res = run_code(script)
         outcomes[res.outcome] = outcomes.get(res.outcome, 0) + 1
@@ -353,10 +518,13 @@ def run_humaneval_gate(source: LogitsSource, model: str) -> GateResult:
                 "извлечение кода (первый markdown-fence, иначе весь ответ) → "
                 "исполнение в песочнице против test-кейса (process-sandbox: "
                 "RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, "
-                "пустой env; НЕ security-граница — честная пометка)"),
-               ("механический базовый референс пайплайна: mini-фикстуры не "
-                "являются языковыми моделями — значение фиксируется как "
-                "точка регрессии, а не оценка качества LLM")])
+                "пустой env; НЕ security-граница — честная пометка)")]
+               + ([] if tokenizer else [
+                   "механический базовый референс пайплайна: проекция байта "
+                   "→ токен — mini-фикстуры/каталоги без tokenizer.json — не "
+                   "языковые модели; значение — точка регрессии, а не "
+                   "оценка качества LLM"])
+               + (notes_extra or []))
 
 
 def _vocab_size(model: str) -> int:
@@ -416,6 +584,118 @@ def run_gates_live(models: List[str] = list(DEFAULT_MODELS),
     return gates
 
 
+# ---------------------------------------------------------------------------
+# Режим «реальная модель» (R8, round 4): PPL + GSM8K-32 + HumanEval-32 через
+# ABI на каталоге с описанием ADR-09 (после hf_to_description [R4]) и весами.
+# Источник логитов — ТОЛЬКО ABI (stell_logits): golden-ref-референс умеет
+# интерпретировать только mini-фикстуры — молчаливая подмена источника
+# запрещена. Прогон — worker ПОСЛЕ скачивания весов ([R3]) и конвертера
+# описания; до того — честный pending «веса не предоставлены» (по образцу
+# R7: env-переключатель без правки кода).
+# ---------------------------------------------------------------------------
+
+_REAL_HONEST_NOTE_SYNTHETIC = (
+    "каталог модели — синтетический реалистичный профиль (не языковая "
+    "модель): значения — точки регрессии конвейера R8, не оценка качества LLM")
+
+
+def run_gates_real(spec: RealModelSpec, engine_lib: Optional[str] = None,
+                   co_tenancy: bool = False) -> Tuple[List[GateResult], Dict[str, Any]]:
+    """Живой прогон гейтов через ABI на каталоге реальной модели.
+
+    Возвращает (гейты, provenance): модель, размер весов, дата, co-tenancy —
+    точки регрессии R8. Токенизация: tokenizer.json каталога (РЕАЛЬНЫЙ
+    byte-level BPE, порт R10) или, при его отсутствии, честная проекция
+    байта → токен (значения — механические точки регрессии).
+    """
+    from stell_serve.engine import CtypesEngineBackend, resolve_engine_lib
+
+    path, _ = resolve_engine_lib(engine_lib)
+    backend = CtypesEngineBackend(path)
+    source = None
+    try:
+        if not backend.supports_logits:
+            raise RuntimeError(
+                "реальный режим (R8) требует ABI-источник логитов: "
+                f"{path} не экспортирует stell_logits ([R1]; golden-ref "
+                "умеет только mini-фикстуры — подмена источника запрещена)")
+        cfg_model = dict(description=str(spec.desc_path),
+                         weights=str(spec.weights_path),
+                         weights_format="safetensors", tokenizer="byte")
+        backend.create({"runner": "ops",
+                        "engine": {"max_slots": 16, "batch_step_max": 16},
+                        "model": cfg_model})
+        source = AbiLogitsSource(backend)
+        tokenizer = None
+        if spec.tokenizer_path is not None:
+            tokenizer = BpeTokenizer(str(spec.tokenizer_path))
+        vocab = spec.vocab_size
+        label = spec.name
+        # Честная пометка для синтетических каталогов (регрессия конвейера,
+        # не оценка качества LLM); для настоящих весов — без пометки.
+        notes_extra = ([_REAL_HONEST_NOTE_SYNTHETIC]
+                       if spec.name.startswith("synthetic") else None)
+        ppl = run_ppl_gate(source, label, vocab=vocab, tokenizer=tokenizer,
+                           notes_extra=notes_extra)
+        gsm = run_gsm8k_gate(source, label, vocab=vocab, tokenizer=tokenizer,
+                             notes_extra=notes_extra)
+        he = run_humaneval_gate(source, label, vocab=vocab, tokenizer=tokenizer,
+                                notes_extra=notes_extra)
+        ppl.dataset = f"ppl_fixed_text[{label}]"
+        gsm.dataset = f"gsm8k_32[{label}]"
+        he.dataset = f"humaneval_32[{label}]"
+        provenance = real_provenance(spec, str(path), co_tenancy, tokenizer)
+        return [ppl, gsm, he], provenance
+    finally:
+        if source is not None:
+            source.close()
+        else:
+            backend.close()
+
+
+def run_gates_real_pending(reason: str) -> Tuple[List[GateResult], Dict[str, Any]]:
+    """Честный pending «веса не предоставлены» (по образцу R7): значения
+    качества НЕ измерены, причина зафиксирована в notes и provenance."""
+    gates = [
+        GateResult("quality-gate", "gsm8k_32", pending=True, value=None,
+                   items=len(gsm8k_32()), unit="score",
+                   notes=[f"веса не предоставлены (R8): {reason}"]),
+        GateResult("quality-gate", "humaneval_32", pending=True, value=None,
+                   items=len(humaneval_32()), unit="score",
+                   notes=[f"веса не предоставлены (R8): {reason}"]),
+        GateResult("quality-gate", "ppl_fixed_text", pending=True, value=None,
+                   items=len(ppl_text().split()), unit="ppl",
+                   notes=[f"веса не предоставлены (R8): {reason}"]),
+    ]
+    provenance = {
+        "mode": "real-model",
+        "weights_provided": False,
+        "reason": reason,
+        "date_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"),
+        "co_tenancy": None,
+    }
+    return gates, provenance
+
+
+def _protocol_snapshot() -> dict:
+    """Протокол-константы прогона (детерминизм между версиями §5)."""
+    return {
+        "ppl_max_tokens": PPL_MAX_TOKENS,
+        "gsm8k_prompt_tokens": GSM8K_PROMPT_TOKENS,
+        "gsm8k_max_steps": GSM8K_MAX_STEPS,
+        "humaneval_prompt_tokens": HUMANEVAL_PROMPT_TOKENS,
+        "humaneval_max_steps": HUMANEVAL_MAX_STEPS,
+        "humaneval_sandbox": {
+            "class": "process-sandbox (НЕ security-граница)",
+            "rlimit_cpu_s": 5, "wall_timeout_s": 10,
+            "rlimit_as_bytes": 512 * 1024 * 1024,
+            "rlimit_nofile": 64,
+            "env": "пустой", "cwd": "изолированный temp-dir"},
+        "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)",
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m stell_bench.quality_gates_runner")
@@ -435,13 +715,83 @@ def main(argv=None) -> int:
     parser.add_argument("--committed", action="store_true",
                         help="писать в bench/results/<date>-<slug>/ (коммитится), "
                              "а не в bench/results/local/ (gitignored)")
+    parser.add_argument("--real", action="store_true",
+                        help="режим «реальная модель» (R8): PPL+GSM8K+HumanEval "
+                             "через ABI на каталоге с описанием ADR-09 (после "
+                             "hf_to_description [R4]) и весами; без источника — "
+                             "честный pending «веса не предоставлены»")
+    parser.add_argument("--real-model-dir", default=None,
+                        help="каталог реальной модели (description.json + "
+                             "model.safetensors [+ tokenizer.json]); "
+                             "по умолчанию — env " + ENV_REAL_MODEL_DIR)
+    parser.add_argument("--model-desc", default=None,
+                        help="явный путь к описанию ADR-09 (с --model-weights; "
+                             "приоритет над каталогом)")
+    parser.add_argument("--model-weights", default=None,
+                        help="явный путь к весам safetensors (один файл)")
+    parser.add_argument("--co-tenancy", action="store_true",
+                        help="честная пометка co-tenancy в provenance точки "
+                             "регрессии")
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src" / "bench"))
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python"))
     models = [m.strip() for m in args.models.split(",") if m.strip()]
 
-    if args.live:
+    if args.real:
+        # Режим «реальная модель» (R8). Без источника — честный pending
+        # («веса не предоставлены», по образцу R7: env-переключатель без
+        # правки кода); явно заданный, но битый источник — громкая ошибка.
+        slug = "quality-gates-real"
+        try:
+            spec = resolve_real_model(model_dir=args.real_model_dir,
+                                      desc_json=args.model_desc,
+                                      weights=args.model_weights)
+        except Exception as e:
+            print(f"quality-gates real: ошибка источника: {e}", file=sys.stderr)
+            return 1
+        if spec is None:
+            reason = ("веса не предоставлены: задайте --real-model-dir или env "
+                      + ENV_REAL_MODEL_DIR + " (каталог с description.json "
+                      "[R4] и model.safetensors); прогон — worker после "
+                      "скачивания весов [R3] и hf_to_description [R4]")
+            gates, provenance = run_gates_real_pending(reason)
+            snapshot = _GatesSnapshot(gates, extra={
+                "mode": "real-model-pending",
+                "provenance": provenance,
+                "pending_reason": reason,
+                "protocol": _protocol_snapshot()})
+            log_lines = ["quality-gates REAL: pending — " + reason]
+        else:
+            try:
+                gates, provenance = run_gates_real(
+                    spec, engine_lib=args.engine_lib,
+                    co_tenancy=args.co_tenancy)
+            except Exception as e:
+                print(f"quality-gates real: прогон не удался: {e}",
+                      file=sys.stderr)
+                return 1
+            snapshot = _GatesSnapshot(gates, extra={
+                "mode": "live-real",
+                "provenance": provenance,
+                "protocol": _protocol_snapshot()})
+            log_lines = [
+                f"quality-gates REAL: модель={spec.name}, "
+                f"веса={spec.weights_path} ({provenance['weights_bytes']} B), "
+                f"co-tenancy={provenance['co_tenancy']}",
+                "точка регрессии R8: PPL + GSM8K-32 + HumanEval-32 через ABI "
+                "(stell_logits); provenance в report.json",
+            ]
+            if spec.name.startswith("synthetic"):
+                log_lines.append(
+                    "каталог — синтетический «реалистичный профиль»: "
+                    "stell_bench.synthetic_model.build_realistic_profile(dir, "
+                    "seed=0x5E8E) — воспроизводим (LCG-веса, эталонный "
+                    "tokenizer.json HF); значения — точки регрессии конвейера")
+        out_dir = (Path(args.results_dir) if args.results_dir
+                   else results_dir_for(slug) if args.committed
+                   else results_local_dir_for(slug))
+    elif args.live:
         gates = run_gates_live(models=models, engine_lib=args.engine_lib,
                                prefer=args.logits_source)
         snapshot = _GatesSnapshot(gates, extra={
@@ -449,18 +799,7 @@ def main(argv=None) -> int:
             "models": models,
             "logits_source": sorted({g.to_dict()["notes"][1]
                                      for g in gates}),
-            "protocol": {"ppl_max_tokens": PPL_MAX_TOKENS,
-                         "gsm8k_prompt_tokens": GSM8K_PROMPT_TOKENS,
-                         "gsm8k_max_steps": GSM8K_MAX_STEPS,
-                         "humaneval_prompt_tokens": HUMANEVAL_PROMPT_TOKENS,
-                         "humaneval_max_steps": HUMANEVAL_MAX_STEPS,
-                         "humaneval_sandbox": {
-                             "class": "process-sandbox (НЕ security-граница)",
-                             "rlimit_cpu_s": 5, "wall_timeout_s": 10,
-                             "rlimit_as_bytes": 512 * 1024 * 1024,
-                             "rlimit_nofile": 64,
-                             "env": "пустой", "cwd": "изолированный temp-dir"},
-                         "projection": "byte % vocab, detok: id<10 → цифра"},
+            "protocol": _protocol_snapshot(),
             "env": {"co_tenancy": False, "gpu": "none (CPU-local)"},
         })
         log_lines = [
@@ -470,12 +809,9 @@ def main(argv=None) -> int:
             "process-sandbox с RLIMIT_CPU/AS/NOFILE, wall 10с, temp-dir, "
             "пустой env; НЕ security-граница — честная пометка в докстринге)",
         ]
-        if args.results_dir:
-            out_dir = Path(args.results_dir)
-        elif args.committed:
-            out_dir = results_dir_for("quality-gates-live")
-        else:
-            out_dir = results_local_dir_for("quality-gates-live")
+        out_dir = (Path(args.results_dir) if args.results_dir
+                   else results_dir_for("quality-gates-live") if args.committed
+                   else results_local_dir_for("quality-gates-live"))
     else:
         gates = run_gates()
         snapshot = _GatesSnapshot(gates)

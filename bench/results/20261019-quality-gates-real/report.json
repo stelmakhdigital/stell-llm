@@ -1,0 +1,87 @@
+{
+  "pending": false,
+  "gates": [
+    {
+      "gate": "quality-gate",
+      "dataset": "ppl_fixed_text[synthetic-realistic-moe]",
+      "pending": false,
+      "value": 606.6646,
+      "unit": "ppl",
+      "items": 127,
+      "notes": [
+        "модель=synthetic-realistic-moe",
+        "источник логитов=abi:stell_logits",
+        "токенизация: byte-level BPE tokenizer.json, токенов=128 (первые 128 фиксированного текста)",
+        "mean_nll=6.407976",
+        "каталог модели — синтетический реалистичный профиль (не языковая модель): значения — точки регрессии конвейера R8, не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "gsm8k_32[synthetic-realistic-moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=synthetic-realistic-moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
+        "каталог модели — синтетический реалистичный профиль (не языковая модель): значения — точки регрессии конвейера R8, не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "humaneval_32[synthetic-realistic-moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=synthetic-realistic-moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "каталог модели — синтетический реалистичный профиль (не языковая модель): значения — точки регрессии конвейера R8, не оценка качества LLM"
+      ]
+    }
+  ],
+  "mode": "live-real",
+  "provenance": {
+    "mode": "real-model",
+    "model": "synthetic-realistic-moe",
+    "model_class": "moe",
+    "description": "/tmp/tmp.yTgjgpBRTe/model/description.json",
+    "weights": "/tmp/tmp.yTgjgpBRTe/model/model.safetensors",
+    "weights_bytes": 130704,
+    "weights_format": "safetensors",
+    "vocab_size": 350,
+    "n_layers": 4,
+    "n_experts": 8,
+    "tokenizer_json": "/tmp/tmp.yTgjgpBRTe/model/tokenizer.json",
+    "tokenization": "byte-level BPE (tokenizer.json)",
+    "date_utc": "2026-10-19T08:42:45+00:00",
+    "co_tenancy": false,
+    "engine_lib": "/home/arkalaust/CODE/SERVER/stell-llm/.worktrees/serve/build/cpu/src/engine/libstell_core.so",
+    "logits_source": "abi:stell_logits"
+  },
+  "protocol": {
+    "ppl_max_tokens": 128,
+    "gsm8k_prompt_tokens": 64,
+    "gsm8k_max_steps": 16,
+    "humaneval_prompt_tokens": 64,
+    "humaneval_max_steps": 32,
+    "humaneval_sandbox": {
+      "class": "process-sandbox (НЕ security-граница)",
+      "rlimit_cpu_s": 5,
+      "wall_timeout_s": 10,
+      "rlimit_as_bytes": 536870912,
+      "rlimit_nofile": 64,
+      "env": "пустой",
+      "cwd": "изолированный temp-dir"
+    },
+    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)"
+  }
+}

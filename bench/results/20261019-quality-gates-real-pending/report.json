@@ -1,0 +1,64 @@
+{
+  "pending": true,
+  "gates": [
+    {
+      "gate": "quality-gate",
+      "dataset": "gsm8k_32",
+      "pending": true,
+      "value": null,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "веса не предоставлены (R8): веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "humaneval_32",
+      "pending": true,
+      "value": null,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "веса не предоставлены (R8): веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "ppl_fixed_text",
+      "pending": true,
+      "value": null,
+      "unit": "ppl",
+      "items": 155,
+      "notes": [
+        "веса не предоставлены (R8): веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]"
+      ]
+    }
+  ],
+  "mode": "real-model-pending",
+  "provenance": {
+    "mode": "real-model",
+    "weights_provided": false,
+    "reason": "веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]",
+    "date_utc": "2026-10-19T08:42:55+00:00",
+    "co_tenancy": null
+  },
+  "pending_reason": "веса не предоставлены: задайте --real-model-dir или env STELL_R8_REAL_MODEL_DIR (каталог с description.json [R4] и model.safetensors); прогон — worker после скачивания весов [R3] и hf_to_description [R4]",
+  "protocol": {
+    "ppl_max_tokens": 128,
+    "gsm8k_prompt_tokens": 64,
+    "gsm8k_max_steps": 16,
+    "humaneval_prompt_tokens": 64,
+    "humaneval_max_steps": 32,
+    "humaneval_sandbox": {
+      "class": "process-sandbox (НЕ security-граница)",
+      "rlimit_cpu_s": 5,
+      "wall_timeout_s": 10,
+      "rlimit_as_bytes": 536870912,
+      "rlimit_nofile": 64,
+      "env": "пустой",
+      "cwd": "изолированный temp-dir"
+    },
+    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)"
+  }
+}
