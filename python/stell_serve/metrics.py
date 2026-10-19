@@ -24,12 +24,20 @@ LOGITS_SNAPSHOT_FIELDS = (
 
 def is_valid_logits_snapshot(obj: Any) -> bool:
     """Проверка строгого формата logits-снапшота ([R5]): ровно 4 поля
-    LOGITS_SNAPSHOT_FIELDS, все значения — числа (payload-массивы/объекты
-    в /metrics запрещены контрактом)."""
-    return (isinstance(obj, dict)
-            and set(obj) == set(LOGITS_SNAPSHOT_FIELDS)
-            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                    for v in obj.values()))
+    LOGITS_SNAPSHOT_FIELDS; счётчики — числа, `last_*` — числа или `null`
+    (до первого успешного вызова — «честно: нет данных», ADR-11 §4 round 3;
+    payload-массивы/объекты в /metrics запрещены контрактом)."""
+    if not (isinstance(obj, dict) and set(obj) == set(LOGITS_SNAPSHOT_FIELDS)):
+        return False
+    for key, value in obj.items():
+        if key in ("requests_total", "errors_total"):
+            if not (isinstance(value, (int, float)) and not isinstance(value, bool)):
+                return False
+        else:  # last_n_vocab, last_positions — число или null
+            if value is not None and not (isinstance(value, (int, float, str))
+                                          and not isinstance(value, bool)):
+                return False
+    return True
 
 
 def _percentile(sorted_values: List[float], q: float) -> Optional[float]:
