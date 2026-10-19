@@ -1,0 +1,41 @@
+{
+  "schema": "1.0",
+  "model": "mini-mixtral-gguf",
+  "profile": "F16",
+  "path": "loader",
+  "prompt_tokens": [
+    1,
+    2,
+    3
+  ],
+  "seed": 0,
+  "greedy": true,
+  "tolerance_rel": 0.001,
+  "logits_ref": [
+    1.3631404638290405,
+    1.1613280773162842,
+    -0.521074652671814,
+    -0.10922133922576904,
+    0.5318423509597778,
+    -0.8232088685035706,
+    0.6537477374076843,
+    -0.30490434169769287,
+    -0.20351602137088776,
+    0.18047277629375458,
+    1.1387358903884888,
+    -0.1596011519432068,
+    0.6792522072792053,
+    0.4010399281978607,
+    -1.223777174949646,
+    -1.584077000617981
+  ],
+  "meta": {
+    "generator": "tests/models/golden/generate_golden.py (mixtral-класс GGUF, R9: стековные экспертные тензоры + смещение роутера exp_probs_b; numpy float32, greedy)",
+    "weights": "mini_mixtral.gguf (синтетический, LCG seed 0x00D3 — README; веса интерпретатора прочитаны ИЗ файла)",
+    "quant_note": "веса F16 → float32 exact, вычисление FP32",
+    "ops_semantics": "см. tests/models/golden/README.md; mixtral: pre-MoE норма = blk.ffn_norm, роутер = ffn_gate_inp + exp_probs_b, softmax → top-2 → renorm",
+    "greedy_token": 0,
+    "logits_min": -1.584077000617981,
+    "logits_max": 1.3631404638290405
+  }
+}

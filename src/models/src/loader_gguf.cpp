@@ -8,11 +8,13 @@
 //
 // Имена тензоров сравниваются с source_pattern описания буквально (GGUF-модели
 // используют конвенции имён gguf/blk — описания генерируются конвертером
-// gguf_description.cpp, нативные имена llama.cpp-GGUF; ADR-09 «Уточнение»).
+// gguf_description.cpp, нативные имена тензоров формата GGUF — см. ADR-09
+// «Уточнение»).
 //
 // SHAPE (round 2): GGUF ne = {in, out} для матриц ({n_embd, vocab} для
 // token_embd); байты C-порядка == row-major [out, in] — parse_gguf_header
-// возвращает РАЗВЕРНУТЫЙ dims (логическую форму, HF-конвенция), байты без
+// возвращает РАЗВЕРНУТЫЙ dims (логическую форму, конвенция раскладки
+// JSON-конфигов/safetensors), байты без
 // изменений. См. tensor_file_formats.hpp.
 #include "tensor_file_formats.hpp"
 #include "quant.hpp"

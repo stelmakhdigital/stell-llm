@@ -128,10 +128,15 @@ void StellTierConverter::convert(const ModelDescription& desc, const std::string
             throw LoaderError(LoaderError::Code::TensorNotFound,
                               "converter: tensor not found for group '" + g.name + "': '" +
                                   pattern + "'");
-        if (it->second.shape != g.shape)
+        // Round 2 (R9): срез стековного тензора (GGUF-mixtral, source_slice) —
+        // та же конвенция, что и в лоадерах (file_weights_source.hpp).
+        const std::int64_t slice =
+            i < desc.group_source_slices.size() ? desc.group_source_slices[i] : -1;
+        const TensorInfo& ti = FileWeightsSource::slice_tensor_info(it->second, g, slice);
+        if (ti.shape != g.shape)
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "converter: shape mismatch for group '" + g.name + "'");
-        slots.push_back(make_slot(g, it->second, fin));
+        slots.push_back(make_slot(g, ti, fin));
 
         StellTierEntry e;
         e.group_id = g.id.value;

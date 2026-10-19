@@ -31,6 +31,7 @@ target_include_directories(stell_models
 # tiers_compat.hpp удалено, типы stell::tiers приходят из stell_tiers.
 target_link_libraries(stell_models PUBLIC stell_tiers)
 
+
 # Каталог встроенных описаний (реестр, ADR-09 §2): env STELL_MODELS_REGISTRY_DIR
 # перекрывает это значение (см. Registry::registry_dir).
 target_compile_definitions(stell_models PRIVATE

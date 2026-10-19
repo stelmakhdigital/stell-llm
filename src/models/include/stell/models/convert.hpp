@@ -38,9 +38,14 @@ public:
 // ----------------------------------------------------------------------------
 // Конвертер GGUF → описание модели (ADR-09 «Уточнение», round 2): GGUF не
 // поставляется с JSON-описанием, поэтому models генерирует его из метаданных
-// и тензорных имён файла. Имена тензоров — НАТИВНЫЕ llama.cpp-GGUF
-// (token_embd.weight, blk.{i}.attn_q.weight, …); source_pattern в описании —
-// те же нативные имена, лоадер сравнивает их буквально.
+// и тензорных имён файла. Имена тензоров — НАТИВНЫЕ имена тензоров формата
+// GGUF (см. ADR-09 «Уточнение»; token_embd.weight, blk.{i}.attn_q.weight, …);
+// source_pattern в описании — те же нативные имена, лоадер сравнивает их
+// буквально. Round 2 (R9): архитектуры llama (dense) И mixtral (MoE) —
+// стековные экспертные тензоры blk.{i}.ffn_*_exps.weight, смещение роутера
+// blk.{i}.exp_probs_b.weight, n_experts/n_experts_active из GGUF-метаданных
+// (llama.expert_count / llama.expert_used_count), срезы экспертов —
+// source_slice.
 // Возвращает JSON-текст описания (схема "1.0", как у llama-class.json).
 // Ошибки — LoaderError (SchemaMismatch/UnsupportedQuant/TensorNotFound).
 // ----------------------------------------------------------------------------

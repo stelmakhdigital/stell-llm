@@ -12,8 +12,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace stell::models {
+
+// --- квантованные GGML-блоки (subset, round 2; R3/R9 — срезы стековных
+// тензоров в file_weights_source.hpp и dequant в loader_gguf.cpp) ------------
+constexpr const char* kGgmlQ40Name = "Q4_0";
+constexpr const char* kGgmlQ80Name = "Q8_0";
+
+inline bool is_quantized_ggml(const std::string& dtype_str) {
+    return dtype_str == kGgmlQ40Name || dtype_str == kGgmlQ80Name;
+}
+
+// Размер блока из 32 элементов: Q4_0 = 2 Б F16 delta (НАЧАЛО блока) + 16 Б
+// нибблов; Q8_0 = 32 Б int8 + 2 Б F16 delta (КОНЕЦ блока).
+inline std::size_t ggml_block_bytes(const std::string& dtype_str) {
+    return dtype_str == kGgmlQ40Name ? 18 : 34;
+}
 
 // --- float16 (IEEE 754 half) -----------------------------------------------
 std::uint16_t f32_to_f16_bits(float v);

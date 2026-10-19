@@ -74,6 +74,10 @@ public:
     }
 
     // Энергичная резолюция всех некешевых групп (fail-fast, ADR-09 §3).
+    // Round 2 (R9): группы со срезом стекового тензора (source_slice ≥ 0,
+    // стековные экспертные тензоры GGUF-mixtral) резолвятся в СРЕЗ тензора —
+    // непрерывный блок по старшей размерности (row-major); форма среза =
+    // форме группы (проверка — SchemaMismatch).
     void resolve_all() {
         file_ = std::fopen(path_.c_str(), "rb");
         if (!file_) throw LoaderError(LoaderError::Code::IoFailure, "cannot open " + path_);
@@ -87,8 +91,55 @@ public:
                 throw LoaderError(LoaderError::Code::TensorNotFound,
                                   "tensor not found for group '" + g.name + "': pattern '" +
                                       pattern + "'");
-            tensors_[g.id.value] = it->second;
+            tensors_[g.id.value] = slice_tensor_info(
+                it->second, g, group_slice(i));
         }
+    }
+
+    // Срез группы i (−1 = тензор целиком; R9: стековные тензоры).
+    std::int64_t group_slice(std::size_t i) const {
+        return i < desc_.group_source_slices.size() ? desc_.group_source_slices[i] : -1;
+    }
+
+    // Эффективная TensorInfo группы: без среза — как в файле; со срезом —
+    // сдвиг/ограничение payload по старшей размерности (непрерывный блок,
+    // row-major). Форма среза обязана совпадать с формой группы.
+    static TensorInfo slice_tensor_info(const TensorInfo& t,
+                                        const stell::tiers::TensorGroup& g,
+                                        std::int64_t slice) {
+        if (slice < 0) return t;
+        if (t.shape.empty() || t.shape.size() - 1 != g.shape.size())
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "group '" + g.name + "': стековный тензор " +
+                                  std::to_string(t.shape.size()) + "-D, группа " +
+                                  std::to_string(g.shape.size()) + "-D");
+        for (std::size_t d = 0; d < g.shape.size(); ++d)
+            if (t.shape[d + 1] != g.shape[d])
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "group '" + g.name + "': shape mismatch (стековный тензор)");
+        const std::int64_t stack = t.shape[0];
+        if (slice >= stack)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "group '" + g.name + "': source_slice " +
+                                  std::to_string(slice) + " >= стека " +
+                                  std::to_string(stack));
+        std::size_t n_slice = 1;
+        for (auto d : g.shape) n_slice *= static_cast<std::size_t>(d);
+        TensorInfo info = t;
+        info.shape = g.shape;
+        if (t.dtype) {
+            info.offset += static_cast<std::uint64_t>(slice) * n_slice * t.itemsize;
+            info.bytes = n_slice * t.itemsize;
+        } else if (is_quantized_ggml(t.dtype_str)) {
+            const std::size_t blocks = (n_slice + 31) / 32;
+            info.offset += static_cast<std::uint64_t>(slice) * blocks * ggml_block_bytes(t.dtype_str);
+            info.bytes = blocks * ggml_block_bytes(t.dtype_str);
+        } else {
+            throw LoaderError(LoaderError::Code::UnsupportedQuant,
+                              "group '" + g.name + "': source_slice для dtype '" +
+                                  t.dtype_str + "' не поддержан");
+        }
+        return info;
     }
 
 protected:

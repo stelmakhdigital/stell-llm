@@ -1,7 +1,8 @@
 // ============================================================================
 // Тесты конвертера GGUF → описание модели (round 2, задача 5; ADR-09
 // «Уточнение»): GGUF не несёт JSON-описания — models генерирует его из
-// метаданных GGUF с НАТИВНЫМИ llama.cpp-именами тензоров (token_embd.weight,
+// метаданных GGUF с НАТИВНЫМИ именами тензоров формата GGUF (см. ADR-09):
+// (token_embd.weight,
 // blk.{i}.attn_q.weight, …). Проверки:
 //   - happy path: описание собирается (schema 1.0, метаданные, группы),
 //     парсится parse_model_description (roundtrip), GGUF-лоадер резолвит
@@ -238,11 +239,11 @@ void body() {
         }
         (void)what;
     };
-    // Unsupported architecture.
+    // Unsupported architecture (mixtral поддержан с round 2, R9; glm — нет).
     {
         auto meta3 = make_meta(1, true, false);
         for (auto& kv : meta3)
-            if (kv.key == "general.architecture") kv.str = "mixtral";
+            if (kv.key == "general.architecture") kv.str = "glm";
         const std::string p3 = "/tmp/stell_test_gguf_arch.gguf";
         write_gguf_meta(p3, make_gguf_tensors(1), meta3);
         expect_error(p3, LoaderError::Code::SchemaMismatch, "unsupported arch rejected");

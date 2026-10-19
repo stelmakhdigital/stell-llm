@@ -89,6 +89,18 @@ TensorGroupTemplate parse_group_template(const JsonValue& v, const std::string& 
             t.kv_block = kvb->bool_v;
         }
 
+        // source_slice: шаблон с токенами ("{expert}") или целочисленный литерал
+        // (round 2, R9: стековные экспертные тензоры GGUF-mixtral).
+        if (const JsonValue* slice = v.find("source_slice")) {
+            if (slice->type == JsonValue::Type::String) {
+                t.source_slice = slice->string_v;
+            } else if (slice->type == JsonValue::Type::Int) {
+                t.source_slice = std::to_string(slice->int_v);
+            } else {
+                throw DescriptionError("source_slice must be a string or int");
+            }
+        }
+
         const JsonValue* card = v.find("cardinality");
         if (card) {
             if (card->type != JsonValue::Type::Object) throw DescriptionError("cardinality must be an object");
@@ -116,16 +128,19 @@ void validate_template(const TensorGroupTemplate& t, const ModelDescription& d,
     } catch (const DescriptionError&) {
         fail(source, "tensor_groups: unknown dtype '" + t.dtype + "'");
     }
-    // Каждый ключ cardinality обязан встречаться токеном и в name, и в source_pattern
-    // (привязка разметки к лоадеру, ADR-09 §1).
+    // Каждый ключ cardinality обязан встречаться токеном в name и в
+    // source_pattern ИЛИ в source_slice (привязка разметки к лоадеру, ADR-09
+    // §1; round 2, R9: ключ экспертов стековного GGUF-тензора живёт в
+    // source_slice, а не в имени тензора).
     for (const auto& [key, n] : t.cardinality) {
         std::string token = "{" + key + "}";
         if (t.name.find(token) == std::string::npos)
             fail(source, "tensor_groups '" + t.name + "': cardinality key '" + key +
                              "' absent in name template");
-        if (t.source_pattern.find(token) == std::string::npos)
+        if (t.source_pattern.find(token) == std::string::npos &&
+            t.source_slice.find(token) == std::string::npos)
             fail(source, "tensor_groups '" + t.name + "': cardinality key '" + key +
-                             "' absent in source_pattern");
+                             "' absent in source_pattern/source_slice");
     }
     // KV-группы не имеют весов в файле — их pattern привязан к кешу, не к лоадеру.
     if (t.kv_block && t.role != "kv")
@@ -171,6 +186,19 @@ void expand_groups(ModelDescription& d, const std::string& source) {
             g.slot_bytes = slot_bytes_for(t.dtype, t.shape);
             d.groups.push_back(std::move(g));
             d.group_source_patterns.push_back(std::move(pattern));
+            // Срез стекового тензора (round 2, R9): токены заменяются сырыми
+            // значениями; пустой шаблон → −1 (тензор целиком).
+            if (t.source_slice.empty()) {
+                d.group_source_slices.push_back(-1);
+            } else {
+                const std::string slice = expand_tokens(t.source_slice, instance, false);
+                try {
+                    d.group_source_slices.push_back(std::stoi(slice));
+                } catch (const std::exception&) {
+                    fail(source, "tensor_groups '" + t.name + "': source_slice '" +
+                                     slice + "' is not an integer");
+                }
+            }
         }
     }
 }
