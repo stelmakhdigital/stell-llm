@@ -242,12 +242,20 @@ int  stell_metrics(stell_engine_t* e, char** out_json);
   статистика вызовов `stell_logits`, без payload:**
 
   ```json
-  {"requests_total": 0, "errors_total": 0, "last_n_vocab": 0, "last_positions": 0}
+  {"requests_total": 0, "errors_total": 0, "last_n_vocab": null, "last_positions": null}
   ```
 
   Payload логитов (массивы) в `/metrics` **не передаётся никогда** (размер;
   логиты доступны только через `stell_logits`). Счётчики достаточны
   дашборду и не зависят от vocab-размера модели.
+
+  Семантика счётчиков (реализация `src/engine/src/capi.cpp`, round 3):
+  `requests_total` — только **успешные** вызовы (rc==0), `errors_total` —
+  ошибочные (rc==-1); сумма — полное число вызовов (счётчики не дублируют
+  друг друга — словарь serve-секции закреплён так же). `last_positions` —
+  строка `"last"|"all"` (наружные enum'ы ADR-11 строковые). До первого
+  успешного вызова `last_n_vocab` и `last_positions` = `null` («честно:
+  нет данных»; 0 — невалидный n_vocab).
 - **Дашборд** рендерит поле ключ→значение таблицей (текущий generic-рендер
   `app.js` совместим; при несовпадении имён — микроправка).
 - **Тест serve** обязан проверять: (а) наличие всех четырёх полей
