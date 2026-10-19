@@ -104,6 +104,30 @@
   server-env.md «Точки регрессии обязаны иметь полный provenance
   ([R2] round 6)»; для будущих конверсий поле обязательно по умолчанию.
 
+## Решения round 7 (T-20261017200354, planner [Q1]/[Q2], вердикт round 6: approve)
+
+- **qk-norm группы в описании** ([R1]): Qwen3Moe-класс содержит
+  `self_attn.{q,k}_norm` — пер-head RMSNorm, форма `[head_dim]` (вектор
+  веса на голову); конвертер генерирует группы `attn.q_norm`/`attn.k_norm`
+  с полем eps из config.json (группа без поля eps → SchemaMismatch);
+  отсутствие ОБОИХ групп — прежнее поведение; частичный набор (q_norm
+  без k_norm или наоборот) → SchemaMismatch. Требование: описание
+  реального Qwen3-30B-A3B генерируется без SchemaMismatch (ADR-09
+  «Уточнение round 7»; дубль в engine.md — семантика/ops_runner).
+- **Опциональное поле `router_renorm`** ([R2]): дефолт true (Mixtral-семантика
+  golden round 1); false = topk-веса без перенормировки (config
+  `norm_topk_prob=false` — tiny-qwen2moe теперь легитимная конфигурация);
+  версионирование — по правилам ADR-09 для опциональных полей; частичная
+  настройка (renorm=false при отсутствии роутера на dense-слое) →
+  SchemaMismatch. Перекрёстная сверка `moe_intermediate_size` — против
+  фактической формы экспертных тензоров (`e{expert}.gate/up/down`),
+  не против d_ff; несогласованность config↔тензоры → SchemaMismatch
+  (тест на Qwen3Moe-конфиге).
+- **`ffn.shared.gate_scalar` подтверждён** ([R5]): имя — контракт
+  обеих сторон (конвертер генерирует ровно `ffn.shared.gate_scalar`,
+  интерпретатор ищет именно его); тест имени-стыковки — регрессионный;
+  переименований и новых алиментов нет.
+
 ## Объём (из PLAN.md §4, поток D)
 
 - Реестр архитектур: dense llama/qwen-класс; MoE glm/qwen-moe/deepseek-класс

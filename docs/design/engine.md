@@ -53,6 +53,26 @@
   черновик-документ, не реализация (ADR-11 «Черновик round 6»;
   дубль в serve.md).
 
+## Решения round 7 (T-20261017200354, planner [Q1]/[Q2], вердикт round 6: approve)
+
+- **qk-norm — per-head RMSNorm** ([R1]): группы `attn.q_norm`/`attn.k_norm`
+  (`[head_dim]`) — КАЖДАЯ голова нормализуется независимо после проекций,
+  до QK/PV; eps — из config (группа без поля eps → SchemaMismatch);
+  реализация в ops_runner — rmsnorm-семантика по head-строкам, новое
+  ядро не вводится; отсутствие ОБОИХ групп — прежнее поведение (побитовые
+  golden не меняются); частичный набор (q_norm без k_norm или наоборот) →
+  SchemaMismatch (ADR-09 «Уточнение round 7»; дубль в models.md).
+- **`router_renorm`** ([R2]): ops_runner учитывает флаг описания
+  (дефолт true; false — без перенормировки topk-весов, config
+  `norm_topk_prob=false`); частичная настройка (renorm=false при
+  отсутствии роутера на dense-слое) → SchemaMismatch; пара op'ов
+  «router-renorm/router-norenorm» не заводится — переключатель внутри
+  существующей op router.
+- **gate_scalar подтверждён** ([R5]): контрактное имя `ffn.shared.gate_scalar`
+  — контракт обеих сторон core/models; тест имени-стыковки (конвертер
+  генерирует ровно это имя, интерпретатор ищет именно его) остаётся
+  регрессионным; изменений кода не требуется.
+
 ## Объём (из PLAN.md §4, поток A)
 
 - Планировщик continuous batching на ≥8 сессий; пулы слотов фиксированного размера.
