@@ -147,7 +147,9 @@ static void run_tiers_side(const std::string& path, const std::vector<TensorGrou
     TierConfig cfg;
     cfg.vram_slots = plan.size();
     cfg.lookahead = 0; // предсказатель выкл.: детерминизм счётчиков io/hit в тесте
-    cfg.ram_capacity = std::size_t(1) << 20; // 1 MiB pinned RAM — хватает слотов
+    // RAM-тир ≥ суммарного плана: RAM-копии всех pinned-групп не вытесняются —
+    // читаемость read_ram_slot() (расширение R8) в тесте детерминирована.
+    cfg.ram_capacity = plan.size() * slot;
     cfg.nvme_layout = path;
     TierManager mgr(cfg);
     mgr.set_plan(plan);
@@ -166,14 +168,22 @@ static void run_tiers_side(const std::string& path, const std::vector<TensorGrou
 
     // (5) Roundtrip данных: слот из tiers == слот, прочитанный models reader'ом;
     //     padding слота нулевой (ADR-12 §2.3: CRC по слоту целиком).
+    //     Чтение — через публичный API tiers read_ram_slot() (расширение R8):
+    //     это ровно путь, которым core в интеграционном тесте R8 читает
+    //     канонические байты слота после pin→wait («layout → tiers → данные
+    //     для логитов, побитово == прямой загрузке»).
     for (const auto& g : plan) {
         std::vector<std::uint8_t> a(g.slot_bytes, 0xEE);
         std::vector<std::uint8_t> b(g.slot_bytes, 0x11);
+        std::vector<std::uint8_t> c(g.slot_bytes, 0x22);
         rd.read_group(g.id.value, a.data());
         T_REQUIRE(cm_read_slot(path.c_str(), g.id.value, b.data(), b.size()) > 0,
                   "models reader read slot");
         T_REQUIRE(std::memcmp(a.data(), b.data(), g.slot_bytes) == 0,
                   "payload roundtrip tiers↔models");
+        mgr.read_ram_slot(g.id, c.data(), c.size()); // публичный API tiers (R8)
+        T_REQUIRE(std::memcmp(c.data(), a.data(), g.slot_bytes) == 0,
+                  "read_ram_slot (публичный API tiers) == слот из layout");
     }
 
     // (6) Мини-симуляция engine→tiers по контракту (ADR-08 «Уточнение»):

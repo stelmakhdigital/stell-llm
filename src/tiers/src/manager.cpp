@@ -164,6 +164,24 @@ bool TierManager::resident_in_vram(GroupId id) const {
     return st && st->in_vram;
 }
 
+// Расширение R8 (см. tier_manager.hpp): чтение слота группы из RAM-тира.
+void TierManager::read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const GroupState* st = find(id);
+    if (!st)
+        throw TierError(TierError::Code::PlanMismatch,
+                        "read_ram_slot: unknown GroupId");
+    if (dst_bytes < slot_size_)
+        throw TierError(TierError::Code::PlanMismatch,
+                        "read_ram_slot: dst_bytes < slot_bytes плана");
+    const auto it = ram_.find(id.value);
+    if (it == ram_.end() || it->second == nullptr)
+        throw TierError(TierError::Code::IoFailure,
+                        "read_ram_slot: RAM-копии нет (pin→wait до чтения; "
+                        "либо RAM-копия вытеснена при VRAM-resident)");
+    std::memcpy(dst, it->second, slot_size_);
+}
+
 void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     // Безопасный ResetPlan: воркер мог взять job из очереди (queue пуста,
     // а process_job ещё идёт) — дожидаемся дренажа in-flight job'ов ДО mu_

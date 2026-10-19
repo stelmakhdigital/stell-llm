@@ -2,6 +2,7 @@
 // коды ошибок (PlanMismatch/SlotExhausted/IoFailure/NotPinned), ResetPlan.
 #include <stell/tiers/tier_manager.hpp>
 
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -229,6 +230,94 @@ T_CASE(manager_ram_tier_cache_and_eviction) {
     // Лимит RAM-тира (tier_bytes[1] ≤ capacity).
     const TierStats st = mgr.stats();
     T_REQUIRE(st.tier_bytes[1] <= 8 * kSlot, "RAM-тир в пределах capacity");
+}
+
+T_CASE(manager_read_ram_slot_roundtrip) {
+    // Расширение R8: чтение содержимого слота из RAM-тира после pin→wait —
+    // байты == payload, записанному writer'ом layout (канонический путь
+    // «layout → tiers → данные для логитов»).
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr8.stelltier", groups);
+    TierManager mgr(ram_cfg(path, 3));
+    mgr.set_plan(groups);
+
+    // Без загрузки RAM-копии нет → IoFailure (pin→wait обязателен до чтения).
+    bool thrown = false;
+    std::vector<std::uint8_t> buf(kSlot);
+    try {
+        mgr.read_ram_slot(GroupId{0}, buf.data(), buf.size());
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::IoFailure;
+    }
+    T_REQUIRE(thrown, "read_ram_slot без pin→wait → IoFailure");
+
+    auto a = mgr.pin(GroupKey{GroupId{0}, Role::Attn});
+    a->wait();
+    mgr.read_ram_slot(GroupId{0}, buf.data(), buf.size());
+    const std::vector<std::uint8_t> expected(kSlot, std::uint8_t(0));
+    T_REQUIRE(std::memcmp(buf.data(), expected.data(), kSlot) == 0,
+              "слот RAM-тира == payload writer'а (gid=0)");
+
+    // Неизвестная группа → PlanMismatch; dst меньше слота → PlanMismatch.
+    thrown = false;
+    try {
+        mgr.read_ram_slot(GroupId{99}, buf.data(), buf.size());
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "read_ram_slot unknown group → PlanMismatch");
+    thrown = false;
+    try {
+        mgr.read_ram_slot(GroupId{0}, buf.data(), kSlot - 1);
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "read_ram_slot dst_bytes < slot_bytes → PlanMismatch");
+    mgr.unpin(GroupKey{GroupId{0}, Role::Attn});
+}
+
+T_CASE(manager_read_ram_slot_after_ram_eviction) {
+    // Семантика честно фиксируется: RAM-копия группы может быть вытеснена
+    // (evict_ram_if_needed), данные восстанавливаются перечитыванием из NVMe
+    // при следующем холодном pin (группа не в VRAM и без RAM-копии).
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr9.stelltier", groups);
+    TierConfig cfg = ram_cfg(path, 1); // один VRAM-слот
+    cfg.ram_capacity = 2 * kSlot;      // RAM-тир меньше плана → вытеснение RAM-копий
+    TierManager mgr(cfg);
+    mgr.set_plan(groups);
+
+    auto a0 = mgr.pin(GroupKey{GroupId{0}, Role::Attn});
+    a0->wait();
+    mgr.unpin(GroupKey{GroupId{0}, Role::Attn});
+
+    auto a1 = mgr.pin(GroupKey{GroupId{1}, Role::Expert});
+    a1->wait(); // вытесняет g0 из VRAM; RAM-копия g0 остаётся
+    mgr.unpin(GroupKey{GroupId{1}, Role::Expert});
+
+    auto a2 = mgr.pin(GroupKey{GroupId{2}, Role::Kv});
+    a2->wait(); // RAM-тир переполнен → RAM-копия g0 (не в VRAM, unpinned) вытесняется
+    mgr.unpin(GroupKey{GroupId{2}, Role::Kv});
+
+    bool thrown = false;
+    std::vector<std::uint8_t> buf(kSlot);
+    try {
+        mgr.read_ram_slot(GroupId{0}, buf.data(), buf.size());
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::IoFailure;
+    }
+    T_REQUIRE(thrown, "RAM-копия вытеснена → IoFailure (семантика расширения R8)");
+    T_REQUIRE(!mgr.resident_in_vram(GroupId{0}), "g0 не в VRAM — данные восстановимы");
+
+    // Повторный холодный pin g0: не в VRAM и без RAM-копии → NVMe→RAM→VRAM,
+    // чтение RAM-копии снова работает.
+    auto a0b = mgr.pin(GroupKey{GroupId{0}, Role::Attn});
+    a0b->wait();
+    mgr.read_ram_slot(GroupId{0}, buf.data(), buf.size());
+    const std::vector<std::uint8_t> expected(kSlot, std::uint8_t(0));
+    T_REQUIRE(std::memcmp(buf.data(), expected.data(), kSlot) == 0,
+              "после повторной загрузки чтение RAM-копии == payload writer'а");
+    mgr.unpin(GroupKey{GroupId{0}, Role::Attn});
 }
 
 T_CASE(manager_ram_capacity_eviction) {

@@ -104,6 +104,25 @@ public:
     void report_router_counts(const std::unordered_map<std::uint32_t, std::uint64_t>& counts);
     void record_layer_pause(double ms);
 
+    // Чтение содержимого слота группы из RAM-тира (расширение R8, раунд 2
+    // продолжение): копирует ровно slot_bytes байтов слота группы в dst.
+    // Назначение — интеграционный тест «stell-tier layout (writer models) →
+    // читатель tiers → слоты RAM/NVMe tiers → логиты, побитово == прямой
+    // загрузке»: engine/core читает канонические байты слота (CRC слота
+    // проверен при первом чтении группы, ADR-12 §2.3) для dequant/ops.
+    // Расширение на конкретной реализации — интерфейс ITierManager (ADR-08 §2)
+    // НЕ расширяется; тот же прецедент, что set_layer_map (см. «Уточнение»
+    // ADR-08). Ошибки:
+    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes;
+    //   - IoFailure: RAM-копии нет — группа ещё не загружалась (pin → wait
+    //     обязателен ДО чтения) либо RAM-копия вытеснена при VRAM-resident
+    //     (evict_ram_if_needed снимает RAM-копию resident-группы — VRAM-копия
+    //     остаётся сохранной; читайте сразу после pin→wait либо держите
+    //     ram_capacity ≥ суммарного плана).
+    // Не горячий путь: копия выполняется под mu_ (защита от гонки с eviction);
+    // предназначено для верификации/тестов, а не для decode-горячего пути.
+    void read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) const;
+
     // Для тестов/дашборда: resident-наличие группы в VRAM.
     bool resident_in_vram(GroupId id) const;
 
@@ -115,6 +134,8 @@ private:
 
     // Внутренний pin: возвращает handle, общий с waiters-списком группы.
     std::shared_ptr<TierAwaiter> pin_internal(const GroupKey& key);
+
+    // read_ram_slot() объявлен выше (расширение R8; реализация — manager.cpp).
 
     GroupState* find(GroupId id);                 // под mu_
     const GroupState* find(GroupId id) const;
