@@ -1,0 +1,2 @@
+quality-gates REAL: модель=tiny-qwen2moe, веса=/home/arkalaust/models/tiny-qwen2moe/model.safetensors (38992656 B), co-tenancy=False
+точка регрессии R8: PPL + GSM8K-32 + HumanEval-32 через ABI (stell_logits); provenance в report.json
