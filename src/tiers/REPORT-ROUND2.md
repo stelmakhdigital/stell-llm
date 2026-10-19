@@ -185,3 +185,129 @@ models) + `tests/tiers/cross_models_abi.h` (плоский C-ABI).
    — блокирует полную CUDA-верификацию дерева на сервере.
 4. Имя записи индекса: `layout.hpp` и `stelltier_format.hpp` комменты уже
    сведены к 16 байтам; тесты моделей используют `substr(0,16)` — согласовано.
+
+## 9. Продолжение раунда 2 (ветка `agent/tiers/3`, база master `56e067b`)
+
+Задачи: R7-подготовка серверного GPU-прогона + p95-NVMe bench + R8-сторона
+tiers (публичное чтение слота). Коммиты: см. `git log` ветки (НЕ пушено).
+
+### 9.1 [R8] Публичное чтение RAM-слота — `TierManager::read_ram_slot`
+
+- `src/tiers/include/stell/tiers/tier_manager.hpp` + `src/tiers/src/manager.cpp`:
+  `void read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) const` —
+  МИНИМАЛЬНОЕ расширение на конкретной реализации (интерфейс `ITierManager`
+  ADR-08 §2 НЕ расширяется; тот же прецедент, что `set_layer_map` — см.
+  «Уточнение» ADR-08). Копирует ровно `slot_bytes` байтов слота группы из
+  RAM-тира в буфер вызывающего. Назначение — интеграционный тест core:
+  layout (writer models) → читатель tiers → слоты RAM/NVMe tiers → логиты,
+  побитово == прямой загрузке. Слот в RAM-тире — канонические байты layout
+  (CRC слота проверен при первом чтении, ADR-12 §2.3; io_uring-чтение NVMe
+  → RAM-тир). Копия под `mu_` — защита от гонки с eviction; НЕ горячий путь.
+- Семантика (честно зафиксирована тестами):
+  - без `pin → wait` RAM-копии нет → `TierError::IoFailure`;
+  - `dst_bytes < slot_bytes` / неизвестный GroupId → `PlanMismatch`;
+  - RAM-копия может быть вытеснена (`evict_ram_if_needed`, в т.ч. у
+    VRAM-resident группы — VRAM-копия сохранна) → `IoFailure`;
+    восстановление — повторный холодный pin (NVMe→RAM→VRAM);
+  - рекомендация для core-теста: читать сразу после `pin → wait` либо
+    держать `ram_capacity ≥` суммарного плана.
+- Тесты: `tests/tiers/test_manager.cpp` — `manager_read_ram_slot_roundtrip`
+  (байты == payload writer'а layout; оба error-кода) и
+  `manager_read_ram_slot_after_ram_eviction` (вытеснение RAM-копии →
+  IoFailure → повторный холодный pin → чтение == payload).
+  `tests/tiers/test_cross_models.cpp` §5 — трёхсторонняя сверка: слот через
+  публичный API `read_ram_slot` == слот из layout (`TierLayoutReader`) ==
+  слот, прочитанному models reader'ом (`cm_read_slot`); `ram_capacity`
+  поднят до суммарного плана (детерминизм читаемости RAM-копий).
+
+### 9.2 [R7] Локальная проверка CUDA-конфигурации (честно: без nvcc/GPU)
+
+- Полное дерево: `cmake -DSTELL_CUDA=ON` локально падает на этапе
+  `enable_language(CUDA)` в **чужом** `src/engine/CMakeLists.txt:83`
+  («Compiler requires the CUDA toolkit») — nvcc на локальной машине нет.
+  Это ожидаемый отказ; полный CUDA-прогон — worker на сервере.
+- Локальный compile/logic-smoke CUDA-веток **только src/tiers** (вне
+  репозитория, в /tmp): stub-toolkit `cuda_runtime.h` (инлайновые
+  сигнатуры cudaMalloc/cudaHostAlloc/cudaMemcpyAsync/…; синхронная
+  семантика копий) + stub `libcudart.so` + `version.txt`
+  (`CUDA Version 12.8.0`, чтобы `FindCUDAToolkit` нашёл toolkit без nvcc
+  через sentinel-file); обёртка CMakeLists собирает `stell_tiers` с
+  `STELL_CUDA=ON` и `tests/tiers/test_manager.cpp`. Результат:
+  **компиляция чистая, 9/9 manager-тестов проходят через DMA-путь**
+  (cudaMalloc-пул device-слотов, cudaMemcpyAsync-ветка, pinned RAM).
+  Границы честности: это проверка сигнатур/компиляции/логики slot-менеджмента
+  на синхронном stub-бэкенде — НЕ замена V100-прогона (асинхронность DMA,
+  реальная VRAM, co-tenancy) — полный прогон помечен pending: worker после merge.
+
+### 9.3 [R7] p95-NVMe bench — отдельный шаг worker'а
+
+- `src/tiers/bench_p95_nvme.sh` (исполняемый): обёртка над
+  `bench_tiers_pause` (round-2) для замера p95-пауз на РЕАЛЬНОМ NVMe.
+  Режимы prefetch/cold, warmup-проход (page cache + CRC-once), двойной
+  замер (bench-side + stats-снапшот), вердикт по p95-prefetch против
+  цели PLAN.md §4 ≤ 5 мс. Честные пометки: отказ на tmpfs/ramfs (файл
+  layout обязан лежать на NVMe), co-tenancy (nvidia-smi, strata НЕ трогать),
+  опция `DROP_CACHE=1` (root) — чтения идут через buffered fd, page cache
+  может маскировать латенс реального NVMe (пометить в отчёте).
+- Локальный smoke: ext4, 8 групп × 1 MiB × 4 слоя — вердикт PASS (p95 ~4 мс
+  на SATA-классе диска при малых слотах), логи/коды выхода корректны;
+  guard tmpfs отработал (rc=2).
+
+### 9.4 Точные команды серверного прогона (worker, в клоне `~/Code/stell-llm` ПОСЛЕ merge ветки `agent/tiers/3` и `git pull`)
+
+```
+# 0) окружение
+export PATH=~/.local/stell-conda/envs/stell/bin:$PATH
+export CC=x86_64-conda-linux-gnu-gcc CXX=x86_64-conda-linux-gnu-g++
+
+# 1) CPU-конфигурация: регресс tiers (ожидание 40/40)
+cmake -S . -B build/cpu -G Ninja && cmake --build build/cpu
+ctest --test-dir build/cpu -R 'tiers/'            # 9/9
+ctest --test-dir build/cpu                         # 40/40
+
+# 2) CUDA-конфигурация (V100 SM70; co-tenancy: strata ~21–30 GB VRAM — НЕ трогать;
+#    свободно ~2–11 GB; при нехватке — CUDA_VISIBLE_DEVICES=4, RTX 2060)
+cmake -S . -B build/cuda -G Ninja -DSTELL_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build/cuda --target stell_tiers test_layout test_nvme_tier \
+      test_policy test_predictor test_manager test_stats_threads \
+      test_cross_arch test_engine_mimic test_cross_models bench_tiers_cuda
+ctest --test-dir build/cuda -R 'tiers/' --output-on-failure   # 9/9 — pending: worker
+# (если полное дерево под CUDA по-прежнему падает в чужом src/parallel —
+#  собирать таргетами, как выше; см. round-2 §3)
+
+# 3) GPU-smoke DMA (exec, не add_test; утечки VRAM до/после печатаются)
+./build/cuda/tests/tiers/bench_tiers_cuda          # pending: worker
+
+# 4) p95-NVMe bench (отдельный шаг; файл layout — на корневом NVMe)
+./src/tiers/bench_p95_nvme.sh build/cpu ~/tiers_bench
+#   цель: p95 (prefetch) ≤ 5 мс (PLAN.md §4); при нехватке root — без
+#   DROP_CACHE: замер «тёплого» NVMe, честная пометка.
+#   Опционально под CUDA-конфигурацией: build/cuda вместо build/cpu
+#   (DMA-путь в контуре bench; VRAM-тир = 2 слота — единицы MiB, безопасно
+#   при co-tenancy).
+
+# 5) R7 GPU-replay ядер (attention/MoE/dequant block32 против CPU-референсов) —
+#    kernels/parallel сторона (чужие каталоги); tiers-часть пути — п.2–3.
+```
+
+### 9.5 Тесты
+
+- Локально (CPU): **40/40** (базлайн до изменений тоже 40/40; tiers 9/9,
+  из них +2 новых кейса `manager_read_ram_slot_*`; `test_cross_models`
+  расширен трёхсторонней сверкой через публичный API).
+- CUDA-stub smoke (/tmp, вне репозитория): компиляция чистая, 9/9.
+- Серверные прогоны (CUDA ctest, bench_tiers_cuda, p95-NVMe) — **pending:
+  worker после merge** (push на сервер запрещён; серверную часть из ветки
+  не запускал).
+
+### 9.6 Не сделано / почему
+
+- Серверные CUDA/p95-прогоны: push на сервер запрещён, серверная часть —
+  worker после merge (инструкции §9.4; скрипт в репозитории).
+- O_DIRECT в NVMe-тире: чтения через buffered fd; переход на O_DIRECT —
+  отдельное изменение (требует выравнивания RAM-буферов и ADR-кларификации
+  §2.3/§2.4) — зафиксировано как открытый вопрос, на замер влияет только
+  через page cache (см. DROP_CACHE в §9.3).
+- `read_ram_slot` для VRAM-тира НЕ добавлен (CUDA device ptr — другой
+  адресный домен; чтение = cudaMemcpy D→H — отдельный API, не запрошен;
+  минимальность — по постановке).
