@@ -110,3 +110,59 @@ CommDType) с разной семантикой полей:
 - **expert_alltoall recv-ёмкость**: при контрактной ёмкости max_tokens×world
   переполнение (BufferTooSmall) недостижимо (fan-out ≤ tp даёт inflow ≤
   ёмкость ровно в worst-case) — либо ревизия контракта, либо ёмкость по плану.
+
+## 8. Раунд 2 (R4/R5/R6, T-20261017200354): token_elems, subgroup, NCCL
+
+Реализовано в `src/parallel` (ветка agent/parallel/3); уточнения внесены в
+`comm.hpp` (контракт ADR-10) и в `docs/design/parallel.md` (дубль docs-3).
+Текст ниже — материал для «Уточнения round 2» в ADR-10 (docs/ закрыт для
+потока C — переносит worker/planner при merge).
+
+- **[R4] token_elems**: `expert_alltoall(..., max_tokens, token_elems, t)`;
+  token_elems — элементов dtype на ОДИН токен (hidden → d_model);
+  token_elems = 1 — совместимость со скалярной семантикой раунда 1 (старые
+  вызовы/тесты остаются зелёными без порогов-послаблений). send_tokens —
+  max_tokens*token_elems элементов; recv — max_tokens*world ТОКЕНОВ
+  (= max_tokens*world*token_elems элементов) и max_tokens*world мет; входящие
+  — в порядке (источник ↑, индекс ↑); хвост — нули + TokenMeta{-1,-1};
+  переполнение → CommError(BufferTooSmall).
+- **[R4] golden**: mini_moe EP2 в `test_golden_real_models.cpp` переписан на
+  ЦЕЛЫЕ токены (token_elems = dm, мета — одна на токен, slot_id кодирует пару
+  (источник,(t,j))) — побитовое равенство TP1 сохранено (88000+ CHECK).
+  Юнит-тест маршрутизации целых токенов: `tok_width_expert_alltoall_dmodel_ep2`.
+- **[R5] subgroup**: `ICommunicator::subgroup(ranks)` — коллективы и p2p
+  подгруппы затрагивают только её ранки; ranks — уникальные глобальные ранки,
+  содержащие собственный (иначе CommError(RankMismatch)); перенумерация — по
+  возрастанию глобального ранка; ВЛАДЕНИЕ У РОДИТЕЛЯ (хранится в родителе,
+  повторный вызов с тем же ranks возвращает тот же объект); вложенные
+  подгруппы допустимы. Эмулятор — фильтрация ранков с ОТДЕЛЬНЫМ состоянием
+  рандеву на подгруппу (коллективы подгруппы не пересекаются с родителем).
+- **[R5] BufferTooSmall**: инвариант inflow(d) ≤ Σ_s max_tokens = контрактной
+  ёмкости (max_tokens×world) означает, что в ПОЛНОЙ группе ошибка недостижима
+  (подтверждает вывод §7). Достижимая ветвь — ПОДГРУППА: маршрут токена за
+  пределы состава подгруппы → CommError(BufferTooSmall) у ВСЕХ членов
+  (молчаливое сокращение пересылки запрещено); тест
+  `sub_route_outside_buffer_too_small`. NCCL-путь: матрица счётчиков через
+  ncclAllGather (строка = [counts по позициям, out_sub]) — решения об ошибках
+  глобально согласованы между членами.
+- **[R6] NCCL**: `expert_alltoall` — обмен матрицей счётчиков (ncclAllGather)
+  + байтовый p2p ncclSend/ncclRecv по парам ранков (токены и меты отдельными
+  проходами, fused в ncclGroupStart/ncclGroupEnd); локальная доставка — D2D;
+  сборка recv по возрастанию источника. `kv_stream` — ncclSend/ncclRecv по
+  кольцу (next/prev) на ОТДЕЛЬНОЙ kv-комме (не мешает коллективам приложения);
+  блок = заголовок uint64 + payload; фоновый поток-приёмник обеспечивает
+  неблокирующий pop; push даёт backpressure до приёма получателем.
+  `subgroup` — свежий комм-клик по бутстрап-реестру подгрупп (ключ — отсорти
+  рованные члены; NCCL 2.26.2 на сервере).
+- **pending GPU-валидации [R6]** (worker после merge): корректность + latency
+  expert_alltoall/kv_stream на V100 (тест `parallel_gpu` — добавлен
+  `parallel_gpu_nccl_expert_alltoall_kv_stream`, при OOM/контенанс — честный
+  PENDING); бутстрап ncclUniqueId между процессами; замена host-маршрутизации
+  на device-ядра MoE gather/scatter (kernels); Timeout-семантика kv-кольца на
+  NCCL-пути (сейчас — backpressure).
+- **Синтакс-контроль NCCL-файла** локально (файл собирается только при
+  STELL_CUDA=ON): прогнан через g++ -fsyntax-only со минимальными стубами
+  cuda_runtime.h/nccl.h (сигнатуры сверены с серверным nccl.h 2.26.2) — чисто,
+  -Wall -Wextra.
+- Тесты: 53 → 59 кейсов test_parallel (добавлено 6: tok_width ×1, sub ×5);
+  ctest локально 40/40; golden побитовые TP2/TP4/EP2 == TP1 — без послаблений.
