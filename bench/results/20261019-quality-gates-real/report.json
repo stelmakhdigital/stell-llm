@@ -11,6 +11,7 @@
       "notes": [
         "модель=synthetic-realistic-moe",
         "источник логитов=abi:stell_logits",
+        "режим PPL: all (teacher-forcing одним вызовом; vocab=350 × позиций=128 ≤ порога 2000000 элементов)",
         "токенизация: byte-level BPE tokenizer.json, токенов=128 (первые 128 фиксированного текста)",
         "mean_nll=6.407976",
         "каталог модели — синтетический реалистичный профиль (не языковая модель): значения — точки регрессии конвейера R8, не оценка качества LLM"
@@ -53,16 +54,17 @@
     "mode": "real-model",
     "model": "synthetic-realistic-moe",
     "model_class": "moe",
-    "description": "/tmp/tmp.yTgjgpBRTe/model/description.json",
-    "weights": "/tmp/tmp.yTgjgpBRTe/model/model.safetensors",
+    "description": "/tmp/tmp.JFZ0YffxkM/model/description.json",
+    "weights": "/tmp/tmp.JFZ0YffxkM/model/model.safetensors",
     "weights_bytes": 130704,
-    "weights_format": "safetensors",
+    "weights_format": "nvfp4w4a16",
     "vocab_size": 350,
     "n_layers": 4,
     "n_experts": 8,
-    "tokenizer_json": "/tmp/tmp.yTgjgpBRTe/model/tokenizer.json",
+    "tokenizer_json": "/tmp/tmp.JFZ0YffxkM/model/tokenizer.json",
     "tokenization": "byte-level BPE (tokenizer.json)",
-    "date_utc": "2026-10-19T08:42:45+00:00",
+    "ppl_mode": "all",
+    "date_utc": "2026-10-19T10:52:30+00:00",
     "co_tenancy": false,
     "engine_lib": "/home/arkalaust/CODE/SERVER/stell-llm/.worktrees/serve/build/cpu/src/engine/libstell_core.so",
     "logits_source": "abi:stell_logits"
@@ -82,6 +84,8 @@
       "env": "пустой",
       "cwd": "изолированный temp-dir"
     },
-    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)"
+    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)",
+    "ppl_all_max_elements": 2000000,
+    "ppl_mode_rule": "n_vocab × n_positions > порога → incremental-last (повторные positions:last по растущему префиксу, по строке логитов за вызов); иначе all одним вызовом; математика путей идентична"
   }
 }

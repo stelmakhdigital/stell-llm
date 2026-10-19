@@ -18,9 +18,16 @@ Round 3 ([R4], решение планировщика [Q4]): HumanEval-32 бо�
   конвенция ADR-11 §1) через биндинг python/stell_serve/engine.py;
   модель загружается СРЕДСТВАМИ движка (cfg runner:"ops", реальные веса
   tests/models/fixtures: mini_dense / mini_moe, weights_format safetensors);
-- PPL считается по logprob позиций ("positions":"all", teacher-forcing за
-  один вызов): softmax/logprob по логитам, PPL = exp(mean(-log P(tok[i+1])))
-  по позициям предсказания (см. ppl_from_logits);
+- PPL считается по logprob позиций (teacher-forcing): режим — по порогу
+  PPL_ALL_MAX_ELEMENTS элементов логитов за вызов. Малые словари — "all"
+  одним вызовом (teacher-forcing за один раз); большие (n_vocab × n_positions
+  > порога; напр. tiny-qwen2moe vocab=151646: 128 × 151646 ≈ 19.4 млн ≈ 300+
+  МиБ JSON в одном ответе — прогон зависал) — 'incremental-last': повторные
+  positions:"last" по растущему префиксу, по строке за вызов. Чанки "all"
+  с окном контекста некорректны каузально (ABI не имеет смещения контекста);
+  математика путей идентична: rows[i] = logits_last(tokens[:i+1]) —
+  значения совпадают (сверено тестом). softmax/logprob по логитам,
+  PPL = exp(mean(-log P(tok[i+1]))) по позициям предсказания (см. ppl_from_logits);
 - GSM8K-32: генерация жадным декодированием (argmax, ничья → меньший индекс —
   конвенция golden), проверка корректности — сопоставление чисел (без
   исполнения чего-либо — выполнимо честно, реализовано);
@@ -94,6 +101,11 @@ _GOLDEN_REF = _REPO_ROOT / "tests" / "models" / "golden" / "generate_golden.py"
 
 # Фиксированные параметры прогона (детерминизм между версиями §5):
 PPL_MAX_TOKENS = 128          # первые 128 токенов фиксированного текста
+# R8 fixup (серверный прогон tiny-qwen2moe, vocab=151646): один вызов
+# positions:"all" на большом словаре — это n_positions × n_vocab логитов в
+# ОДНОМ JSON-ответе (128 × 151646 ≈ 19.4 млн ≈ 300+ МиБ) — прогон зависает.
+# Порог переключения режима PPL (элементов логитов за один вызов):
+PPL_ALL_MAX_ELEMENTS = 2_000_000
 GSM8K_PROMPT_TOKENS = 64      # проекция вопроса → не более 64 токенов
 GSM8K_MAX_STEPS = 16          # жадное декодирование: до 16 токенов ответа
 HUMANEVAL_PROMPT_TOKENS = 64  # проекция сигнатуры+docstring → ≤ 64 токенов
@@ -190,8 +202,14 @@ def resolve_real_model(model_dir: Optional[str] = None,
 
 
 def real_provenance(spec: RealModelSpec, engine_lib: str, co_tenancy: bool,
-                    tokenizer: Optional[BpeTokenizer]) -> Dict[str, Any]:
-    """Provenance точки регрессии (модель, размер, дата, co-tenancy) — R8."""
+                    tokenizer: Optional[BpeTokenizer],
+                    ppl_mode: Optional[str] = None,
+                    weights_format: str = "safetensors") -> Dict[str, Any]:
+    """Provenance точки регрессии (модель, размер, дата, co-tenancy) — R8.
+
+    ppl_mode — честная пометка режима PPL ('all' / 'incremental-last');
+    None → оценка по протоколу (vocab × PPL_MAX_TOKENS против порога).
+    """
     moe = spec.desc.get("moe") or {}
     return {
         "mode": "real-model",
@@ -200,7 +218,7 @@ def real_provenance(spec: RealModelSpec, engine_lib: str, co_tenancy: bool,
         "description": str(spec.desc_path),
         "weights": str(spec.weights_path),
         "weights_bytes": spec.weights_path.stat().st_size,
-        "weights_format": "safetensors",
+        "weights_format": weights_format,
         "vocab_size": spec.vocab_size,
         "n_layers": spec.desc.get("n_layers"),
         "n_experts": moe.get("n_experts"),
@@ -209,6 +227,8 @@ def real_provenance(spec: RealModelSpec, engine_lib: str, co_tenancy: bool,
         "tokenization": ("byte-level BPE (tokenizer.json)" if tokenizer
                          else "проекция байта → токен b % vocab (tokenizer.json "
                               "в каталоге отсутствует)"),
+        "ppl_mode": (ppl_mode if ppl_mode is not None else
+                     ppl_mode_for(spec.vocab_size, PPL_MAX_TOKENS)),
         "date_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(
             timespec="seconds"),
         "co_tenancy": bool(co_tenancy),
@@ -395,14 +415,66 @@ def _decode_ids(ids: List[int], tokenizer: Optional[BpeTokenizer]) -> str:
     return detokenize_ids(ids)
 
 
+def ppl_mode_for(vocab: int, n_positions: int) -> str:
+    """Режим PPL (R8 fixup): 'all' или 'incremental-last'.
+
+    - 'all' — teacher-forcing ОДНИМ вызовом positions:"all" (малые словари;
+      тот же путь, что у mini-фикстур — значения прежние);
+    - 'incremental-last' — teacher-forcing ПОЗИЦИЯМ: повторные вызовы
+      positions:"last" с растущим префиксом (по ОДНОЙ строке логитов за
+      вызов — ответ ~n_vocab элементов, а не n_positions × n_vocab).
+
+    Чанковые вызовы "all" с окном контекста невозможны честно: каузальная
+    семантика требует для строки i полный префикс tokens[:i+1], а ABI не
+    имеет параметра смещения контекста — усечённое окно дало бы логиты без
+    левого контекста. Поэтому единственная честная альтернатива "all" на
+    больших словарях — инкрементальный last, с ТОЙ ЖЕ математикой:
+    rows[i] = logits_last(tokens[:i+1]) — значения путей совпадают
+    (сверено тестом на детерминированном стабе).
+
+    Порог: n_vocab × n_positions > PPL_ALL_MAX_ELEMENTS элементов логитов
+    за один вызов → инкрементальный путь.
+    """
+    if vocab * n_positions > PPL_ALL_MAX_ELEMENTS:
+        return "incremental-last"
+    return "all"
+
+
 def run_ppl_gate(source: LogitsSource, model: str, *, vocab: Optional[int] = None,
                  tokenizer: Optional[BpeTokenizer] = None,
                  notes_extra: Optional[List[str]] = None) -> GateResult:
-    """PPL фиксированного текста по logprob позиций ("positions":"all")."""
+    """PPL фиксированного текста по logprob позиций (teacher-forcing).
+
+    Режим — ppl_mode_for(vocab, len(tokens)): 'all' одним вызовом (малые
+    словари) или 'incremental-last' — повторные positions:"last" по растущему
+    префиксу (R8 fixup: на vocab ≥ 100к один вызов "all" — это сотни МиБ
+    JSON; математика путей идентична: rows[i] = logits_last(tokens[:i+1]))."""
     vocab = _vocab_size(model) if vocab is None else vocab
     tokens = _tokens_for_text(ppl_text(), vocab, tokenizer, PPL_MAX_TOKENS)
-    rows = source.logits_all(tokens)
-    stats = ppl_from_logits(rows, tokens)
+    mode = ppl_mode_for(vocab, len(tokens))
+    if mode == "all":
+        rows = source.logits_all(tokens)
+        stats = ppl_from_logits(rows, tokens)
+    else:
+        if len(tokens) < 2:
+            raise ValueError("нет позиций предсказания: tokens пуст/одиночен")
+        nlls = []
+        for i in range(len(tokens) - 1):
+            row = source.logits_last(tokens[:i + 1])
+            nlls.append(-logprob_of(row, tokens[i + 1]))
+        mean_nll = sum(nlls) / len(nlls)
+        stats = {"ppl": math.exp(mean_nll), "mean_nll": mean_nll,
+                 "n_pred_positions": len(nlls)}
+    mode_note = (
+        f"режим PPL: all (teacher-forcing одним вызовом; vocab={vocab} × "
+        f"позиций={len(tokens)} ≤ порога {PPL_ALL_MAX_ELEMENTS} элементов)"
+        if mode == "all" else
+        f"режим PPL: incremental-last (teacher-forcing по позициям, повторные "
+        "positions:last по растущему префиксу, по строке за вызов; "
+        f"vocab={vocab} × позиций={len(tokens)} > порога "
+        f"{PPL_ALL_MAX_ELEMENTS} элементов; чанки all с окном контекста "
+        "некорректны каузально — ABI не имеет смещения контекста; математика "
+        "та же: rows[i]=logits_last(tokens[:i+1]), значения путей совпадают)")
     tok_note = (f"токенизация: byte-level BPE tokenizer.json, токенов={len(tokens)} "
                 f"(первые {PPL_MAX_TOKENS} фиксированного текста)" if tokenizer else
                 f"токенов={len(tokens)} (первые {PPL_MAX_TOKENS} фиксированного "
@@ -412,7 +484,8 @@ def run_ppl_gate(source: LogitsSource, model: str, *, vocab: Optional[int] = Non
         "quality-gate", "ppl_fixed_text", pending=False,
         value=round(stats["ppl"], 4), unit="ppl",
         items=stats["n_pred_positions"],
-        notes=[f"модель={model}", f"источник логитов={source.name}", tok_note,
+        notes=[f"модель={model}", f"источник логитов={source.name}", mode_note,
+               tok_note,
                f"mean_nll={stats['mean_nll']:.6f}"] + (notes_extra or []))
 
 
@@ -603,13 +676,19 @@ def run_gates_real(spec: RealModelSpec, engine_lib: Optional[str] = None,
                    co_tenancy: bool = False) -> Tuple[List[GateResult], Dict[str, Any]]:
     """Живой прогон гейтов через ABI на каталоге реальной модели.
 
-    Возвращает (гейты, provenance): модель, размер весов, дата, co-tenancy —
-    точки регрессии R8. Токенизация: tokenizer.json каталога (РЕАЛЬНЫЙ
-    byte-level BPE, порт R10) или, при его отсутствии, честная проекция
-    байта → токен (значения — механические точки регрессии).
+    Возвращает (гейты, provenance): модель, размер весов, дата, co-tenancy,
+    ppl_mode — точки регрессии R8. Токенизация: tokenizer.json каталога
+    (РЕАЛЬНЫЙ byte-level BPE, порт R10) или, при его отсутствии, честная
+    проекция байта → токен (значения — механические точки регрессии).
+    weights_format — из ADR-09 описания: квантованный профиль (NVFP4/W4A16)
+    → лоадер nvfp4w4a16 (квантование на read, ADR-03; он же обслуживает
+    плоские группы F16/F32 — фикс round 2), иначе — plain safetensors.
     """
     from stell_serve.engine import CtypesEngineBackend, resolve_engine_lib
 
+    profile = str(spec.desc.get("dtype_weights") or "")
+    weights_format = "nvfp4w4a16" if profile in ("NVFP4", "W4A16")\
+        else "safetensors"
     path, _ = resolve_engine_lib(engine_lib)
     backend = CtypesEngineBackend(path)
     source = None
@@ -621,7 +700,7 @@ def run_gates_real(spec: RealModelSpec, engine_lib: Optional[str] = None,
                 "умеет только mini-фикстуры — подмена источника запрещена)")
         cfg_model = dict(description=str(spec.desc_path),
                          weights=str(spec.weights_path),
-                         weights_format="safetensors", tokenizer="byte")
+                         weights_format=weights_format, tokenizer="byte")
         backend.create({"runner": "ops",
                         "engine": {"max_slots": 16, "batch_step_max": 16},
                         "model": cfg_model})
@@ -644,7 +723,13 @@ def run_gates_real(spec: RealModelSpec, engine_lib: Optional[str] = None,
         ppl.dataset = f"ppl_fixed_text[{label}]"
         gsm.dataset = f"gsm8k_32[{label}]"
         he.dataset = f"humaneval_32[{label}]"
-        provenance = real_provenance(spec, str(path), co_tenancy, tokenizer)
+        # Честная пометка режима PPL — ТОТ ЖЕ расчёт, что внутри run_ppl_gate
+        # (те же входы: vocab, длина токенизированного PPL-текста).
+        ppl_tokens = _tokens_for_text(ppl_text(), vocab, tokenizer, PPL_MAX_TOKENS)
+        ppl_mode = ppl_mode_for(vocab, len(ppl_tokens))
+        provenance = real_provenance(spec, str(path), co_tenancy, tokenizer,
+                                     ppl_mode=ppl_mode,
+                                     weights_format=weights_format)
         return [ppl, gsm, he], provenance
     finally:
         if source is not None:
@@ -693,6 +778,11 @@ def _protocol_snapshot() -> dict:
             "rlimit_nofile": 64,
             "env": "пустой", "cwd": "изолированный temp-dir"},
         "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)",
+        "ppl_all_max_elements": PPL_ALL_MAX_ELEMENTS,
+        "ppl_mode_rule": ("n_vocab × n_positions > порога → incremental-last "
+                          "(повторные positions:last по растущему префиксу, "
+                          "по строке логитов за вызов); иначе all одним "
+                          "вызовом; математика путей идентична"),
     }
 
 

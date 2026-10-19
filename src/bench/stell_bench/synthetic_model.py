@@ -24,7 +24,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _GOLDEN_GEN = _REPO_ROOT / "tests" / "models" / "golden" / "generate_golden.py"
@@ -103,9 +103,13 @@ TOKENIZER_NAME = "tokenizer.json"
 
 
 def build_realistic_profile(dest_dir: Path, *, seed: int = DEFAULT_SEED,
-                            with_tokenizer: bool = True) -> Dict[str, Any]:
+                            with_tokenizer: bool = True,
+                            vocab_size: Optional[int] = None) -> Dict[str, Any]:
     """Создаёт каталог синтетической модели реалистичного профиля.
 
+    vocab_size — переопределение словаря (R8 fixup: big-vocab вариант, ≥100к,
+      для теста инкрементального PPL-пути; патчится vocab_size описания и
+      форма embed-группы [vocab_size, d_model]).
     Возвращает сводку {description, weights, tokenizer, weights_bytes}.
     Бросает FileNotFoundError, если эталонный tokenizer.json недоступен
     (тишина запрещена: with_tokenizer=True требует файл).
@@ -120,6 +124,13 @@ def build_realistic_profile(dest_dir: Path, *, seed: int = DEFAULT_SEED,
 
     desc = dict(REALISTIC_DESC)
     desc["tensor_groups"] = [dict(g) for g in REALISTIC_DESC["tensor_groups"]]
+    if vocab_size is not None:
+        if vocab_size < 2:
+            raise ValueError("vocab_size должен быть ≥ 2")
+        desc["vocab_size"] = int(vocab_size)
+        for g in desc["tensor_groups"]:
+            if g["name"] == "embed":
+                g["shape"] = [int(vocab_size), g["shape"][1]]
     desc_path = dest_dir / DESCRIPTION_NAME
     desc_path.write_text(json.dumps(desc, indent=2, ensure_ascii=False) + "\n",
                          encoding="utf-8")
