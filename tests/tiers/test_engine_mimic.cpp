@@ -65,7 +65,12 @@ T_CASE(engine_contract_mimic) {
     const auto path = write_layout("/tmp/stell_tier_engine_mimic.stelltier", plan);
 
     TierConfig cfg;
-    cfg.vram_slots = 3;                 // churn: слоев больше, чем VRAM-слотов
+    // Bugfix раунда 3 (корректный учёт VRAM-слотов в acquire_slot): для
+    // детерминизма prefetch-хитов нужно ≥ 2 слоёв групп (3 группы/слой):
+    // при 3 слотах (1 слой) загрузка слоя l+1 вытесняла слой l → все pin —
+    // промахи. Раньше тест проходил на aliasing-баге слотов (resident
+    // завышался, вытеснения не происходило фактически).
+    cfg.vram_slots = 6;                 // churn: 3 слоя × 3 группы > 6 слотов
     cfg.vram_slot_size = kSlot;
     cfg.ram_capacity = 6 * kSlot;
     cfg.nvme_layout = path;

@@ -336,4 +336,31 @@ T_CASE(manager_ram_capacity_eviction) {
     T_REQUIRE(st.tier_bytes[1] <= cfg.ram_capacity, "RAM-тир не превышает capacity");
 }
 
+T_CASE(manager_vram_slot_accounting_under_churn) {
+    // Регрессия bugfix раунда 3: acquire_slot при eviction забирает слот
+    // жертвы себе (pop_back). Раньше возвращал free_slots_.back() без pop →
+    // слот оставался в списке свободных → следующий acquire_slot выдавал ТОТ
+    // ЖЕ слот другой группе → aliasing (resident > vram_slots, порча VRAM-
+    // копий при churn — сценарий MoE > VRAM, срез 3).
+    const auto groups = plan3();
+    const auto path =
+        write_layout("/tmp/stell_tier_test_mgr_slotacc.stelltier", groups);
+    TierManager mgr(ram_cfg(path, 1)); // один VRAM-слот — максимальный churn
+    mgr.set_plan(groups);
+    for (int round = 0; round < 4; ++round)
+        for (const auto& g : groups) {
+            auto a = mgr.pin(GroupKey{g.id, g.role});
+            a->wait();
+            mgr.unpin(GroupKey{g.id, g.role});
+        }
+    int resident = 0;
+    for (const auto& g : groups)
+        resident += mgr.resident_in_vram(g.id) ? 1 : 0;
+    T_REQUIRE(resident <= 1, "resident-группы ≤ vram_slots (нет aliasing слотов)");
+    // Слот учётен корректно: VRAM-байты == resident × slot.
+    const TierStats st = mgr.stats();
+    T_REQUIRE(st.tier_bytes[0] == std::uint64_t(resident) * kSlot,
+              "tier_bytes[VRAM] == resident × slot_bytes");
+}
+
 T_MAIN

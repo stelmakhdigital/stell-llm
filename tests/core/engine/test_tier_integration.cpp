@@ -71,7 +71,11 @@ void run() {
 
     // --- TierManager по плану реальных групп (ADR-08 §2) --------------------
     stell::tiers::TierConfig cfg{};
-    cfg.vram_slots = 16;
+    // Bugfix раунда 3 (корректный учёт VRAM-слотов): слотов ≥ всех групп
+    // плана (21) — интент теста: интеграция/residency, а не churn. Прежнее
+    // значение 16 проходило только из-за aliasing-бага acquire_slot
+    // (resident завышался, вытеснение не происходило фактически).
+    cfg.vram_slots = 32;
     cfg.ram_capacity = 1u << 20;
     cfg.nvme_layout = tier_path;
     cfg.lookahead = 2;

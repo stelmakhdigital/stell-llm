@@ -321,6 +321,11 @@ void TierManager::internal_prefetch(GroupId id) {
     GroupState* st = find(id);
     if (!st) return;
     st->prefetch_flag = true; // идемпотентно: повторный prefetch не удваивает работу
+    // Bugfix (раунд 3): префетченная группа — «недавно использованная» для
+    // LRU/LCU (иначе last_use = 0 → она первая жертва следующей eviction:
+    // prefetch(l+1) второй загрузкой вытеснял первую, свежезагруженную,
+    // → гарантированные промахи prefetch при churn, срез 3 MoE > VRAM).
+    st->last_use = ++tick_;
     if (!st->in_vram && !st->loading) {
         st->loading = true;
         std::lock_guard<std::mutex> qk(qmu_);
@@ -505,10 +510,18 @@ std::int32_t TierManager::acquire_slot(GroupId) {
         throw TierError(TierError::Code::SlotExhausted,
                         "vram: no free slots and nothing evictable (all pinned)");
     const GroupId victim = choose_victim(cand, policy_);
-    release_slot(states_[victim.value].slot);
+    // Bugfix (раунд 3): слот жертвы нужно ЗАБРАТЬ себе — release_slot клалит
+    // его в free_slots_, но возвращаемый слот обязан быть извлечён (pop_back).
+    // Раньше free_slots_.back() возвращался без pop → слот оставался в списке
+    // свободных → следующий acquire_slot выдавал ТОТ ЖЕ слот другой группе →
+    // двукратная броня одного слота (aliasing данных VRAM, resident > slots;
+    // проявлялось при любом churn — сценарий MoE > VRAM, срез 3).
+    const std::int32_t victim_slot = states_[victim.value].slot;
+    release_slot(victim_slot);
     states_[victim.value].in_vram = false;
     states_[victim.value].slot = -1;
-    return free_slots_.back();
+    free_slots_.pop_back(); // забираем слот жертвы под загружаемую группу
+    return victim_slot;
 }
 
 void TierManager::release_slot(std::int32_t slot) {
