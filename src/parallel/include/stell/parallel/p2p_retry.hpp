@@ -100,4 +100,40 @@ inline bool bench_allowed_after(const std::string& correctness_outcome) {
            correctness_outcome == kOutcomeFewDevices;
 }
 
+// --- итоговый вердикт оркестратора (round 4b: транспортная sanity + expert) ---
+
+// Оркестратор прогоняет ДВЕ корректности: (а) транспортная sanity —
+// минимальные allreduce+allgather F32 на паре; (б) expert-контракт
+// (expert_alltoall/kv_stream). Развилка [R1] round 4:
+//   простые коллективы проходят → транспорт ОК, а expert не подтверждён →
+//   баг НАШЕЙ обвязки (counts-allgather) → честный FAIL (починка в потоке C);
+//   падают тем же 'unhandled cuda error' → транспорт/среда → честный pending.
+enum class GpuValidationVerdict {
+    Ok,            // корректность подтверждена (или <2 карт: неприменима)
+    Pending,       // транспорт/среда не подтверждены — честный pending
+                   //   (checks=0 failures=0); bench не запускается
+    FailExpert,    // транспорт ОК, expert-контракт не подтверждён → баг нашей
+                   //   обвязки (поток C) → честный FAIL
+    FailConfirmed, // подтверждённое битовое несовпадение (fail:) — честный FAIL
+};
+
+// Вердикт по паре исходов (транспортная sanity, expert-контракт).
+// Пустой исход = зависание (watchdog убил дочерний процесс).
+inline GpuValidationVerdict gpu_validation_verdict(const std::string& transport_outcome,
+                                                   const std::string& expert_outcome) {
+    if (outcome_is_fail(transport_outcome)) return GpuValidationVerdict::FailConfirmed;
+    if (expert_outcome == kOutcomeFewDevices) return GpuValidationVerdict::Ok;
+    if (outcome_is_pass(expert_outcome)) return GpuValidationVerdict::Ok;
+    if (outcome_is_fail(expert_outcome))
+        return outcome_is_pass(transport_outcome) ? GpuValidationVerdict::FailExpert
+                                                  : GpuValidationVerdict::FailConfirmed;
+    // pending/пустой исход expert: исключение/зависание в нашей обвязке
+    // при подтверждённом транспорте — attributable нашему коду (round 4:
+    // «unhandled cuda error» на expert_alltoall при рабочем транспорте).
+    // Caveat (честно): OOM/expert-буферов с рабочим транспортом попадает
+    // сюда же — редкий класс, worker различает по тексту ошибки в логе.
+    return outcome_is_pass(transport_outcome) ? GpuValidationVerdict::FailExpert
+                                              : GpuValidationVerdict::Pending;
+}
+
 } // namespace stell::parallel

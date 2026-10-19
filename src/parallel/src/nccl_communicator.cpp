@@ -56,15 +56,27 @@ ncclDataType_t nccl_dtype(CommDType t) {
     return ncclFloat;
 }
 
-void check_nccl(ncclResult_t r, const char* what) {
-    if (r != ncclSuccess)
-        throw CommError(CommError::Code::NcclFailure,
-                        std::string(what) + ": " + ncclGetErrorString(r));
-}
 void check_cuda(cudaError_t r, const char* what) {
     if (r != cudaSuccess)
         throw CommError(CommError::Code::NcclFailure,
                         std::string(what) + ": " + cudaGetErrorString(r));
+}
+
+// Причина ошибки NCCL — в двух уровнях (диагностика round 4b): слепое пятно
+// серверного прогона было в том, что ncclGetErrorString даёт только класс
+// («unhandled cuda error» / «run with NCCL_DEBUG=INFO») — реальная причина
+// скрыта в NCCL. ncclGetLastError(comm) вскрывает underlying ошибку
+// (CUDA-статус, файл/строка NCCL). comm==nullptr безопасно («no communicator»):
+// на пути бутстрапа (ncclGetUniqueId/ncclCommInitRank) комма ещё нет.
+void check_nccl(ncclResult_t r, const char* what, const ncclComm_t comm = nullptr) {
+    if (r == ncclSuccess) return;
+    std::string msg = std::string(what) + ": " + ncclGetErrorString(r);
+    if (comm) {
+        const char* last = ncclGetLastError(comm);
+        if (last && *last && std::string(last) != "no error")
+            msg += std::string(" [ncclGetLastError: ") + last +"]";
+    }
+    throw CommError(CommError::Code::NcclFailure, msg);
 }
 
 // Бутстрап id между ранками одного процесса (см. коммент. в шапке).
@@ -184,7 +196,7 @@ public:
     void allreduce(void* buf, std::size_t count, CommDType t) override {
         if (t != CommDType::E4M3) {
             check_nccl(ncclAllReduce(buf, buf, count, nccl_dtype(t), ncclSum, comm_, stream_),
-                       "ncclAllReduce");
+                       "ncclAllReduce", comm_);
             sync_check();
             return;
         }
@@ -199,7 +211,7 @@ public:
         check_cuda(cudaMemcpy(stage, host.data(), count * sizeof(float), cudaMemcpyHostToDevice),
                    "H2D");
         check_nccl(ncclAllReduce(stage, stage, count, ncclFloat, ncclSum, comm_, stream_),
-                   "ncclAllReduce(F32 stage)");
+                   "ncclAllReduce(F32 stage)", comm_);
         check_cuda(cudaStreamSynchronize(stream_), "sync");
         check_cuda(cudaMemcpy(host.data(), stage, count * sizeof(float), cudaMemcpyDeviceToHost),
                    "D2H");
@@ -212,7 +224,8 @@ public:
         if (t == CommDType::E4M3)
             throw CommError(CommError::Code::NcclFailure,
                             "ncclAllGather для E4M3 не поддерживается (используйте F16/F32)");
-        check_nccl(ncclAllGather(send, recv, count, nccl_dtype(t), comm_, stream_), "ncclAllGather");
+        check_nccl(ncclAllGather(send, recv, count, nccl_dtype(t), comm_, stream_),
+                   "ncclAllGather", comm_);
         sync_check();
     }
 
@@ -299,7 +312,7 @@ public:
         check_cuda(cudaMemcpy(d_row, row.data(), (std::size_t(n) + 1) * sizeof(int),
                               cudaMemcpyHostToDevice), "expert_alltoall: H2D row");
         check_nccl(ncclAllGather(d_row, d_mat, std::size_t(n) + 1, ncclInt, comm_, stream_),
-                   "expert_alltoall: ncclAllGather(counts)");
+                   "expert_alltoall: ncclAllGather(counts)", comm_);
         sync_check();
         std::vector<int> mat(std::size_t(n) * (std::size_t(n) + 1));
         check_cuda(cudaMemcpy(mat.data(), d_mat, mat.size() * sizeof(int),
@@ -373,28 +386,28 @@ public:
             static_cast<std::uint8_t*>(dev.alloc(inflow_me * sizeof(TokenMeta)));
 
         // 6. P2P-обмен (байтовый, fused): peer — позиция в подгруппе.
-        check_nccl(ncclGroupStart(), "expert_alltoall: ncclGroupStart");
+        check_nccl(ncclGroupStart(), "expert_alltoall: ncclGroupStart", comm_);
         for (rank_t p = 0; p < n; ++p) {
             if (p == my) continue;
             const std::size_t cnt = route[std::size_t(p)].size();
             if (cnt == 0) continue;
             check_nccl(ncclSend(pack_tok + send_off[std::size_t(p)] * tb, cnt * tb,
-                                ncclUint8, p, comm_, stream_), "expert_alltoall: ncclSend tokens");
+                                ncclUint8, p, comm_, stream_), "expert_alltoall: ncclSend tokens", comm_);
             check_nccl(ncclSend(pack_meta + send_off[std::size_t(p)] * sizeof(TokenMeta),
                                 cnt * sizeof(TokenMeta), ncclUint8, p, comm_, stream_),
-                       "expert_alltoall: ncclSend meta");
+                       "expert_alltoall: ncclSend meta", comm_);
         }
         for (rank_t s = 0; s < n; ++s) {
             if (s == my) continue;
             const std::size_t cnt = std::size_t(mat[std::size_t(s) * (std::size_t(n) + 1) + my]);
             if (cnt == 0) continue;
             check_nccl(ncclRecv(stage_tok + recv_off[std::size_t(s)] * tb, cnt * tb,
-                                ncclUint8, s, comm_, stream_), "expert_alltoall: ncclRecv tokens");
+                                ncclUint8, s, comm_, stream_), "expert_alltoall: ncclRecv tokens", comm_);
             check_nccl(ncclRecv(stage_meta + recv_off[std::size_t(s)] * sizeof(TokenMeta),
                                 cnt * sizeof(TokenMeta), ncclUint8, s, comm_, stream_),
-                       "expert_alltoall: ncclRecv meta");
+                       "expert_alltoall: ncclRecv meta", comm_);
         }
-        check_nccl(ncclGroupEnd(), "expert_alltoall: ncclGroupEnd");
+        check_nccl(ncclGroupEnd(), "expert_alltoall: ncclGroupEnd", comm_);
         sync_check();
 
         // 7. Сборка recv: блоки по возрастанию источника; локальная доставка —
@@ -472,12 +485,12 @@ public:
         const std::uint64_t sz = bytes;
         check_cuda(cudaMemcpy(kv_hdr_send_dev_, &sz, sizeof(sz), cudaMemcpyHostToDevice),
                    "kv push: H2D size");
-        check_nccl(ncclGroupStart(), "kv push: ncclGroupStart");
+        check_nccl(ncclGroupStart(), "kv push: ncclGroupStart", kv_comm_);
         check_nccl(ncclSend(kv_hdr_send_dev_, 1, ncclUint64, next_rank(), kv_comm_,
-                            kv_send_stream_), "kv push: ncclSend hdr");
+                            kv_send_stream_), "kv push: ncclSend hdr", kv_comm_);
         check_nccl(ncclSend(kv_block, bytes, ncclUint8, next_rank(), kv_comm_,
-                            kv_send_stream_), "kv push: ncclSend block");
-        check_nccl(ncclGroupEnd(), "kv push: ncclGroupEnd");
+                            kv_send_stream_), "kv push: ncclSend block", kv_comm_);
+        check_nccl(ncclGroupEnd(), "kv push: ncclGroupEnd", kv_comm_);
         check_cuda(cudaStreamSynchronize(kv_send_stream_), "kv push: sync");
     }
 
@@ -644,12 +657,12 @@ private:
         check_cuda(cudaStreamSynchronize(stream_), "nccl stream sync");
     }
     void group_sendrecv(rank_t peer, void* buf, std::size_t count, CommDType t, bool send) {
-        check_nccl(ncclGroupStart(), "ncclGroupStart");
+        check_nccl(ncclGroupStart(), "ncclGroupStart", comm_);
         if (send)
-            check_nccl(ncclSend(buf, int(count), nccl_dtype(t), peer, comm_, stream_), "ncclSend");
+            check_nccl(ncclSend(buf, int(count), nccl_dtype(t), peer, comm_, stream_), "ncclSend", comm_);
         else
-            check_nccl(ncclRecv(buf, int(count), nccl_dtype(t), peer, comm_, stream_), "ncclRecv");
-        check_nccl(ncclGroupEnd(), "ncclGroupEnd");
+            check_nccl(ncclRecv(buf, int(count), nccl_dtype(t), peer, comm_, stream_), "ncclRecv", comm_);
+        check_nccl(ncclGroupEnd(), "ncclGroupEnd", comm_);
         sync_check();
     }
 

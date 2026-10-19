@@ -102,3 +102,48 @@ TEST(p2p_retry_bench_allowed_after_pass_or_few_devices_only) {
     CHECK(!bench_allowed_after("fail:битовое равенство"));
     CHECK(!bench_allowed_after(""));
 }
+
+TEST(gpu_validation_verdict_transport_ok_expert_broken_is_fail) {
+    // Диагностическая развилка round 4: транспортная sanity (минимальные
+    // allreduce+allgather F32) подтверждает транспорт → expert-контракт
+    // не подтверждён (pending ИЛИ fail — неважно: обвязка та же) →
+    // честный FAIL, не pending (починка в потоке C).
+    CHECK(gpu_validation_verdict(kOutcomePass, "pending:ncclAllGather(counts): "
+          "unhandled cuda error") == GpuValidationVerdict::FailExpert);
+    CHECK(gpu_validation_verdict(kOutcomePass,
+          "fail:корректность expert_alltoall не подтверждена") ==
+          GpuValidationVerdict::FailExpert);
+    CHECK(gpu_validation_verdict(kOutcomePass, "") ==
+          GpuValidationVerdict::FailExpert);   // зависание expert при живом транспорте
+}
+
+TEST(gpu_validation_verdict_transport_broken_is_pending_or_fail) {
+    // Простые коллективы падают тем же 'unhandled cuda error' → транспорт/
+    // среда → честный pending (checks=0 failures=0). Подтверждённое же
+    // битовое несовпадение (fail:) на любом из тестов — честный FAIL
+    // (маскировать запрещено).
+    CHECK(gpu_validation_verdict("pending:транспортная sanity: co-tenancy/OOM",
+          "pending:ncclAllGather(counts): unhandled cuda error") ==
+          GpuValidationVerdict::Pending);
+    CHECK(gpu_validation_verdict("pending:транспорт не проверен", "") ==
+          GpuValidationVerdict::Pending);
+    CHECK(gpu_validation_verdict("pending:транспорт не проверен",
+          "fail:корректность expert_alltoall не подтверждена") ==
+          GpuValidationVerdict::FailConfirmed);
+    CHECK(gpu_validation_verdict("fail:транспортная sanity: битовое равенство нарушено",
+          "pending:expert не подтверждён") == GpuValidationVerdict::FailConfirmed);
+}
+
+TEST(gpu_validation_verdict_ok_paths) {
+    // Корректность подтверждена — Ok (транспортная sanity уже была pass);
+    // «<2 карт» — Ok (корректность неприменима; bench — по bench_allowed_after).
+    CHECK(gpu_validation_verdict(kOutcomePass, kOutcomePass) ==
+          GpuValidationVerdict::Ok);
+    CHECK(gpu_validation_verdict(kOutcomeFewDevices, kOutcomeFewDevices) ==
+          GpuValidationVerdict::Ok);
+    // Согласованность с bench_allowed_after: после Ok-вердикта с pass — bench
+    // разрешён; после Pending/Fail-вердиктов bench не запускается вовсе
+    // (оркестратор выходит до bench-фазы).
+    CHECK(bench_allowed_after(kOutcomePass));
+    CHECK(!bench_allowed_after("pending:ncclAllGather(counts): unhandled cuda error"));
+}
