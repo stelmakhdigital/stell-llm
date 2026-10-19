@@ -215,6 +215,13 @@ def real_provenance(spec: RealModelSpec, engine_lib: str, co_tenancy: bool,
         "mode": "real-model",
         "model": spec.name,
         "model_class": spec.desc.get("class"),
+        # dtype-происхождение весов (честный профиль): dtype_weights — профиль
+        # описания (определяет weights_format), dtype_orig — исходный dtype
+        # весов до конверсии ([R5] models: BF16-источник → "bf16", конверсия
+        # с clamp-сатурацией ±65504, ADR-03 round 5); пока описание не несёт
+        # поле — None (честно: поле не предоставлено, не догадки).
+        "dtype_weights": spec.desc.get("dtype_weights"),
+        "dtype_orig": spec.desc.get("dtype_orig"),
         "description": str(spec.desc_path),
         "weights": str(spec.weights_path),
         "weights_bytes": spec.weights_path.stat().st_size,
@@ -763,6 +770,34 @@ def run_gates_real_pending(reason: str) -> Tuple[List[GateResult], Dict[str, Any
     return gates, provenance
 
 
+def wall_provenance(wall_seconds: Optional[float],
+                    wall_phase: Optional[str] = None,
+                    wall_before_seconds: Optional[float] = None
+                    ) -> Dict[str, Any]:
+    """Wall-поля provenance для сравнения до/после [R1] (round 5, [R8]).
+
+    wall_seconds — wall-время прогона этой фазы (замер обёртки);
+    wall_phase — фаза относительно движковой оптимизации [R1]: "before"
+    (неоптимизированный движок, O(n²) на positions:"last") / "after"
+    (после [R1] — проекция только последней позиции);
+    wall_before_seconds — цифра фазы "before" в артефакте фазы "after"
+    (обе цифры в одном provenance — требование planner [R1]/[R8]).
+    Только переданные поля попадают в provenance (честно: не измерено —
+    не записано).
+    """
+    fields: Dict[str, Any] = {}
+    if wall_seconds is not None:
+        fields["wall_seconds"] = round(float(wall_seconds), 3)
+    if wall_phase is not None:
+        if wall_phase not in ("before", "after"):
+            raise ValueError("wall_phase: ожидалось 'before' или 'after': "
+                             f"{wall_phase}")
+        fields["wall_phase"] = wall_phase
+    if wall_before_seconds is not None:
+        fields["wall_before_seconds"] = round(float(wall_before_seconds), 3)
+    return fields
+
+
 def _protocol_snapshot() -> dict:
     """Протокол-константы прогона (детерминизм между версиями §5)."""
     return {
@@ -783,6 +818,9 @@ def _protocol_snapshot() -> dict:
                           "(повторные positions:last по растущему префиксу, "
                           "по строке логитов за вызов); иначе all одним "
                           "вызовом; математика путей идентична"),
+        "wall_measurement": ("date +%s.%N diff (обёртка run_real_gates.sh); "
+                            "wall-поля provenance: wall_seconds/wall_phase/"
+                            "wall_before_seconds — сравнение до/после [R1]"),
     }
 
 
@@ -822,6 +860,17 @@ def main(argv=None) -> int:
     parser.add_argument("--co-tenancy", action="store_true",
                         help="честная пометка co-tenancy в provenance точки "
                              "регрессии")
+    parser.add_argument("--wall-seconds", type=float, default=None,
+                        help="wall-время прогона (замер обёртки "
+                             "run_real_gates.sh, date-дифф) — в provenance")
+    parser.add_argument("--wall-phase", default=None,
+                        choices=["before", "after"],
+                        help="фаза относительно движковой оптимизации [R1]: "
+                             "before — неоптимизированный движок (O(n²) на "
+                             "positions:last), after — после [R1]")
+    parser.add_argument("--wall-before-seconds", type=float, default=None,
+                        help="wall-время прогона фазы before (для артефакта "
+                             "after: обе цифры в provenance — planner [R1])")
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src" / "bench"))
@@ -846,6 +895,8 @@ def main(argv=None) -> int:
                       "[R4] и model.safetensors); прогон — worker после "
                       "скачивания весов [R3] и hf_to_description [R4]")
             gates, provenance = run_gates_real_pending(reason)
+            provenance.update(wall_provenance(
+                args.wall_seconds, args.wall_phase, args.wall_before_seconds))
             snapshot = _GatesSnapshot(gates, extra={
                 "mode": "real-model-pending",
                 "provenance": provenance,
@@ -861,6 +912,8 @@ def main(argv=None) -> int:
                 print(f"quality-gates real: прогон не удался: {e}",
                       file=sys.stderr)
                 return 1
+            provenance.update(wall_provenance(
+                args.wall_seconds, args.wall_phase, args.wall_before_seconds))
             snapshot = _GatesSnapshot(gates, extra={
                 "mode": "live-real",
                 "provenance": provenance,
