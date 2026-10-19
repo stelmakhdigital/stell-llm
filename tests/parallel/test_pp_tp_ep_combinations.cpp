@@ -114,7 +114,7 @@ TEST(combo_pp_ep_tokens_e2e) {
         const std::size_t cap = std::size_t(slots) * std::size_t(c->world_size());
         std::vector<float> recv_t(cap);
         std::vector<TokenMeta> recv_m(cap);
-        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots,
+        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots, 1,
                            CommDType::F32);
         for (std::size_t i = 0; i < cap; ++i) {
             if (recv_m[i].expert_id < 0) continue;

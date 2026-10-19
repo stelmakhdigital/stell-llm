@@ -152,7 +152,7 @@ TEST(em_expert_alltoall_pure_ep4) {
         const std::size_t cap = std::size_t(slots) * std::size_t(ep);
         std::vector<float> recv_t(cap);
         std::vector<TokenMeta> recv_m(cap);
-        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots,
+        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots, 1,
                            CommDType::F32);
         int count = 0;
         for (std::size_t i = 0; i < cap; ++i) {
@@ -192,7 +192,7 @@ TEST(em_expert_alltoall_with_tp_fanout) {
         const std::size_t cap = std::size_t(slots) * std::size_t(world);
         std::vector<float> recv_t(cap);
         std::vector<TokenMeta> recv_m(cap);
-        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots,
+        c->expert_alltoall(send_t, send_m, recv_t.data(), recv_m.data(), slots, 1,
                            CommDType::F32);
         const rank_t ep_r = my / tp;
         std::size_t total = 0;

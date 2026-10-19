@@ -5,10 +5,17 @@
 // редукция детерминирована (порядок ранков, аккумулятор F32, см. ADR-10 §4).
 // После ошибки Timeout состояние группы не гарантируется — пересоздайте
 // группу (новый group_id); тесты это соблюдают.
+//
+// Раунд 2 (уточнения ADR-10): expert_alltoall несёт token_elems (элементов
+// dtype на токен); subgroup(ranks) возвращает под-комм только по своим ранкам
+// (перенумерация по возрастанию глобального ранка, владение у родителя);
+// нехватка recv-ёмкости — CommError(BufferTooSmall), молчаливое сокращение
+// пересылки запрещено (в т.ч. маршруты за пределы подгруппы).
 #include "stell/parallel/emulated.hpp"
 #include "stell/parallel/dtype_codec.hpp"
 #include "stell/parallel/plan.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -24,13 +31,45 @@ namespace {
 
 constexpr rank_t kMaxRanks = 64;
 
+// Рандеву коллективов: по состоянию на тип коллектива; epoch — номер
+// последней завершённой операции. Слоты буферов — по ПОЗИЦИЯМ в группе/
+// подгруппе (для полной группы позиция == глобальному ранку; для подгруппы
+// — по возрастанию глобального ранка, перенумерация ADR-10 round 2).
+struct Rendez {
+    std::mutex m;
+    std::condition_variable cv;
+    std::uint64_t epoch = 0;
+    int arrived = 0;
+    CommError::Code error = CommError::Code::NcclFailure;
+    void* bufs[kMaxRanks] = {};         // allreduce in-place | allgather send | alltoall tokens
+    void* bufs2[kMaxRanks] = {};        // allgather recv | alltoall send_meta
+    void* bufs3[kMaxRanks] = {};        // alltoall recv_tokens
+    void* bufs4[kMaxRanks] = {};        // alltoall recv_meta
+    std::size_t counts[kMaxRanks] = {}; // count | alltoall max_tokens
+    std::size_t te[kMaxRanks] = {};     // alltoall: token_elems (одинаков по ранкам)
+    std::size_t caps[kMaxRanks] = {};   // alltoall: ёмкость recv в токенах (max_tokens*n)
+};
+
+} // namespace
+
+// Состояние коллективов группы/подгруппы (ADR-10 round 2): полная группа
+// и каждая подгруппа имеют собственное состояние — коллективы подгруппы
+// не пересекаются с коллективами родителя и с другими подгруппами. Члены
+// хранятся по возрастанию глобального ранка (перенумерация подгруппы).
+struct SubgroupState {
+    std::vector<rank_t> members;
+    Rendez allreduce_r, allgather_r, alltoall_r;
+};
+
+namespace {
+
 // --- процессная группа --------------------------------------------------------
 struct GroupState {
-    std::mutex m;                     // охраняет registered/world
+    std::mutex m;                     // охраняет registered/world/subgroups
     rank_t world = 0;
     rank_t registered = 0;
 
-    // chain-каналы: ключ (src, dst) -> FIFO блоков байтов.
+    // chain-каналы: ключ (src, dst) -> FIFO блоков байтов (глобальные ранки).
     struct Chain {
         std::mutex m;
         std::condition_variable cv;
@@ -38,7 +77,7 @@ struct GroupState {
     };
     std::map<std::pair<rank_t, rank_t>, Chain*> chains;
 
-    // KV-кольца: ключ — ранок-получатель (блоки приходят от rank-1).
+    // KV-кольца: ключ — глобальный ранок-получатель (блоки приходят от rank-1).
     struct KvRing {
         std::mutex m;
         std::condition_variable cv;
@@ -47,22 +86,11 @@ struct GroupState {
     };
     std::map<rank_t, KvRing*> kv_rings;
 
-    // Рандеву коллективов: по состоянию на тип коллектива; epoch — номер
-    // последней завершённой операции. Слоты буферов — по ранкам.
-    struct Rendez {
-        std::mutex m;
-        std::condition_variable cv;
-        std::uint64_t epoch = 0;
-        int arrived = 0;
-        CommError::Code error = CommError::Code::NcclFailure;
-        void* bufs[kMaxRanks] = {};         // allreduce in-place | allgather send | alltoall tokens
-        void* bufs2[kMaxRanks] = {};        // allgather recv | alltoall send_meta
-        void* bufs3[kMaxRanks] = {};        // alltoall recv_tokens
-        void* bufs4[kMaxRanks] = {};        // alltoall recv_meta
-        std::size_t counts[kMaxRanks] = {}; // count | alltoall max_tokens
-        std::size_t caps[kMaxRanks] = {};   // alltoall: ёмкость recv (max_tokens*world)
-    };
-    Rendez allreduce_r, allgather_r, alltoall_r;
+    std::shared_ptr<SubgroupState> full;    // вся группа; создаётся в ctor GroupState
+    // Ключ — отсортированный список членов; под мьютексом m.
+    std::map<std::vector<rank_t>, std::shared_ptr<SubgroupState>> subgroups;
+
+    GroupState() : full(std::make_shared<SubgroupState>()) {}
 
     ~GroupState() {
         for (auto& kv : chains) delete kv.second;
@@ -102,12 +130,13 @@ std::shared_ptr<GroupState> get_group(int group_id) {
     return slot;
 }
 
-// Редукция по ранкам 0,1,...,world-1; аккумулятор F32; неассоциативность
-// float фиксируется этим порядком (golden-тест TP2 == TP1 опирается на него).
-float reduce_in_rank_order(GroupState::Rendez& r, rank_t world, std::size_t idx, CommDType t) {
+// Редукция по позициям 0,1,...,n-1 (для полной группы — по возрастанию
+// глобального ранка); аккумулятор F32; неассоциативность float фиксируется
+// этим порядком (golden-тест TP2 == TP1 опирается на него).
+float reduce_in_rank_order(Rendez& r, rank_t n, std::size_t idx, CommDType t) {
     const std::size_t es = dtype_size(t);
     float acc = comm_to_float(t, static_cast<std::uint8_t*>(r.bufs[0]) + idx * es);
-    for (rank_t rr = 1; rr < world; ++rr)
+    for (rank_t rr = 1; rr < n; ++rr)
         acc += comm_to_float(t, static_cast<std::uint8_t*>(r.bufs[rr]) + idx * es);
     return acc;
 }
@@ -117,7 +146,7 @@ template <class Reg, class Exec>
 // ожидания); последний прибывший исполняет exec (пишет результаты напрямую
 // в буферы всех участников — один процесс); при ошибке все получают ту же
 // CommError; при тайм-ауте ранок получает Timeout.
-void rendez_collective(GroupState::Rendez& r, rank_t /*my_rank*/, rank_t world,
+void rendez_collective(Rendez& r, rank_t /*my_rank*/, rank_t world,
                        int timeout_ms, Reg&& reg, Exec&& exec) {
     std::unique_lock<std::mutex> lk(r.m);
     const std::uint64_t my_epoch = r.epoch;
@@ -149,13 +178,59 @@ void rendez_collective(GroupState::Rendez& r, rank_t /*my_rank*/, rank_t world,
         throw CommError(r.error, "collective failed on this rank");
 }
 
+// Валидация списка членов подгруппы: уникальные глобальные ранки из текущего
+// состава, содержащие собственный ранок my_global. Возвращает отсортированный
+// список. Бросает CommError(RankMismatch).
+std::vector<rank_t> validated_members(const std::vector<rank_t>& ranks,
+                                      const std::vector<rank_t>& cur_members,
+                                      rank_t my_global) {
+    std::vector<rank_t> sorted = ranks;
+    std::sort(sorted.begin(), sorted.end());
+    const auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+    if (dup != sorted.end())
+        throw CommError(CommError::Code::RankMismatch, "subgroup: повторяющиеся ранки");
+    for (rank_t r : sorted) {
+        if (r < 0)
+            throw CommError(CommError::Code::RankMismatch, "subgroup: ранок вне world");
+        if (!std::binary_search(cur_members.begin(), cur_members.end(), r))
+            throw CommError(CommError::Code::RankMismatch,
+                            "subgroup: ранок не входит в текущий комм");
+    }
+    if (!std::binary_search(sorted.begin(), sorted.end(), my_global))
+        throw CommError(CommError::Code::RankMismatch,
+                        "subgroup: собственный ранок не входит в подгруппу");
+    return sorted;
+}
+
 } // namespace
 
 // --- EmulatedCommunicator ------------------------------------------------------
 
 struct EmulatedCommunicator::Impl {
-    ParallelConfig cfg;
-    std::shared_ptr<GroupState> g;
+    ParallelConfig cfg;                                // родительская топология (мир, таймауты)
+    std::shared_ptr<GroupState> g;                     // состояние процессной группы
+    std::shared_ptr<SubgroupState> rs;                 // коллективы: вся группа или подгруппа
+    std::vector<rank_t> members;                       // глобальные ранки-участники (по возрастанию)
+    rank_t my_pos = 0;                                 // позиция данного инстанса в members
+    std::vector<rank_t> pos_of;                        // глобальный ранок -> позиция (или -1)
+    // Владение под-коммами у родителя (ADR-10 round 2): живут в деструкторе
+    // родителя; повторный subgroup() с тем же ranks возвращает тот же объект.
+    std::map<std::vector<rank_t>, std::unique_ptr<EmulatedCommunicator>> owned_subs;
+
+    rank_t sub_world() const { return rank_t(members.size()); }
+    rank_t my_global() const { return members[std::size_t(my_pos)]; }
+    // Позиция глобального ранка d в подгруппе; -1 — не член (для полной группы
+    // всегда >= 0 в пределах world).
+    rank_t position_of(rank_t d) const {
+        if (std::size_t(d) >= pos_of.size()) return -1;
+        return pos_of[std::size_t(d)];
+    }
+    rank_t resolve_peer(rank_t peer) const {
+        if (peer < 0 || peer >= sub_world())
+            throw CommError(CommError::Code::RankMismatch,
+                            "peer вне подгруппы (перенумерация ADR-10 round 2)");
+        return members[std::size_t(peer)];
+    }
 };
 
 EmulatedCommunicator::EmulatedCommunicator(const ParallelConfig& cfg) : impl_(new Impl) {
@@ -170,6 +245,7 @@ EmulatedCommunicator::EmulatedCommunicator(const ParallelConfig& cfg) : impl_(ne
                         "CPU-эмулятор ограничен 64 ранками (kMaxRanks)");
     impl_->cfg = cfg;
     impl_->g = get_group(cfg.group_id);
+    impl_->rs.reset();   // заполнится ниже (full)
     GroupState& g = *impl_->g;
     std::lock_guard<std::mutex> lk(g.m);
     if (g.registered == 0) g.world = cfg.world();
@@ -177,56 +253,80 @@ EmulatedCommunicator::EmulatedCommunicator(const ParallelConfig& cfg) : impl_(ne
         throw CommError(CommError::Code::RankMismatch,
                         "world не совпал с ранее зарегистрированной группой (group_id)");
     ++g.registered;
+    // Полная группа: члены 0..world-1, позиция == глобальному ранку.
+    impl_->rs = g.full;
+    for (rank_t r = 0; r < cfg.world(); ++r) impl_->members.push_back(r);
+    impl_->my_pos = cfg.rank;
+    impl_->pos_of.assign(std::size_t(cfg.world()), 0);
+    for (rank_t r = 0; r < cfg.world(); ++r) impl_->pos_of[std::size_t(r)] = r;
+}
+
+EmulatedCommunicator::EmulatedCommunicator(const ParallelConfig& cfg,
+                                           const std::vector<rank_t>& members,
+                                           rank_t my_pos,
+                                           const std::shared_ptr<SubgroupState>& rs)
+    : impl_(new Impl) {
+    impl_->cfg = cfg;
+    impl_->g = get_group(cfg.group_id);
+    impl_->rs = rs;
+    impl_->members = members;
+    impl_->my_pos = my_pos;
+    // pos_of: глобальный ранок -> позиция в members (остальное — -1).
+    rank_t maxr = 0;
+    for (rank_t r : members) maxr = std::max(maxr, rank_t(r + 1));
+    impl_->pos_of.assign(std::size_t(maxr), -1);
+    for (std::size_t i = 0; i < members.size(); ++i)
+        impl_->pos_of[members[i]] = rank_t(i);
 }
 
 EmulatedCommunicator::~EmulatedCommunicator() = default;
 
-rank_t EmulatedCommunicator::world_size() const { return impl_->cfg.world(); }
-rank_t EmulatedCommunicator::rank() const { return impl_->cfg.rank; }
+rank_t EmulatedCommunicator::world_size() const { return impl_->sub_world(); }
+rank_t EmulatedCommunicator::rank() const { return impl_->my_pos; }
 
 void EmulatedCommunicator::allreduce(void* buf, std::size_t count, CommDType t) {
-    GroupState& g = *impl_->g;
-    GroupState::Rendez& r = g.allreduce_r;
-    const rank_t world = impl_->cfg.world(), my = impl_->cfg.rank;
+    SubgroupState& rs = *impl_->rs;
+    Rendez& r = rs.allreduce_r;
+    const rank_t n = impl_->sub_world(), my = impl_->my_pos;
     rendez_collective(
-        r, my, world, impl_->cfg.timeout_ms,
+        r, my, n, impl_->cfg.timeout_ms,
         [&](std::unique_lock<std::mutex>&) {
             r.bufs[my] = buf;
             r.counts[my] = count;
         },
         [&] {
-            for (rank_t q = 0; q < world; ++q)
+            for (rank_t q = 0; q < n; ++q)
                 if (r.counts[q] != count)
                     throw CommError(CommError::Code::RankMismatch,
                                     "allreduce: count не одинаков по ранкам");
             const std::size_t es = dtype_size(t);
             for (std::size_t i = 0; i < count; ++i) {
-                const float acc = reduce_in_rank_order(r, world, i, t);
-                for (rank_t d = 0; d < world; ++d)
+                const float acc = reduce_in_rank_order(r, n, i, t);
+                for (rank_t d = 0; d < n; ++d)
                     comm_store_float(t, static_cast<std::uint8_t*>(r.bufs[d]) + i * es, acc);
             }
         });
 }
 
 void EmulatedCommunicator::allgather(void* send, void* recv, std::size_t count, CommDType t) {
-    GroupState& g = *impl_->g;
-    GroupState::Rendez& r = g.allgather_r;
-    const rank_t world = impl_->cfg.world(), my = impl_->cfg.rank;
+    SubgroupState& rs = *impl_->rs;
+    Rendez& r = rs.allgather_r;
+    const rank_t n = impl_->sub_world(), my = impl_->my_pos;
     rendez_collective(
-        r, my, world, impl_->cfg.timeout_ms,
+        r, my, n, impl_->cfg.timeout_ms,
         [&](std::unique_lock<std::mutex>&) {
             r.bufs[my] = send;
             r.bufs2[my] = recv;
             r.counts[my] = count;
         },
         [&] {
-            for (rank_t q = 0; q < world; ++q)
+            for (rank_t q = 0; q < n; ++q)
                 if (r.counts[q] != count)
                     throw CommError(CommError::Code::RankMismatch,
                                     "allgather: count не одинаков по ранкам");
             const std::size_t es = dtype_size(t);
-            for (rank_t d = 0; d < world; ++d)
-                for (rank_t s = 0; s < world; ++s)
+            for (rank_t d = 0; d < n; ++d)
+                for (rank_t s = 0; s < n; ++s)
                     std::memcpy(static_cast<std::uint8_t*>(r.bufs2[d]) +
                                     std::size_t(s) * count * es,
                                 r.bufs[s], count * es);
@@ -235,34 +335,46 @@ void EmulatedCommunicator::allgather(void* send, void* recv, std::size_t count, 
 
 void EmulatedCommunicator::expert_alltoall(
     void* send_tokens, void* send_meta, void* recv_tokens, void* recv_meta,
-    std::size_t max_tokens, CommDType t) {
-    GroupState& g = *impl_->g;
-    GroupState::Rendez& r = g.alltoall_r;
-    const rank_t world = impl_->cfg.world(), my = impl_->cfg.rank;
-    const ParallelConfig cfg = impl_->cfg;
+    std::size_t max_tokens, std::size_t token_elems, CommDType t) {
+    if (token_elems == 0)
+        throw CommError(CommError::Code::RankMismatch,
+                        "expert_alltoall: token_elems должен быть > 0");
+    SubgroupState& rs = *impl_->rs;
+    Rendez& r = rs.alltoall_r;
+    const rank_t n = impl_->sub_world(), my = impl_->my_pos;
+    const ParallelConfig cfg = impl_->cfg;      // маршрутизация — по родительской топологии
+    const auto& members = impl_->members;
     const std::size_t es = dtype_size(t);
     rendez_collective(
-        r, my, world, impl_->cfg.timeout_ms,
+        r, my, n, impl_->cfg.timeout_ms,
         [&](std::unique_lock<std::mutex>&) {
             r.bufs[my] = send_tokens;
             r.bufs2[my] = send_meta;
             r.bufs3[my] = recv_tokens;
             r.bufs4[my] = recv_meta;
             r.counts[my] = max_tokens;
-            r.caps[my] = max_tokens * std::size_t(world);
+            r.te[my] = token_elems;
+            r.caps[my] = max_tokens * std::size_t(n);   // ёмкость recv в токенах
         },
         [&] {
-            for (rank_t q = 0; q < world; ++q)
+            for (rank_t q = 0; q < n; ++q) {
                 if (r.counts[q] != max_tokens)
                     throw CommError(CommError::Code::RankMismatch,
                                     "expert_alltoall: max_tokens не одинаков по ранкам");
-            // Входящие на каждый ранок: список (байты токена, метка) в порядке
-            // (ранок-источник ↑, индекс ↑) — детерминировано.
+                if (r.te[q] != token_elems)
+                    throw CommError(CommError::Code::RankMismatch,
+                                    "expert_alltoall: token_elems не одинаков по ранкам");
+            }
+            // Входящие на каждую позицию: список (байты токена, метка) в порядке
+            // (ранок-источник ↑, индекс ↑) — детерминировано. Маршрутизация —
+            // по РОДИТЕЛЬСКОЙ топологии (глобальные ранки); позиция назначения
+            // ищется в составе подгруппы.
             std::vector<std::uint8_t> in_tokens[static_cast<std::size_t>(kMaxRanks)];
             std::vector<TokenMeta> in_meta[static_cast<std::size_t>(kMaxRanks)];
-            for (rank_t s = 0; s < world; ++s) {
+            for (rank_t p = 0; p < n; ++p) {
+                const rank_t s = members[std::size_t(p)];
                 const RankDecomp sd = decompose_rank(s, cfg);
-                auto* meta = static_cast<TokenMeta*>(r.bufs2[s]);
+                auto* meta = static_cast<TokenMeta*>(r.bufs2[p]);
                 for (std::size_t i = 0; i < max_tokens; ++i) {
                     const std::int32_t eid = meta[i].expert_id;
                     if (eid < 0) continue;                   // пустой слот — не отправляется
@@ -270,32 +382,44 @@ void EmulatedCommunicator::expert_alltoall(
                     expert_alltoall_route(rank_t(eid), sd.pp_rank, cfg, dst);
                     for (rank_t k = 0; k < cfg.tp; ++k) {
                         const rank_t d = dst[k];
-                        if (d >= world)
+                        if (d < 0 || d >= cfg.world())
                             throw CommError(CommError::Code::RankMismatch, "route вне world");
+                        const rank_t dpos = impl_->position_of(d);
+                        if (dpos < 0)
+                            // Маршрут уходит за пределы подгруппы: приёмник не
+                            // входит в состав — входящий поток не помещается в
+                            // recv-ёмкость подгруппы. Молчаливое сокращение
+                            // пересылки запрещено (ADR-10, round 2).
+                            throw CommError(CommError::Code::BufferTooSmall,
+                                            "expert_alltoall: маршрут вне подгруппы "
+                                            "(recv-ёмкость подгруппы не покрывает поток)");
                         const std::uint8_t* tok =
-                            static_cast<std::uint8_t*>(r.bufs[s]) + i * es;
-                        in_tokens[d].insert(in_tokens[d].end(), tok, tok + es);
-                        in_meta[d].push_back(meta[i]);
+                            static_cast<std::uint8_t*>(r.bufs[p]) + i * token_elems * es;
+                        in_tokens[dpos].insert(in_tokens[dpos].end(), tok,
+                                               tok + token_elems * es);
+                        in_meta[dpos].push_back(meta[i]);
                     }
                 }
             }
-            // Запись в recv-буферы: входящие, затем заполнение TokenMeta{-1}.
-            for (rank_t d = 0; d < world; ++d) {
-                const std::size_t cap = r.caps[d];
-                if (in_meta[d].size() > cap)
+            // Запись в recv-буферы: входящие токены (token_elems элементов
+            // каждый), затем заполнение нулями и TokenMeta{-1}.
+            for (rank_t p = 0; p < n; ++p) {
+                const std::size_t cap = r.caps[p];
+                if (in_meta[p].size() > cap)
                     throw CommError(CommError::Code::BufferTooSmall,
                                     "expert_alltoall: recv-ёмкость меньше входящего потока");
-                auto* rt = static_cast<std::uint8_t*>(r.bufs3[d]);
-                auto* rm = static_cast<TokenMeta*>(r.bufs4[d]);
+                auto* rt = static_cast<std::uint8_t*>(r.bufs3[p]);
+                auto* rm = static_cast<TokenMeta*>(r.bufs4[p]);
+                const std::size_t tb = token_elems * es;
                 std::size_t off = 0;
-                for (std::size_t i = 0; i < in_meta[d].size(); ++i) {
-                    std::memcpy(rt + off, in_tokens[d].data() + i * es, es);
-                    off += es;
-                    rm[i] = in_meta[d][i];
+                for (std::size_t i = 0; i < in_meta[p].size(); ++i) {
+                    std::memcpy(rt + off, in_tokens[p].data() + i * tb, tb);
+                    off += tb;
+                    rm[i] = in_meta[p][i];
                 }
-                for (std::size_t i = in_meta[d].size(); i < cap; ++i) {
-                    std::memset(rt + off, 0, es);
-                    off += es;
+                for (std::size_t i = in_meta[p].size(); i < cap; ++i) {
+                    std::memset(rt + off, 0, tb);
+                    off += tb;
                     rm[i] = TokenMeta{};                     // expert_id = -1
                 }
             }
@@ -304,11 +428,12 @@ void EmulatedCommunicator::expert_alltoall(
 
 void EmulatedCommunicator::chain_send(void* buf, std::size_t count, CommDType t, rank_t peer) {
     GroupState& g = *impl_->g;
-    const rank_t my = impl_->cfg.rank;
-    if (peer < 0 || peer >= impl_->cfg.world() || peer == my)
+    const rank_t my = impl_->my_global();
+    const rank_t dst = impl_->resolve_peer(peer);
+    if (dst == my)
         throw CommError(CommError::Code::RankMismatch, "chain_send: неверный peer");
     const std::size_t bytes = count * dtype_size(t);
-    GroupState::Chain& ch = g.chain(my, peer);
+    GroupState::Chain& ch = g.chain(my, dst);
     std::vector<std::uint8_t> data(bytes);
     std::memcpy(data.data(), buf, bytes);
     {
@@ -320,10 +445,11 @@ void EmulatedCommunicator::chain_send(void* buf, std::size_t count, CommDType t,
 
 void EmulatedCommunicator::chain_recv(void* buf, std::size_t count, CommDType t, rank_t peer) {
     GroupState& g = *impl_->g;
-    const rank_t my = impl_->cfg.rank;
-    if (peer < 0 || peer >= impl_->cfg.world() || peer == my)
+    const rank_t my = impl_->my_global();
+    const rank_t src = impl_->resolve_peer(peer);
+    if (src == my)
         throw CommError(CommError::Code::RankMismatch, "chain_recv: неверный peer");
-    GroupState::Chain& ch = g.chain(peer, my);
+    GroupState::Chain& ch = g.chain(src, my);
     const std::size_t bytes = count * dtype_size(t);
     std::unique_lock<std::mutex> lk(ch.m);
     const auto deadline = std::chrono::steady_clock::now() +
@@ -340,8 +466,8 @@ void EmulatedCommunicator::chain_recv(void* buf, std::size_t count, CommDType t,
 
 void EmulatedCommunicator::kv_stream_push(const void* kv_block, std::size_t bytes) {
     GroupState& g = *impl_->g;
-    const rank_t my = impl_->cfg.rank;
-    const rank_t dst = rank_t((my + 1) % std::size_t(impl_->cfg.world()));
+    const rank_t n = impl_->sub_world();
+    const rank_t dst = impl_->members[std::size_t((impl_->my_pos + 1) % n)];
     GroupState::KvRing& ring =
         g.kv_ring(dst, impl_->cfg.kv_ring_capacity ? impl_->cfg.kv_ring_capacity : 16);
     std::unique_lock<std::mutex> lk(ring.m);
@@ -361,7 +487,7 @@ bool EmulatedCommunicator::kv_stream_pop(void* dst, std::size_t bytes) {
     // Ёмкость кольца задаётся симметрично (kv_ring_capacity обоих ранков):
     // кто первым создаст кольцо (push/pop), тот и фиксирует ёмкость.
     GroupState::KvRing& ring =
-        g.kv_ring(impl_->cfg.rank,
+        g.kv_ring(impl_->my_global(),
                   impl_->cfg.kv_ring_capacity ? impl_->cfg.kv_ring_capacity : 16);
     std::lock_guard<std::mutex> lk(ring.m);
     if (ring.q.empty()) return false;
@@ -371,6 +497,29 @@ bool EmulatedCommunicator::kv_stream_pop(void* dst, std::size_t bytes) {
     ring.q.pop_front();
     ring.cv.notify_all();
     return true;
+}
+
+ICommunicator* EmulatedCommunicator::subgroup(const std::vector<rank_t>& ranks) {
+    GroupState& g = *impl_->g;
+    const rank_t my_global = impl_->my_global();
+    const std::vector<rank_t> sorted =
+        validated_members(ranks, impl_->members, my_global);
+    // Владение у родителя (ADR-10 round 2): под-комм хранится в родителе,
+    // удаляется его деструктором; повторный вызов с тем же ranks возвращает
+    // ТОТ ЖЕ под-комм.
+    auto& slot = impl_->owned_subs[sorted];
+    if (!slot) {
+        std::lock_guard<std::mutex> lk(g.m);
+        auto& st = g.subgroups[sorted];
+        if (!st) {
+            st = std::make_shared<SubgroupState>();
+            st->members = sorted;
+        }
+        const rank_t my_pos = rank_t(std::find(sorted.begin(), sorted.end(), my_global) -
+                                     sorted.begin());
+        slot.reset(new EmulatedCommunicator(impl_->cfg, sorted, my_pos, st));
+    }
+    return slot.get();
 }
 
 } // namespace stell::parallel

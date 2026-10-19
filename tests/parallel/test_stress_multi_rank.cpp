@@ -158,7 +158,7 @@ TEST(stress_alltoall_ep4_many_tokens_order) {
         std::vector<float> recv(cap);
         std::vector<TokenMeta> rm(cap);
         comm->expert_alltoall(toks.data(), meta.data(), recv.data(), rm.data(),
-                              SLOTS, CommDType::F32);
+                              SLOTS, 1, CommDType::F32);
         // Порядок входящих: источник ↑ внутри индекс ↑; проверяем, что входящие
         // на ранок d = все (s,i) с expert_id%4==d, отсортированные по (s,i).
         std::size_t idx = 0;
@@ -180,14 +180,13 @@ TEST(stress_alltoall_ep4_many_tokens_order) {
 }
 
 TEST(stress_alltoall_recv_capacity_worst_case_invariant) {
-    // Контракт (comm.hpp): ёмкость recv = max_tokens * world. При fan-out TP
-    // каждый токен доставляется ровно один раз на каждый tp-ранок группы-
-    // владельца → inflow на ранок ≤ world * max_tokens = ёмкость, причём
-    // worst-case (все токены в одну EP-группу) даёт inflow == ёмкость РОВНО.
-    // Вывод (см. отчёт раунда 2): CommError(BufferTooSmall) для expert_alltoall
-    // НЕДОСТИЖИМ при контрактной ёмкости — защитная ветвь эмулятора мертва;
-    // контракт требует ревизии (ёмкость = max_tokens*world избыточна для
-    // fan-out ≤ tp). Здесь фиксируем worst-case: успех, точные количества.
+    // Контракт (comm.hpp): ёмкость recv = max_tokens * world ТОКЕНОВ. При
+    // fan-out TP inflow на ранок ≤ world*max_tokens = ёмкость, причём worst-case
+    // (все токены в одну EP-группу) даёт inflow == ёмкость РОВНО: при контрактной
+    // ёмкости полной группы CommError(BufferTooSmall) НЕДОСТИЖИМ (инвариант:
+    // inflow(d) ≤ Σ_s max_tokens). Достижимая ветвь ошибки — подгруппа: маршруты
+    // за пределы её состава (см. test_subgroup_token_width.cpp) — раунд 2. Здесь
+    // фиксируем worst-case: успех, точные количества.
     constexpr int SLOTS = 16;
     constexpr std::size_t CAP = std::size_t(SLOTS) * 4;   // max_tokens*world
     SafeFlag ok;
@@ -206,7 +205,7 @@ TEST(stress_alltoall_recv_capacity_worst_case_invariant) {
                 toks[i] = stress_value(rc.rank, i, 0);
             }
             comm->expert_alltoall(toks.data(), meta.data(), recv.data(),
-                                  rm.data(), SLOTS, CommDType::F32);
+                                  rm.data(), SLOTS, 1, CommDType::F32);
             // Ранки 0/1 (EP-группа 0): ровно 4 источника × 16 токенов = 64.
             if (rc.rank <= 1) {
                 int inflow = 0;
@@ -384,7 +383,7 @@ TEST(stress_world_2_all_collectives_smoke) {
         TokenMeta m[8], rm[16];
         float t8[8], r8[16];
         for (int i = 0; i < 8; ++i) m[i] = TokenMeta{std::int32_t(i % 2), i};
-        comm->expert_alltoall(t8, m, r8, rm, 8, CommDType::F32);
+        comm->expert_alltoall(t8, m, r8, rm, 8, 1, CommDType::F32);
         if (rc.rank == 0) {
             comm->chain_send(ar, 8, CommDType::F32, 1);   // ar после allreduce = 2*i
         } else {

@@ -48,9 +48,10 @@
 //     rmsnorm, attention, moe_gather_scatter);
 //  A8 mini_moe не содержит head-группу — выходные логиты = embed·nf
 //     (tied embeddings);
-//  A3b expert_alltoall переносит max_tokens ЭЛЕМЕНТОВ dtype (скаляры):
-//     d_model-вектор гонится поэлементно с кодированием позиции в slot_id —
-//     контракт не параметризует ширину токена (открытый вопрос, в отчёт).
+//  A3b expert_alltoall: токен = token_elems ЭЛЕМЕНТОВ dtype (уточнение ADR-10
+//     round 2): EP-сценарий гонит ЦЕЛЫЕ векторы d_model (token_elems = dm),
+//     мета — одна на токен (slot_id кодирует пару источник,(t,j));
+//     скалярная семантика token_elems=1 покрыта юнит-тестами эмулятора.
 #include "test_harness.hpp"
 #include "stell/parallel/dtype_codec.hpp"
 #include "stell/parallel/emulated.hpp"
@@ -480,80 +481,70 @@ void forward(const Ctx& c, std::vector<float>& logits /* T*vocab */) {
                     for (int i = 0; i < dm; ++i) x[t][i] += y[t][i];
             } else {
                 // EP: два прохода expert_alltoall (gather → FFN у владельца →
-                // scatter назад). Токен = d_model скаляров (A3b): один вызов
-                // переносит max_tokens ЭЛЕМЕНТОВ dtype; max_tokens = T*k*dm.
-                const int slots = T * kKTop * dm;                     // 64
-                const std::size_t cap = std::size_t(slots) * std::size_t(c.world);
-                std::vector<float> send(slots), recv(cap);
-                std::vector<TokenMeta> smeta(slots), rmeta(cap);
-                const int my_ep = int(c.rank % c.ep);                 // tp=1 (A3b-сценарий)
+                // scatter назад). Токен = ЦЕЛЫЙ вектор d_model (token_elems = dm,
+                // уточнение ADR-10 round 2): max_tokens = T*k токенов, мета —
+                // одна на токен (slot_id кодирует пару (источник, t, j)).
+                const int ntok = T * kKTop;
+                const std::size_t cap = std::size_t(ntok) * std::size_t(c.world); // в токенах
+                std::vector<float> send(std::size_t(ntok) * dm),
+                    recv(cap * std::size_t(dm));
+                std::vector<TokenMeta> smeta(ntok), rmeta(cap);
+                const int my_ep = int(c.rank % c.ep);                 // tp=1 (EP2-сценарий)
+                std::memset(send.data(), 0, send.size() * sizeof(float));
                 for (int t = 0; t < T; ++t)
                     for (int j = 0; j < kKTop; ++j) {
+                        const int idx = t * kKTop + j;
                         const int e = ids[t][j];
                         const int owner = int(expert_owner(rank_t(e), rank_t(c.ep)));
                         const bool remote = owner != my_ep;
-                        for (int dd = 0; dd < dm; ++dd) {
-                            const int idx = (t * kKTop + j) * dm + dd;
-                            const std::int32_t enc = std::int32_t(c.rank) * 64 +
-                                                     t * 16 + j * 8 + dd;      // A3
-                            if (remote) {
-                                smeta[idx] = TokenMeta{std::int32_t(e), enc};
-                                send[idx] = x[t][dd];
-                            } else {
-                                smeta[idx] = TokenMeta{-1, -1};   // не отправляется
-                                send[idx] = 0.f;
-                            }
+                        // slot_id: база пары (источник ↑, t, j) — позиция dd
+                        // внутри токена не нужна (токен целый).
+                        const std::int32_t enc = std::int32_t(c.rank) * 64 +
+                                                 t * 16 + j * 8;              // A3
+                        if (remote) {
+                            smeta[idx] = TokenMeta{std::int32_t(e), enc};
+                            for (int dd = 0; dd < dm; ++dd) send[idx * dm + dd] = x[t][dd];
+                        } else {
+                            smeta[idx] = TokenMeta{-1, -1};   // не отправляется
                         }
                     }
                 // --- проход 1: gather к владельцам (все ранки — коллективно) ---
                 c.comm->expert_alltoall(send.data(), smeta.data(), recv.data(),
-                                        rmeta.data(), std::size_t(slots), CommDType::F32);
-                // Владелец: восстановление скрытых состояний по enc (ключ пары
-                // = enc без позиции скаляра: enc = src*64 + t*16 + j*8 + dd),
+                                        rmeta.data(), std::size_t(ntok), std::size_t(dm),
+                                        CommDType::F32);
+                // Владелец: восстановление не нужно — входящий токен ГОТОВЫЙ
+                // вектор d_model (ключ пары = enc: enc = src*64 + t*16 + j*8);
                 // FFN своего эксперта, отправка назад (eid = исходный ранок, A3).
-                struct InTok { float h[8]; int e; int got; };
-                std::map<std::int32_t, InTok> in;    // ключ пары (t,j) → скаляры
+                struct InTok { float h[8]; int e; };   // dm=8 в фикстурах mini_moe
+                std::map<std::int32_t, InTok> in;      // ключ пары (src,t,j) → токен
                 for (std::size_t i = 0; i < cap; ++i) {
                     if (rmeta[i].expert_id < 0) continue;
-                    const std::int32_t enc = rmeta[i].slot_id;
-                    const std::int32_t key = enc - (enc % 8);      // пара (src,t,j)
+                    const std::int32_t key = rmeta[i].slot_id;
                     InTok& r = in[key];
                     r.e = rmeta[i].expert_id;
-                    r.h[enc % 8] = recv[i];
-                    ++r.got;
+                    for (int dd = 0; dd < dm; ++dd) r.h[dd] = recv[i * dm + dd];
                 }
-                std::vector<float> send2(slots);
-                std::vector<TokenMeta> smeta2(slots);
+                std::vector<float> send2(std::size_t(ntok) * dm, 0.f);
+                std::vector<TokenMeta> smeta2(ntok, TokenMeta{-1, -1});
                 {
                     int idx = 0;
                     for (const auto& [key, r] : in) {
                         (void)key;
-                        if (r.got != dm) {
-                            // Неполный вектор — не может быть (контракт гарантирует
-                            // доставку всех скаляров пары владельцу); защита.
-                            for (int dd = 0; dd < dm; ++dd) {
-                                send2[idx] = 0.f;
-                                smeta2[idx] = TokenMeta{-1, -1};
-                                ++idx;
-                            }
-                            continue;
-                        }
                         const std::int32_t src = key / 64;
                         float eout[8];
                         expert_ffn(d, w, layer, r.e, r.h, eout);
-                        for (int dd = 0; dd < dm; ++dd) {
-                            send2[idx] = eout[dd];
-                            smeta2[idx] = TokenMeta{src, key + dd};
-                            ++idx;
-                        }
+                        for (int dd = 0; dd < dm; ++dd) send2[idx * dm + dd] = eout[dd];
+                        smeta2[idx] = TokenMeta{src, key};
+                        ++idx;
                     }
-                    for (int i = idx; i < slots; ++i) smeta2[i] = TokenMeta{-1, -1};
+                    // Хвост — пустые слоты (не отправляется; send2 уже обнулён).
                 }
                 // --- проход 2: scatter назад к «домашним» ранкам ---
-                std::vector<float> recv2(cap);
+                std::vector<float> recv2(cap * std::size_t(dm), 0.f);
                 std::vector<TokenMeta> rmeta2(cap);
                 c.comm->expert_alltoall(send2.data(), smeta2.data(), recv2.data(),
-                                        rmeta2.data(), std::size_t(slots), CommDType::F32);
+                                        rmeta2.data(), std::size_t(ntok), std::size_t(dm),
+                                        CommDType::F32);
                 // Сборка e_out по (t, j): локальные + полученные; порядок j ↑.
                 float eo[8][8];
                 std::int32_t eid[T][kKTop];
@@ -572,8 +563,9 @@ void forward(const Ctx& c, std::vector<float>& logits /* T*vocab */) {
                 for (std::size_t i = 0; i < cap; ++i) {
                     if (rmeta2[i].expert_id < 0) continue;
                     const std::int32_t enc = rmeta2[i].slot_id;
-                    const int t = (enc / 16) % 4, j = (enc / 8) % 2, dd = enc % 8;
-                    eo[std::size_t(t) * kKTop + j][dd] = recv2[i];
+                    const int t = (enc / 16) % 4, j = (enc / 8) % 2;   // dd = позиция в токене
+                    for (int dd = 0; dd < dm; ++dd)
+                        eo[std::size_t(t) * kKTop + j][dd] = recv2[i * dm + dd];
                 }
                 float y[T][8] = {};
                 moe_scatter_add(&eo[0][0], &eid[0][0], &epr[0][0], T, kKTop, dm, &y[0][0]);
