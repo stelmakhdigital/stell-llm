@@ -1,0 +1,96 @@
+{
+  "pending": false,
+  "gates": [
+    {
+      "gate": "quality-gate",
+      "dataset": "ppl_fixed_text[tiny-qwen2moe]",
+      "pending": false,
+      "value": 157819.7397,
+      "unit": "ppl",
+      "items": 127,
+      "notes": [
+        "модель=tiny-qwen2moe",
+        "источник логитов=abi:stell_logits",
+        "режим PPL: incremental-last (teacher-forcing по позициям, повторные positions:last по растущему префиксу, по строке за вызов; vocab=151646 × позиций=128 > порога 2000000 элементов; чанки all с окном контекста некорректны каузально — ABI не имеет смещения контекста; математика та же: rows[i]=logits_last(tokens[:i+1]), значения путей совпадают)",
+        "токенов=128 (первые 128 фиксированного текста, проекция байта → токен b % vocab, vocab=151646; механический базовый референс, а не языковая PPL)",
+        "mean_nll=11.969209"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "gsm8k_32[tiny-qwen2moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=tiny-qwen2moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "humaneval_32[tiny-qwen2moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=tiny-qwen2moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    }
+  ],
+  "mode": "live-real",
+  "provenance": {
+    "mode": "real-model",
+    "model": "tiny-qwen2moe",
+    "model_class": "moe",
+    "dtype_weights": "F16",
+    "dtype_orig": "f32",
+    "description": "/home/arkalaust/models/tiny-qwen2moe/description.json",
+    "weights": "/home/arkalaust/models/tiny-qwen2moe/model.safetensors",
+    "weights_bytes": 38992656,
+    "weights_format": "safetensors",
+    "vocab_size": 151646,
+    "n_layers": 2,
+    "n_experts": 8,
+    "tokenizer_json": null,
+    "tokenization": "проекция байта → токен b % vocab (tokenizer.json в каталоге отсутствует)",
+    "ppl_mode": "incremental-last",
+    "date_utc": "2026-10-19T16:47:11+00:00",
+    "co_tenancy": true,
+    "engine_lib": "/home/arkalaust/Code/stell-llm/build/cpu/src/engine/libstell_core.so",
+    "logits_source": "abi:stell_logits",
+    "wall_phase": "after",
+    "wall_before_seconds": 281.959,
+    "wall_seconds": 331.308
+  },
+  "protocol": {
+    "ppl_max_tokens": 128,
+    "gsm8k_prompt_tokens": 64,
+    "gsm8k_max_steps": 16,
+    "humaneval_prompt_tokens": 64,
+    "humaneval_max_steps": 32,
+    "humaneval_sandbox": {
+      "class": "process-sandbox (НЕ security-граница)",
+      "rlimit_cpu_s": 5,
+      "wall_timeout_s": 10,
+      "rlimit_as_bytes": 536870912,
+      "rlimit_nofile": 64,
+      "env": "пустой",
+      "cwd": "изолированный temp-dir"
+    },
+    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)",
+    "ppl_all_max_elements": 2000000,
+    "ppl_mode_rule": "n_vocab × n_positions > порога → incremental-last (повторные positions:last по растущему префиксу, по строке логитов за вызов); иначе all одним вызовом; математика путей идентична",
+    "wall_measurement": "date +%s.%N diff (обёртка run_real_gates.sh); wall-поля provenance: wall_seconds/wall_phase/wall_before_seconds — сравнение до/после [R1]"
+  }
+}
