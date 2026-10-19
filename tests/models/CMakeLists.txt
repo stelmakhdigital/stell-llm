@@ -20,6 +20,7 @@ add_executable(test_models_golden_logits golden/golden_logits.cpp)
 add_executable(test_models_golden_fixtures test_golden_fixtures.cpp)
 add_executable(test_models_gguf_description test_gguf_description.cpp)
 add_executable(test_models_gguf_mixtral test_gguf_mixtral.cpp)
+add_executable(test_models_tokenizer test_tokenizer.cpp)
 
 foreach(t
     test_models_json
@@ -32,7 +33,8 @@ foreach(t
     test_models_golden_logits
     test_models_golden_fixtures
     test_models_gguf_description
-    test_models_gguf_mixtral)
+    test_models_gguf_mixtral
+    test_models_tokenizer)
     target_include_directories(${t} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/models/include
         ${_models_src_dir}
@@ -60,3 +62,4 @@ add_test(NAME models_golden_logits COMMAND test_models_golden_logits)
 add_test(NAME models_golden_fixtures COMMAND test_models_golden_fixtures)
 add_test(NAME models_gguf_description COMMAND test_models_gguf_description)
 add_test(NAME models_gguf_mixtral COMMAND test_models_gguf_mixtral)
+add_test(NAME models_tokenizer COMMAND test_models_tokenizer)

@@ -20,6 +20,7 @@ target_sources(stell_models PRIVATE
     src/loader_stelltier.cpp
     src/weights_factory.cpp
     src/converter.cpp
+    src/tokenizer.cpp
 )
 
 target_include_directories(stell_models
@@ -30,6 +31,12 @@ target_include_directories(stell_models
 # Round 2: реальный stell/tiers/types.hpp (поток B, ADR-08 §1) — зеркало
 # tiers_compat.hpp удалено, типы stell::tiers приходят из stell_tiers.
 target_link_libraries(stell_models PUBLIC stell_tiers)
+
+# Round 2 (R10): ByteLevelBpeTokenizer реализует stell::engine::ITokenizer
+# (инжект в Scheduler::set_tokenizer, ADR-11 §3 / план Q7) — заголовок
+# интерфейса engine (header-only, без линковки libstell_engine).
+target_include_directories(stell_models
+    PUBLIC ${CMAKE_SOURCE_DIR}/src/engine/include)
 
 
 # Каталог встроенных описаний (реестр, ADR-09 §2): env STELL_MODELS_REGISTRY_DIR
