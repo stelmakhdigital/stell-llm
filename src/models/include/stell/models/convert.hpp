@@ -131,7 +131,15 @@ std::string gguf_to_description(const std::string& gguf_uri);
 // Архитектуры (subset): LlamaForCausalLM / Qwen2ForCausalLM (dense);
 // Qwen2MoeForCausalLM / Qwen1.5MoeForCausalLM / OlmoeForCausalLM (MoE,
 // поэертельные тензоры экспертов; роутер mlp.router|mlp.gate — по факту в
-// шардах); MixtralForCausalLM (MoE, стековные block_sparse_moe.w1/w2/w3,
+// шардах; [R3] round 5: per-layer план — классификация КАЖДОГО слоя по факту
+// в шардах, слой с mlp.router|mlp.gate → MoE-группы, слой с dense-ffn
+// тензорами и без роутера → dense ffn группы (literal, pad3-имена);
+// однородный чекпоинт — план как раньше (шаблоны с cardinality, дефолт
+// round 4 побитово); частичные/неоднозначные конфигурации — честный
+// SchemaMismatch; [R4] round 5: shared-expert mlp.shared_expert.{gate,up,
+// down} → dense-FFN группы ffn.shared — выход суммируется интерпретатором
+// плана с выходом routed-экспертов, отсутствие тензоров — группы нет);
+// MixtralForCausalLM (MoE, стековные block_sparse_moe.w1/w2/w3,
 // source_slice "{expert}", канон R9).
 // rope-параметры config.json (rope_theta) → параметр ops attention.
 // Ошибки — LoaderError: нет config.json → SchemaMismatch; шард не соответствует
