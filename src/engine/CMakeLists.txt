@@ -82,6 +82,11 @@ endif()
 if(STELL_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 70)   # Tesla V100 (SM70, SXM2)
+    # dep-исходники tiers/parallel с STELL_CUDA=1 тянут cuda_runtime.h —
+    # CUDA-include нужен и в перекомпиляции внутри SHARED stell_core
+    # (серверная сборка; аналогично include-строкам в чужих CMakeLists).
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(stell_core PRIVATE SYSTEM ${CUDAToolkit_INCLUDE_DIRS})
     target_sources(stell_engine PRIVATE cuda/graph_executor.cu)
     target_sources(stell_core PRIVATE cuda/graph_executor.cu)
     target_compile_definitions(stell_engine PUBLIC STELL_CUDA=1)
