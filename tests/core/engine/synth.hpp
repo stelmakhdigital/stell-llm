@@ -62,14 +62,21 @@ inline std::uint16_t f32_to_f16(float v) {
     const std::uint32_t exp32 = (b >> 23) & 0xFFu;
     if (exp32 == 0xFF) return static_cast<std::uint16_t>(sign | 0x7C00u);  // inf/nan
     std::int32_t e = static_cast<std::int32_t>(exp32) - 127 + 15;
-    std::uint32_t m24 = (b & 0x7FFFFFu) | 0x800000u;   // с неявным битом
+    // [FIX round 6] 10-битная мантисса F16 — ДРОБЬ значащей части БЕЗ неявного
+    // бита: раньше m24 (с неявным битом) целиком сдвигался в 10-битное поле,
+    // из-за чего m всегда > 0x3FF → мантисса обнулялась, а экспонента росла
+    // (1.0f → 0x4000 = 2.0): payload фикстур систематически искажался. Существ
+    // вующие тесты не ломаются: обе стороны каждого побитового сравнения читают
+    // ОДНИ и те же байты payload (самосогласованность), значение — теперь
+    // честное (payload == fill_weights для кратных 2^-4).
+    const std::uint32_t frac24 = b & 0x7FFFFFu;                  // без неявного бита
+    const std::uint32_t mant10 = frac24 >> 13;
+    const std::uint32_t rem = frac24 & 0x1FFFu;
+    std::uint32_t m = mant10;
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) ++m;      // RNE
+    if (m > 0x3FFu) { m = 0; ++e; }                              // переполнение 1.111…→2.0
     if (e >= 0x1F) return static_cast<std::uint16_t>(sign | 0x7C00u);      // кламп inf
     if (e <= 0) return sign;                           // denormal/0: тестовые значения > 2^-14
-    const std::uint32_t mant10 = m24 >> 13;
-    const std::uint32_t rem = m24 & 0x1FFFu;
-    std::uint32_t m = mant10;
-    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) ++m;
-    if (m > 0x3FFu) { m = 0; ++e; }
     return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(e) << 10) | m);
 }
 

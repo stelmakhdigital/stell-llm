@@ -83,6 +83,14 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
         const bool sh_g = group(p + "ffn.shared.gate") != nullptr;
         const bool sh_u = group(p + "ffn.shared.up") != nullptr;
         const bool sh_d = group(p + "ffn.shared.down") != nullptr;
+        // [R1] round 6 (ADR-09 «Уточнение round 6», planner [Q5]): скалярный
+        // сигмоид-гейт — группа ffn.shared.gate_scalar (d_model→1, тензор
+        // mlp.shared_expert_gate Qwen2Moe-класса). Имя ОТЛИЧАЕТСЯ от
+        // ffn.shared.gate (SwiGLU gate_proj round 5, [d_ff_shared, d_model]):
+        // реальный Qwen2Moe содержит ОБА тензора, обе группы плана обязаны
+        // сосуществовать с разными именами (контракт round 5 не меняется —
+        // существующие планы валидны без перегенерации).
+        const PlainGroup* gsc = group(p + "ffn.shared.gate_scalar");
         if (router) {
             any_moe_layer = true;
             // Полнота expert-набора СЛОЯ: слой обслуживает router.rows
@@ -107,6 +115,31 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
                     "SchemaMismatch: слой " + std::to_string(l) +
                     " — частичный набор групп ffn.shared.{gate,up,down}");
             }
+            // [R1] round 6: полный набор — shared-FFN (up+down) с гейтом или
+            // без; гейт БЕЗ shared-FFN — частичный набор, честный отказ
+            // (fail-fast §3: гейт без shared-FFN не имеет определённой
+            // семантики; отсутствие гейта — прежнее поведение round 5).
+            if (gsc && (!sh_u || !sh_d)) {
+                throw std::invalid_argument(
+                    "SchemaMismatch: слой " + std::to_string(l) +
+                    " — ffn.shared.gate_scalar без ffn.shared.{up,down} "
+                    "(гейт без shared-FFN — частичный набор, ADR-09 round 6)");
+            }
+            // Форма гейта — [1, d_model] (или вектор [d_model]); иначе это
+            // не скалярный сигмоид-гейт — честный SchemaMismatch.
+            if (gsc) {
+                const std::int64_t dm = static_cast<std::int64_t>(spec_.d_model);
+                const bool shape_ok =
+                    (gsc->shape.size() == 2 && gsc->shape[0] == 1 &&
+                     gsc->shape[1] == dm) ||
+                    (gsc->shape.size() == 1 && gsc->shape[0] == dm);
+                if (!shape_ok) {
+                    throw std::invalid_argument(
+                        "SchemaMismatch: слой " + std::to_string(l) +
+                        " — ffn.shared.gate_scalar: ожидался тензор [1, d_model] "
+                        "(скалярный сигмоид-гейт, ADR-09 round 6)");
+                }
+            }
         } else {
             any_dense_layer = true;
             // Dense-слой исполняет op ffn: группы обязаны быть полными;
@@ -116,11 +149,11 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
                 throw std::invalid_argument(
                     "SchemaMismatch: dense-слой " + std::to_string(l) +
                     " — неполный набор групп ffn.{up,down}");
-            if (sh_g || sh_u || sh_d)
+            if (sh_g || sh_u || sh_d || gsc != nullptr)
                 throw std::invalid_argument(
                     "SchemaMismatch: слой " + std::to_string(l) +
-                    " — группы ffn.shared на dense-слое (без mlp.router) не "
-                    "исполняются ни одним op'ом");
+                    " — группы ffn.shared{,.gate_scalar} на dense-слое (без "
+                    "mlp.router) не исполняются ни одним op'ом");
         }
     }
     if (spec_.is_moe != any_moe_layer) {
@@ -517,11 +550,42 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
     // (hidden до residual-добавления routed-суммы); отсутствие группы —
     // поведение без изменений (shared_out пуст, аддитивного вклада нет).
     std::vector<float> shared_out;
-    if (group(layer_prefix(layer) + "ffn.shared.up") ||
-        group(layer_prefix(layer) + "ffn.shared.down")) {
+    const bool has_shared =
+        group(layer_prefix(layer) + "ffn.shared.up") ||
+        group(layer_prefix(layer) + "ffn.shared.down");
+    if (has_shared) {
         shared_out = ffn_forward(layer_prefix(layer) + "ffn.shared", hidden,
                                  "ffn.shared слоя " + std::to_string(layer));
     }
+    // [R1] round 6 (ADR-09 «Уточнение round 6», planner [Q5]): скалярный
+    // сигмоид-гейт ffn.shared.gate_scalar (d_model→1): shared_contrib =
+    // sigmoid(dot(w_gate, hidden)) × shared_ffn_out; hidden — вход MoE-контура
+    // (тот же, что питает router и shared-FFN, до residual-добавления
+    // routed-суммы). Умножение на скаляр — локальная операция интерпретатора
+    // плана, новое ядро не вводится. Отсутствие группы — прежнее поведение
+    // round 5; наличие без shared-FFN честно отсекается при загрузке плана
+    // (SchemaMismatch) — здесь страховочный fail-fast того же правила.
+    if (const PlainGroup* gsc =
+            group(layer_prefix(layer) + "ffn.shared.gate_scalar")) {
+        if (!has_shared) {
+            throw std::invalid_argument(
+                "ops runner: слой " + std::to_string(layer) +
+                " — ffn.shared.gate_scalar без ffn.shared (частичный набор, "
+                "ADR-09 round 6)");
+        }
+        const Mat* gm = mat(gsc->id);
+        if (!gm || gm->rows != 1 || gm->w.size() != d_model)
+            throw std::invalid_argument(
+                "ops runner: слой " + std::to_string(layer) +
+                " — ffn.shared.gate_scalar: не скалярный гейт [1, d_model]");
+        const std::vector<float> g1 = matvec(*gm, hidden);
+        const float gs = 1.0f / (1.0f + std::exp(-g1[0]));
+        for (std::size_t i = 0; i < shared_out.size(); ++i)
+            shared_out[i] *= gs;
+    }
+    // Порядок суммирования фиксирован (ADR-09 round 6, побитовый референс):
+    // routed_sum накапливается первым, shared_contrib (с гейтом или без)
+    // добавляется последним.
     for (std::size_t i = 0; i < d_model; ++i) hidden[i] += y[i];
     for (std::size_t i = 0; i < shared_out.size(); ++i) hidden[i] += shared_out[i];
 }

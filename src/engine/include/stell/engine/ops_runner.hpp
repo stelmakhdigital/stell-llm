@@ -46,6 +46,11 @@ namespace stell::engine {
 // исполняет MoE-контур, слой без неё — dense ffn; непокрытые конфигурации —
 // честный SchemaMismatch; [R4] — группа ffn.shared (shared-expert, dense-FFN,
 // выход суммируется с routed-экспертами), отсутствие — без изменений.
+// Round 6: [R1] — оп-дополнение ffn.shared.gate_scalar (скалярный сигмоид-гейт
+// d_model→1: shared_contrib = sigmoid(dot(w_gate, hidden)) × shared_ffn_out;
+// порядок суммирования routed_sum → shared_contrib фиксирован; ADR-09
+// «Уточнение round 6»; отсутствие группы — прежнее поведение; частичный
+// набор — SchemaMismatch; новое ядро не вводится.
 class OpsInterpreter {
 public:
     // tiers — реальный TierManager (конкретный класс: ADR-08 «Уточнение»
