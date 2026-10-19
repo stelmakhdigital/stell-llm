@@ -42,6 +42,20 @@
 //     интерпретатором плана с выходом routed-экспертов; отсутствие тензоров
 //     — группы нет, обратная совместимость планов; частичный набор —
 //     SchemaMismatch).
+//     [R1] round 6 (ADR-09 round 6): скалярный сигмоид-гейт shared-эксперта
+//     — тензор mlp.shared_expert_gate (форма [1, d_model]) → группа
+//     ffn.shared.gate_scalar (роль как у ffn.shared-групп round 5; dtype —
+//     исходный тензора, по прецеденту роутера: маленький служебный вес
+//     не квантуется). Отсутствие тензора — группы нет (обратная
+//     совместимость: группы описаний без гейта побитово прежние);
+//     частичный набор (gate есть, shared-FFN нет) — честный
+//     SchemaMismatch. Семантика умножения — ops_runner (поток core).
+//     [R2] round 6 (planner [Q6], ADR-03 round 5/6): провенанс dtype_orig
+//     — top-level поле описания: исходный dtype весов до конверсии;
+//     однородный источник → "f32"/"bf16"/"f16", смешанный источник — поле
+//     не пишется (скаляр неоднозначен; полный состав — в Stats конвертера
+//     groups_dtype_orig_bf16/f32 и логе CLI). Поле информационное:
+//     перегенерация не меняет слоты/логиты (побитово).
 //   - MixtralForCausalLM (MoE, стековные тензоры): block_sparse_moe.gate
 //     (роутер), block_sparse_moe.w1/w3 ([n_experts, d_ff, d_model] — gate/up)
 //     и w2 ([n_experts, d_model, d_ff] — down); срезы экспертов —
@@ -629,7 +643,23 @@ std::string hf_to_description(const std::string& hf_dir,
                     ++n_sh;
                 }
             }
-            if (n_sh == 0) continue;
+            // [R1] round 6: скалярный сигмоид-гейт shared-эксперта — тензор
+            // mlp.shared_expert_gate (форма [1, d_model]) → группа
+            // ffn.shared.gate_scalar. Частичный набор «gate есть, shared-FFN
+            // нет» — честный SchemaMismatch (гейт без shared-FFN не имеет
+            // определённой семантики, ADR-09 round 6, fail-fast §3).
+            const std::string gate_name = "model.layers." + std::to_string(i) +
+                                          ".mlp.shared_expert_gate.weight";
+            const bool has_gate = find_tensor(gate_name) != nullptr;
+            if (n_sh == 0) {
+                if (has_gate)
+                    throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                      "hf: слой " + std::to_string(i) +
+                                          ": mlp.shared_expert_gate есть, тензоров "
+                                          "shared-FFN (mlp.shared_expert.{gate,up,down}) "
+                                          "нет — частичный набор (непокрытая конфигурация)");
+                continue;
+            }
             if (n_sh != 3)
                 throw LoaderError(LoaderError::Code::SchemaMismatch,
                                   "hf: слой " + std::to_string(i) +
@@ -651,6 +681,20 @@ std::string hf_to_description(const std::string& hf_dir,
                                         {dff_sh, dm}, dtype_weights, sp + "up" + sh[1]));
             groups.push_back(make_group(std::string(lbuf) + "ffn.shared.down", "attn",
                                         {dm, dff_sh}, dtype_weights, sp + "down" + sh[2]));
+            // [R1] round 6: группа гейта — d_model→1, роль как у ffn.shared-
+            // групп (round 5), dtype — исходный тензора (по прецеденту
+            // роутера: маленький служебный вес не квантуется, сигмоид/dot —
+            // F16/F32 путь интерпретатора). Отсутствие тензора — группы нет
+            // (обратная совместимость: группы описаний без гейта побитово
+            // прежние, round 5). Имя «gate_scalar», не «gate»: имя «gate»
+            // занято матрицей gate_proj shared-FFN (ключ групп
+            // ffn.shared.{gate,up,down} в ops_runner, ADR-09 round 5).
+            if (has_gate) {
+                check_shape(gate_name, {1, dm});
+                groups.push_back(make_group(std::string(lbuf) + "ffn.shared.gate_scalar",
+                                            "attn", {1, dm},
+                                            source_group_dtype(gate_name), gate_name));
+            }
         }
         moe_json = ",\"moe\":{\"n_experts\":" + fmt_int(static_cast<std::int64_t>(n_experts)) +
                    ",\"n_experts_active\":" + fmt_int(static_cast<std::int64_t>(n_active)) +
@@ -788,11 +832,14 @@ std::string hf_to_description(const std::string& hf_dir,
     }
     json += "]}";
 
-    // --- 6. Валидация: разбор + энергичная резолюция ВСЕХ некешевых групп ------
+    // --- 6. Валидация: разбор + энергичная резолюция ВСЕХ некешевых групп ----
     // (fail-fast, ADR-09 §3): каждая группа обязана разрешиться в тензора
     // шардов с согласованной формой; шард не соответствует плану →
     // TensorNotFound/SchemaMismatch.
     const ModelDescription d = parse_model_description(json, "hf-generated");
+    // [R2] round 6: сбор исходных dtype тензоров-источников (по ВСЕМ
+    // расширенным группам — ровно множество конвертируемых тензоров).
+    std::vector<std::string> dtype_orig;  // уникальные "f32"/"bf16"/"f16"
     for (std::size_t i = 0; i < d.groups.size(); ++i) {
         const auto& g = d.groups[i];
         if (g.role == stell::tiers::Role::Kv) continue;
@@ -813,6 +860,15 @@ std::string hf_to_description(const std::string& hf_dir,
         // профиль — F16/F32/BF16-источник, квантование — отдельный проход).
         const bool plain_target = g.dtype == stell::tiers::DType::F16 ||
                                   g.dtype == stell::tiers::DType::F32;
+        {
+            const TensorInfo& ti = it->second;
+            if (ti.dtype) {
+                const char* s = *ti.dtype == stell::tiers::DType::F32 ? "f32"
+                                : (ti.bf16 ? "bf16" : "f16");
+                if (dtype_orig.empty() || dtype_orig[0] != s)
+                    dtype_orig.push_back(s);
+            }
+        }
         if (plain_target) {
             const TensorInfo& ti = it->second;
             const bool ok =
@@ -837,6 +893,19 @@ std::string hf_to_description(const std::string& hf_dir,
                                       "': источник должен быть F16/F32/BF16, получено '" +
                                       ti.dtype_str + "'");
         }
+    }
+
+    // [R2] round 6 (planner [Q6], ADR-03 round 5/6): провенанс dtype_orig —
+    // top-level поле описания («исходный dtype весов до конверсии»; поле
+    // читается R8-обёрткой serve/bench из description.json). Однородный
+    // источник → "f32"/"bf16"/"f16"; смешанный источник — поле НЕ пишется
+    // (честно: скаляр неоднозначен, полный состав — в Stats конвертера
+    // groups_dtype_orig_bf16/f32 и логе CLI). Поле информационное:
+    // перегенерация не меняет слоты/логиты (побитово — тест [R2]).
+    if (dtype_orig.size() == 1) {
+        const std::string tag = ",\"vocab_size\":";
+        const std::size_t pos = json.find(tag);
+        json.insert(pos, std::string(",\"dtype_orig\":\"") + dtype_orig[0] + "\"");
     }
 
     return json;
