@@ -41,7 +41,11 @@
 namespace stell::engine {
 
 // Каталог операций + интерпретатор графа (ADR-09 §1: неизвестная операция =
-// ошибка загрузки модели — «новая операция = новое ядро»).
+// ошибка загрузки модели — «новая операция = новое ядро»). Round 5: per-layer
+// план (ADR-09 «Уточнение round 5», [R3]) — слой с группой l%03zu.mlp.router
+// исполняет MoE-контур, слой без неё — dense ffn; непокрытые конфигурации —
+// честный SchemaMismatch; [R4] — группа ffn.shared (shared-expert, dense-FFN,
+// выход суммируется с routed-экспертами), отсутствие — без изменений.
 class OpsInterpreter {
 public:
     // tiers — реальный TierManager (конкретный класс: ADR-08 «Уточнение»
@@ -107,6 +111,12 @@ private:
     void op_attention(std::size_t layer, std::vector<float>& hidden, SlotState& st);
     void op_ffn(std::size_t layer, std::vector<float>& hidden);
     void op_moe(std::size_t layer, std::vector<float>& hidden);
+
+    // Dense-FFN вычисление по префиксу имени групп (<prefix>.gate/.up/.down);
+    // общий путь op "ffn" и shared-expert'а ([R4]) — возврат БЕЗ residual.
+    std::vector<float> ffn_forward(const std::string& prefix,
+                                   const std::vector<float>& x,
+                                   const std::string& what) const;
 
     void pin_and_prefetch(std::size_t layer);         // ADR-08 §2/§5 (+ prefetch)
     void unpin_layer(std::size_t layer);              // снятие пина после слоя

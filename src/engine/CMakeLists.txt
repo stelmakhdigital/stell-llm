@@ -248,3 +248,25 @@ target_include_directories(test_engine_prompt_last PRIVATE ../../tests/core)
 target_compile_definitions(test_engine_prompt_last PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/prompt_last COMMAND test_engine_prompt_last)
+
+# --- round 5: [R3] per-layer план (смешанные dense/MoE слои) ------------------
+
+add_executable(test_engine_ops_mixed
+    ../../tests/core/engine/test_ops_mixed.cpp
+)
+target_link_libraries(test_engine_ops_mixed stell_engine)
+target_include_directories(test_engine_ops_mixed PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_mixed PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_mixed COMMAND test_engine_ops_mixed)
+
+# --- round 5: [R4] shared-expert (ffn.shared, dense-FFN + сумма) --------------
+
+add_executable(test_engine_ops_shared
+    ../../tests/core/engine/test_ops_shared.cpp
+)
+target_link_libraries(test_engine_ops_shared stell_engine)
+target_include_directories(test_engine_ops_shared PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_shared PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_shared COMMAND test_engine_ops_shared)
