@@ -48,6 +48,36 @@ inline float bf16_bits_to_f32(std::uint16_t h) {
     return v;
 }
 
+// --- R5 ([Q6], ADR-03 round 5): clamp-сатурация конверсий F32/BF16 → F16 ----
+// Конверсия в F16 сатурсирируется к ±65504 (максимум F16): inf в весах не
+// порождается (inf заражает вычисления NaN-пространством и недиагностируем
+// в golden-логитах); clamp — детерминированный, видимый (счётчик) и
+// наблюдаемый. Обычные значения (|v| ≤ 65504) — побитово == прежней
+// конверсии (round-to-nearest-even не меняется).
+inline constexpr float kF16Max = 65504.0f;
+
+// Счётчик сатураций (plain_fill_slot: F32/BF16→F16 — общий путь лоадеров и
+// конвертера). CPU-пути однопоточные — атомарность не требуется; читается/
+// сбрасывается тестами и CLI конвертера (лог: «сатураций … N»).
+inline std::uint64_t g_f16_saturation_count = 0;
+inline void f16_saturation_reset() { g_f16_saturation_count = 0; }
+inline std::uint64_t f16_saturation_count() { return g_f16_saturation_count; }
+
+// Clamp-сатурация к ±65504; насыщенные значения учитываются в глобальном
+// счётчике. NaN/|v| ≤ kF16Max — без изменений (NaN обрабатывает
+// f32_to_f16_bits: canonical NaN half — прежнее поведение).
+inline float saturate_f16(float v) {
+    if (v > kF16Max) {
+        ++g_f16_saturation_count;
+        return kF16Max;
+    }
+    if (v < -kF16Max) {
+        ++g_f16_saturation_count;
+        return -kF16Max;
+    }
+    return v;
+}
+
 // --- float8 e4m3 (scale NVFP4) ---------------------------------------------
 std::uint8_t f32_to_e4m3(float v);
 float e4m3_to_f32(std::uint8_t b);

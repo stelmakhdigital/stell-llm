@@ -52,7 +52,17 @@ public:
     void convert(const ModelDescription& desc, const std::string& source_uri,
                  const std::string& out_dir) override;
 
-    // ----------------------------------------------------------------------
+    // ------------------------------------------------------------
+    // R5 ([Q6], ADR-03 round 5): статистика/провенанс конвертации — заполняется
+    // convert_streaming, печатается в лог CLI конвертера (счётчик сатураций
+    // clamp-сатурации F32/BF16→F16; исходные dtype групп — dtype_orig: bf16/f32,
+    // честность профиля: точка регрессии/замер знает о сжатии из BF16).
+    struct Stats {
+        std::uint64_t f16_saturations = 0;      // значений, сатурированных к ±65504
+        std::uint64_t groups_dtype_orig_bf16 = 0;  // группы с исходным dtype bf16
+        std::uint64_t groups_dtype_orig_f32 = 0;   // группы с исходным dtype f32
+    };
+
     // Потоковая конвертация (round 3, R7 — подготовка среза 3): writer БЕЗ
     // полной загрузки модели в RAM. Источник (safetensors-файл / каталог
     // safetensors-шардов HF / GGUF) читается ПОСЛЕДОВАТЕЛЬНО по группам плана;
@@ -86,7 +96,8 @@ public:
     // экспертов смежны — чтение последовательное и в этом случае.
     void convert_streaming(const ModelDescription& desc, const std::string& source_uri,
                            const std::string& out_dir,
-                           const StellTierWriterConfig& cfg = {});
+                           const StellTierWriterConfig& cfg = {},
+                           Stats* stats = nullptr);
 };
 
 // ----------------------------------------------------------------------------
@@ -120,7 +131,15 @@ std::string gguf_to_description(const std::string& gguf_uri);
 // Архитектуры (subset): LlamaForCausalLM / Qwen2ForCausalLM (dense);
 // Qwen2MoeForCausalLM / Qwen1.5MoeForCausalLM / OlmoeForCausalLM (MoE,
 // поэертельные тензоры экспертов; роутер mlp.router|mlp.gate — по факту в
-// шардах); MixtralForCausalLM (MoE, стековные block_sparse_moe.w1/w2/w3,
+// шардах; [R3] round 5: per-layer план — классификация КАЖДОГО слоя по факту
+// в шардах, слой с mlp.router|mlp.gate → MoE-группы, слой с dense-ffn
+// тензорами и без роутера → dense ffn группы (literal, pad3-имена);
+// однородный чекпоинт — план как раньше (шаблоны с cardinality, дефолт
+// round 4 побитово); частичные/неоднозначные конфигурации — честный
+// SchemaMismatch; [R4] round 5: shared-expert mlp.shared_expert.{gate,up,
+// down} → dense-FFN группы ffn.shared — выход суммируется интерпретатором
+// плана с выходом routed-экспертов, отсутствие тензоров — группы нет);
+// MixtralForCausalLM (MoE, стековные block_sparse_moe.w1/w2/w3,
 // source_slice "{expert}", канон R9).
 // rope-параметры config.json (rope_theta) → параметр ops attention.
 // Ошибки — LoaderError: нет config.json → SchemaMismatch; шард не соответствует

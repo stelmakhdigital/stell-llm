@@ -105,7 +105,8 @@ int main(int argc, char** argv) {
 
         const auto t0 = std::chrono::steady_clock::now();
         StellTierConverter conv;
-        conv.convert_streaming(desc, source_uri, out_dir, cfg);
+        StellTierConverter::Stats stats;
+        conv.convert_streaming(desc, source_uri, out_dir, cfg, &stats);
         const double sec =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
@@ -128,6 +129,12 @@ int main(int argc, char** argv) {
         std::printf("layout: %s (%ld байт)\n", out_path.c_str(), sz);
         std::printf("потоковая конвертация: %.2f c, пиковая память процесса: %s\n", sec,
                     read_peak_rss_kb().c_str());
+        // R5 ([Q6], ADR-03 round 5): счётчик сатураций + провенанс dtype_orig
+        // — в логе конвертера (clamp-сатурация F32/BF16→F16 к ±65504; inf в
+        // весах не порождается; обычные значения — без изменений).
+        std::printf("сатураций F32/BF16→F16: %zu (clamp к ±65504); dtype_orig: bf16=%zu, f32=%zu групп\n",
+                    stats.f16_saturations, stats.groups_dtype_orig_bf16,
+                    stats.groups_dtype_orig_f32);
         if (cfg.vram_slot_size)
             std::printf("tiers-профиль: vram_slot_size=%zu, ram_capacity=%zu "
                         "(валидация плана пройдена; границы тиров — стороны tiers, ADR-12)\n",

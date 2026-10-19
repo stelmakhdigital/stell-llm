@@ -292,7 +292,8 @@ private:
 void StellTierConverter::convert_streaming(const ModelDescription& desc,
                                            const std::string& source_uri,
                                            const std::string& out_dir,
-                                           const StellTierWriterConfig& cfg) {
+                                           const StellTierWriterConfig& cfg,
+                                           Stats* stats) {
     // --- 1. Конфигурация: выравнивания фиксированы layout v1 (ADR-12 §2); ----
     //      параметры тиров — извне (tiers-конфиг), валидация совместимости плана.
     if (cfg.slot_align != kStellTierSlotAlign || cfg.index_align != kStellTierIndexAlign)
@@ -312,6 +313,12 @@ void StellTierConverter::convert_streaming(const ModelDescription& desc,
     };
     std::vector<PendingSlot> pending;
     std::size_t n_nonkv = 0;
+    // R5: провенанс dtype_orig (ADR-03 round 5) — считается на этапе резолвции.
+    if (stats) {
+        stats->f16_saturations = 0;
+        stats->groups_dtype_orig_bf16 = 0;
+        stats->groups_dtype_orig_f32 = 0;
+    }
     for (const auto& g : desc.groups)
         if (g.role != stell::tiers::Role::Kv) ++n_nonkv;
 
@@ -360,6 +367,14 @@ void StellTierConverter::convert_streaming(const ModelDescription& desc,
         cursor += e.slot_bytes;
         entries.push_back(e);
         pending.push_back(PendingSlot{&g, std::move(eff), pattern});
+        // R5 ([Q6], ADR-03 round 5): провенанс исходного dtype группы
+        // (dtype_orig: bf16/f32 — честность профиля: точка регрессии знает,
+        // что было сжатие из BF16/F32).
+        if (stats) {
+            const TensorInfo& ti = pending.back().ti;
+            if (ti.bf16) ++stats->groups_dtype_orig_bf16;
+            else if (ti.dtype == stell::tiers::DType::F32) ++stats->groups_dtype_orig_f32;
+        }
     }
 
     // --- 4. Файл: header + индекс (CRC групп — placeholder) + padding --------
@@ -404,7 +419,11 @@ void StellTierConverter::convert_streaming(const ModelDescription& desc,
         const TensorInfo& ti = pending[i].ti;
         const std::string& pattern = pending[i].pattern;
         std::FILE* fin = shards.file_for(pattern);  // последовательный переход шард→шард
+        // R5: дельта глобального счётчика сатураций по этой группе
+        // (конверсии F32/BF16→F16 в plain_fill_slot — clamp к ±65504).
+        const std::uint64_t sat0 = f16_saturation_count();
         const std::vector<std::uint8_t> slot = make_slot(g, ti, fin);  // O(группы)
+        if (stats) stats->f16_saturations += f16_saturation_count() - sat0;
 
         std::fseek(fout, static_cast<long>(entries[i].data_offset), SEEK_SET);
         std::fwrite(slot.data(), 1, slot.size(), fout);

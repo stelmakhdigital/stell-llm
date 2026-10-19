@@ -75,6 +75,8 @@ inline std::size_t expected_payload(const stell::tiers::TensorGroup& g) {
 // группы с записью в слот (хвост до slot_bytes — нули, ADR-09 §3):
 //   F16→F16, F32→F32, E4M3→E4M3  — копия байтов;
 //   F32→F16, BF16→F16            — допустимая конвертация лоадера (не dequant);
+//                                  R5: clamp-сатурация к ±65504 (ADR-03 round 5),
+//                                  счётчик — f16_saturation_count() (quant.hpp);
 // прочие комбинации — SchemaMismatch/UnsupportedQuant (разрешения — в
 // compatible_plain вызовой стороны; здесь — честная проверка размеров).
 // Побитовая идентичность путей loader/converter — контракт round 4 (R4/R6):
@@ -108,11 +110,14 @@ inline void plain_fill_slot(const stell::tiers::TensorGroup& g, const TensorInfo
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "group '" + g.name + "': payload > dst_bytes");
         for (std::size_t i = 0; i < n; ++i) {
-            const float v = src_f32
-                                ? [&] { float f; std::memcpy(&f, raw.data() + 4 * i, 4); return f; }()
-                                : bf16_bits_to_f32(static_cast<std::uint16_t>(raw[2 * i]) |
-                                                   (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8));
-            const std::uint16_t h = f32_to_f16_bits(v);
+            const float v0 = src_f32
+                                 ? [&] { float f; std::memcpy(&f, raw.data() + 4 * i, 4); return f; }()
+                                 : bf16_bits_to_f32(static_cast<std::uint16_t>(raw[2 * i]) |
+                                                    (static_cast<std::uint16_t>(raw[2 * i + 1]) << 8));
+            // R5 ([Q6], ADR-03 round 5): clamp-сатурация к ±65504 — inf в
+            // весах не порождается; обычные значения — побитово == прежней
+            // конверсии; счётчик сатураций — в логе конвертера (R5).
+            const std::uint16_t h = f32_to_f16_bits(saturate_f16(v0));
             out[2 * i] = static_cast<std::uint8_t>(h & 0xFF);
             out[2 * i + 1] = static_cast<std::uint8_t>((h >> 8) & 0xFF);
         }

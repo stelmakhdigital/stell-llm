@@ -24,13 +24,24 @@
 //
 // Поддержанные архитектуры (subset):
 //   - LlamaForCausalLM / Qwen2ForCausalLM (dense): llama-нейминг тензоров HF.
+//     (dense-архитектура с MoE-слоями — непокрытая конфигурация: честный
+//     отказ валидацией плана; реальные смешанные чекпоинты объявляют
+//     MoE-архитектуру — per-layer поддержан в ветви Qwen2Moe-класса.)
 //   - Qwen2MoeForCausalLM / Qwen1.5MoeForCausalLM / OlmoeForCausalLM (MoE,
 //     поэертельные тензоры экспертов): роутер — mlp.router.weight (Qwen2Moe)
 //     или mlp.gate.weight (Qwen1.5Moe/Olmoe — выбирается по факту в шардах);
-//     эксперты — mlp.experts.{expert}.{gate,up,down}_proj.weight;
-//     shared-expert тензоры плана не касаются (не группируются — честная
-//     пометка в REPORT-ROUND4.md; движковый MoE-контур shared expert не
-//     содержит, интерпретатор плана такие группы не требует).
+//     эксперты — mlp.experts.{expert}.{gate,up,down}_proj.weight.
+//     [R3] round 5 (ADR-09 round 5, per-layer план): классификация КАЖДОГО
+//     слоя по факту в шардах — слой с mlp.router|mlp.gate (и полным набором
+//     экспертов) → MoE-группы; слой с dense-ffn тензорами (mlp.*_proj) и без
+//     роутера → dense ffn группы (literal, pad3-имена); однородный чекпоинт —
+//     план как раньше (шаблоны с cardinality, дефолт round 4 побитово);
+//     частичные/неоднозначные наборы — честный SchemaMismatch.
+//     [R4] round 5 (ADR-09 round 5): shared-expert (mlp.shared_expert.{gate,
+//     up,down}) → dense-FFN группы ffn.shared (выход суммируется
+//     интерпретатором плана с выходом routed-экспертов; отсутствие тензоров
+//     — группы нет, обратная совместимость планов; частичный набор —
+//     SchemaMismatch).
 //   - MixtralForCausalLM (MoE, стековные тензоры): block_sparse_moe.gate
 //     (роутер), block_sparse_moe.w1/w3 ([n_experts, d_ff, d_model] — gate/up)
 //     и w2 ([n_experts, d_model, d_ff] — down); срезы экспертов —
@@ -40,8 +51,9 @@
 // аргумент profile ("F16" по умолчанию; "NVFP4"/"W4A16" — квантование
 // выполняет отдельный проход: конвертер/лоадер NVFP4W4A16); линейные веса
 // (q/k/v/o, gate/up/down, эксперты) — dtype профиля; нормы/роутер — dtype
-// тензора источника (F32/F16, BF16 → F16); embed/head — F16 (канон
-// registry-классов); kv — F16.
+// тензора источника (F32/F16, BF16 → F16; [R5] round 5, ADR-03: конверсия
+// F32/BF16→F16 — clamp-сатурация к ±65504, счётчик — f16_saturation_count());
+// embed/head — F16 (канон registry-классов); kv — F16.
 //
 // Ошибки — LoaderError: нет config.json → SchemaMismatch; шард не
 // соответствует плану (нет тензора для группы) → TensorNotFound; формы/
@@ -275,6 +287,11 @@ std::string hf_to_description(const std::string& hf_dir,
 
     std::vector<std::string> groups;
 
+    // Op "ffn" (dense-ветвь; [R3] round 5: та же строка — dense-слои
+    // per-layer смешанного плана). Единый литерал — без дублей.
+    const std::string kFfnOpJson =
+        ",{\"op\":\"ffn\",\"io\":[\"hidden\"],\"params\":{\"activation\":\"silu_mul\"}}";
+
     // --- общие группы ----------------------------------------------------------
     groups.push_back(make_group("embed", "attn",
                                 {static_cast<std::int64_t>(vocab_size), dm}, "F16",
@@ -353,10 +370,16 @@ std::string hf_to_description(const std::string& hf_dir,
             groups.push_back(make_group(lt.group, "attn", shape, dtype,
                                         lp + lt.pattern, {{card_key, L}}));
         }
-        ffn_op_json =
-            ",{\"op\":\"ffn\",\"io\":[\"hidden\"],\"params\":{\"activation\":\"silu_mul\"}}";
+        ffn_op_json = kFfnOpJson;
     } else if (moe_per_expert) {
         // --- 4b. MoE, поэертельные тензоры (Qwen2Moe/Qwen1.5Moe/Olmoe) --------
+        // [R3] round 5 (ADR-09 round 5, per-layer план): классификация КАЖДОГО
+        // слоя по факту в шардах — слой с mlp.router|mlp.gate (и полным набором
+        // экспертов) → MoE-контур; слой с dense-ffn тензорами (mlp.*_proj,
+        // llama-нейминг) и без роутера → dense ffn группы. Частичные/
+        // неоднозначные наборы — честный SchemaMismatch (fail-fast §3 не
+        // ослабляется). Однородный чекпоинт (все слои MoE) — план как раньше
+        // (шаблонные группы по cardinality — дефолт round 4 не меняется).
         const std::uint64_t n_experts = cfg_u64("num_experts", false, 0)
                                             ? cfg_u64("num_experts", false, 0)
                                             : cfg_u64("num_local_experts", false, 0);
@@ -366,37 +389,81 @@ std::string hf_to_description(const std::string& hf_dir,
                               "hf: config.json: num_experts/num_local_experts и "
                               "num_experts_per_tok обязаны быть > 0 и "
                               "num_experts_per_tok <= num_experts");
-        // Роутер: mlp.router.weight (Qwen2Moe) или mlp.gate.weight
-        // (Qwen1.5Moe/Olmoe) — выбирается по факту в шардах.
-        std::string router_suffix;
-        if (find_tensor(l0 + ".mlp.router.weight"))
-            router_suffix = ".router.weight";
-        else if (find_tensor(l0 + ".mlp.gate.weight"))
-            router_suffix = ".gate.weight";
-        else
-            throw LoaderError(LoaderError::Code::TensorNotFound,
-                              "hf: роутер MoE не найден (mlp.router.weight / "
-                              "mlp.gate.weight) в '" + hf_dir + "'");
-        // Эксперты: {gate,up,down}_proj.weight (Qwen/Olmoe) или
-        // {gate,up,down}.weight — выбирается по факту.
-        std::string proj_suffix[3];  // gate/up/down
-        {
+
+        // Суффиксы имён — по факту в шардах, на каждый слой независимо
+        // (роутер: mlp.router.weight (Qwen2Moe) | mlp.gate.weight
+        // (Qwen1.5Moe/Olmoe); эксперты: *_proj.weight | *.weight; dense-ffn —
+        // только llama-нейминг *_proj.weight, чтобы не пересекаться с
+        // роутером mlp.gate.weight Qwen1.5Moe/Olmoe).
+        auto layer_router_suffix = [&](std::int64_t i) -> std::string {
+            const std::string li = "model.layers." + std::to_string(i);
+            if (find_tensor(li + ".mlp.router.weight")) return ".router.weight";
+            if (find_tensor(li + ".mlp.gate.weight")) return ".gate.weight";
+            return "";
+        };
+        auto layer_expert_suffix = [&](std::int64_t i, int k) -> std::string {
+            const std::string p =
+                "model.layers." + std::to_string(i) + ".mlp.experts.0.";
             const char* names[3] = {"gate", "up", "down"};
-            for (int k = 0; k < 3; ++k) {
-                if (find_tensor(l0 + ".mlp.experts.0." + names[k] + "_proj.weight"))
-                    proj_suffix[k] = std::string("_proj.weight");
-                else if (find_tensor(l0 + ".mlp.experts.0." + names[k] + ".weight"))
-                    proj_suffix[k] = std::string(".weight");
-                else
-                    throw LoaderError(LoaderError::Code::TensorNotFound,
-                                      "hf: тензор эксперта не найден (mlp.experts.0." +
-                                          std::string(names[k]) + "_proj.weight / " +
-                                          names[k] + ".weight) в '" + hf_dir + "'");
+            if (find_tensor(p + names[k] + "_proj.weight"))
+                return std::string("_proj.weight");
+            if (find_tensor(p + names[k] + ".weight")) return std::string(".weight");
+            return "";
+        };
+        auto layer_dense_suffix = [&](std::int64_t i) -> std::string {
+            const std::string p = "model.layers." + std::to_string(i) + ".mlp.";
+            if (find_tensor(p + "gate_proj.weight")) return "_proj.weight";
+            return "";
+        };
+
+        // --- классификация слоёв (fail-fast, честные отказы) ------------------
+        std::vector<bool> moe_layer(static_cast<std::size_t>(L), false);
+        std::size_t n_moe_layers = 0;
+        std::int64_t first_moe = -1;
+        for (std::int64_t i = 0; i < L; ++i) {
+            const std::string rs = layer_router_suffix(i);
+            const bool has_experts = !layer_expert_suffix(i, 0).empty();
+            const bool has_dense = !layer_dense_suffix(i).empty();
+            if (!rs.empty() && !has_experts)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) +
+                                      ": роутер есть, тензоров экспертов нет — "
+                                      "частичный MoE-набор (непокрытая конфигурация)");
+            if (rs.empty() && has_experts)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) +
+                                      ": тензоры экспертов есть, роутера нет — "
+                                      "частичный MoE-набор (непокрытая конфигурация)");
+            if (!rs.empty() && has_dense)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) +
+                                      ": роутер И dense-ffn тензоры одновременно — "
+                                      "неоднозначная конфигурация");
+            if (rs.empty() && !has_dense)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) +
+                                      ": нет ffn-контура (ни dense-ffn тензоров, ни "
+                                      "MoE-набора) — непокрытая конфигурация");
+            moe_layer[static_cast<std::size_t>(i)] = !rs.empty();
+            if (!rs.empty()) {
+                ++n_moe_layers;
+                if (first_moe < 0) first_moe = i;
             }
         }
+        if (n_moe_layers == 0)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "hf: MoE-архитектура '" + arch + "', но ни один слой не "
+                              "содержит mlp.router/mlp.gate — непокрытая конфигурация");
+        const bool homogeneous_moe = (n_moe_layers == static_cast<std::size_t>(L));
+
+        // d_ff routed-экспертов — из ПЕРВОГО MoE-слоя; согласованность по всем
+        // MoE-слоям (разные d_ff — непокрытая конфигурация: moe.expert_d_ff —
+        // одно поле схемы).
         const std::int64_t dff = [&] {
-            const TensorInfo& t = require_tensor(l0 + ".mlp.experts.0.gate" +
-                                                     proj_suffix[0], "hf");
+            const std::string p = "model.layers." + std::to_string(first_moe) +
+                                  ".mlp.experts.0.gate" +
+                                  layer_expert_suffix(first_moe, 0);
+            const TensorInfo& t = require_tensor(p, "hf");
             if (t.shape.size() != 2 || t.shape[0] <= 0)
                 throw LoaderError(LoaderError::Code::SchemaMismatch,
                                   "hf: тензора экспертов должны быть матрицами "
@@ -406,12 +473,28 @@ std::string hf_to_description(const std::string& hf_dir,
         if (dff <= 0)
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "hf: expert_d_ff обязана быть > 0");
-        check_shape(l0 + ".mlp" + router_suffix,
+        for (std::int64_t i = 0; i < L; ++i) {
+            if (!moe_layer[static_cast<std::size_t>(i)]) continue;
+            check_shape("model.layers." + std::to_string(i) + ".mlp.experts.0.gate" +
+                            layer_expert_suffix(i, 0),
+                        {dff, dm});
+        }
+        check_shape("model.layers." + std::to_string(first_moe) + ".mlp" +
+                        layer_router_suffix(first_moe),
                     {static_cast<std::int64_t>(n_experts), dm});
         const std::int64_t E = static_cast<std::int64_t>(n_experts);
-        check_shape(l0 + ".mlp.experts.0.gate" + proj_suffix[0], {dff, dm});
-        check_shape(l0 + ".mlp.experts.0.up" + proj_suffix[1], {dff, dm});
-        check_shape(l0 + ".mlp.experts.0.down" + proj_suffix[2], {dm, dff});
+
+        // d_ff dense-слоёв — config intermediate_size (обязательна, если есть
+        // хотя бы один dense-слой).
+        std::int64_t dff_dense = 0;
+        if (!homogeneous_moe) {
+            const std::uint64_t v = cfg_u64("intermediate_size", true, 0);
+            if (v == 0)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: config.json: intermediate_size обязана быть > 0 "
+                                  "(dense-слои в per-layer плане)");
+            dff_dense = static_cast<std::int64_t>(v);
+        }
 
         groups.push_back(make_group("l{layer}.attn.norm", "attn", {dm},
                                     norm0_dtype,
@@ -443,29 +526,135 @@ std::string hf_to_description(const std::string& hf_dir,
                                         dtype_weights, lp + m.suffix,
                                         {{card_key, L}}));
         }
-        groups.push_back(make_group("l{layer}.mlp.router", "expert",
-                                    {static_cast<std::int64_t>(n_experts), dm},
-                                    source_group_dtype(l0 + ".mlp" + router_suffix),
-                                    lp + ".mlp" + router_suffix,
-                                    {{card_key, L}}));
-        const std::vector<std::pair<std::string, std::int64_t>> card = {
-            {card_key, L}, {"expert", E}};
-        groups.push_back(make_group("l{layer}.e{expert}.gate", "expert",
-                                    {dff, dm}, dtype_weights,
-                                    lp + ".mlp.experts.{expert}.gate" + proj_suffix[0],
-                                    card));
-        groups.push_back(make_group("l{layer}.e{expert}.up", "expert",
-                                    {dff, dm}, dtype_weights,
-                                    lp + ".mlp.experts.{expert}.up" + proj_suffix[1],
-                                    card));
-        groups.push_back(make_group("l{layer}.e{expert}.down", "expert",
-                                    {dm, dff}, dtype_weights,
-                                    lp + ".mlp.experts.{expert}.down" + proj_suffix[2],
-                                    card));
+        if (homogeneous_moe) {
+            // --- однородный MoE: план как раньше (дефолт round 4, побитово) —
+            // шаблонные группы по cardinality {layer: L, expert: E}; суффиксы —
+            // слоя 0 (first_moe == 0 в однородном случае — как раньше).
+            const std::string router_suffix = layer_router_suffix(0);
+            std::string proj_suffix[3];
+            for (int k = 0; k < 3; ++k) proj_suffix[k] = layer_expert_suffix(0, k);
+            groups.push_back(make_group("l{layer}.mlp.router", "expert",
+                                        {static_cast<std::int64_t>(n_experts), dm},
+                                        source_group_dtype(l0 + ".mlp" + router_suffix),
+                                        lp + ".mlp" + router_suffix,
+                                        {{card_key, L}}));
+            const std::vector<std::pair<std::string, std::int64_t>> card = {
+                {card_key, L}, {"expert", E}};
+            groups.push_back(make_group("l{layer}.e{expert}.gate", "expert",
+                                        {dff, dm}, dtype_weights,
+                                        lp + ".mlp.experts.{expert}.gate" + proj_suffix[0],
+                                        card));
+            groups.push_back(make_group("l{layer}.e{expert}.up", "expert",
+                                        {dff, dm}, dtype_weights,
+                                        lp + ".mlp.experts.{expert}.up" + proj_suffix[1],
+                                        card));
+            groups.push_back(make_group("l{layer}.e{expert}.down", "expert",
+                                        {dm, dff}, dtype_weights,
+                                        lp + ".mlp.experts.{expert}.down" + proj_suffix[2],
+                                        card));
+            ffn_op_json = "";
+        } else {
+            // --- [R3] per-layer план (смешанный dense/MoE): dense слои —
+            // literal dense ffn группы; MoE слои — literal router +
+            // поэертельные группы. Шаблон с cardinality layer==n_layers
+            // размечает ВСЕ слои сразу — для смешанного членства он неприменим;
+            // literal-группы (без cardinality) валидны в схеме 1.0
+            // (ADR-09 round 5: per-layer — обобщение, не новая схема). Имена —
+            // pad3-конвенция ("l002.e001", как в expansion шаблонов); формы —
+            // по config/первому MoE-слою, шард не соответствует плану →
+            // SchemaMismatch/TensorNotFound (валидация §6 — энергичная).
+            auto pad3 = [](std::int64_t v) {
+                char b[8];
+                std::snprintf(b, sizeof b, "%03d", static_cast<int>(v));
+                return std::string(b);
+            };
+            for (std::int64_t i = 0; i < L; ++i) {
+                char lbuf[24];
+                std::snprintf(lbuf, sizeof lbuf, "l%03d.", static_cast<int>(i));
+                const std::string li = lbuf;
+                const std::string src = "model.layers." + std::to_string(i);
+                if (moe_layer[static_cast<std::size_t>(i)]) {
+                    const std::string rs = layer_router_suffix(i);
+                    groups.push_back(make_group(li + "mlp.router", "expert",
+                                                {static_cast<std::int64_t>(n_experts), dm},
+                                                source_group_dtype(src + ".mlp" + rs),
+                                                src + ".mlp" + rs));
+                    for (std::int64_t e = 0; e < E; ++e) {
+                        const std::string ep =
+                            src + ".mlp.experts." + std::to_string(e);
+                        groups.push_back(make_group(li + "e" + pad3(e) + ".gate", "expert",
+                                                    {dff, dm}, dtype_weights,
+                                                    ep + ".gate" + layer_expert_suffix(i, 0)));
+                        groups.push_back(make_group(li + "e" + pad3(e) + ".up", "expert",
+                                                    {dff, dm}, dtype_weights,
+                                                    ep + ".up" + layer_expert_suffix(i, 1)));
+                        groups.push_back(make_group(li + "e" + pad3(e) + ".down", "expert",
+                                                    {dm, dff}, dtype_weights,
+                                                    ep + ".down" + layer_expert_suffix(i, 2)));
+                    }
+                } else {
+                    const std::string ds = src + ".mlp.";
+                    groups.push_back(make_group(li + "ffn.gate", "attn", {dff_dense, dm},
+                                                dtype_weights, ds + "gate_proj.weight"));
+                    groups.push_back(make_group(li + "ffn.up", "attn", {dff_dense, dm},
+                                                dtype_weights, ds + "up_proj.weight"));
+                    groups.push_back(make_group(li + "ffn.down", "attn", {dm, dff_dense},
+                                                dtype_weights, ds + "down_proj.weight"));
+                }
+            }
+            // Смешанный план: op-граф содержит ОБЕ ветви ffn — маршрутизация
+            // per-layer по наличию MoE-групп слоя (ADR-09 round 5: слой с
+            // mlp.router → MoE-контур, без → dense ffn; интерпретатор плана).
+            ffn_op_json = kFfnOpJson;
+        }
+
+        // --- [R4] round 5: shared-expert (Qwen2Moe/OLMoE: mlp.shared_expert.*)
+        // → dense-FFN группы ffn.shared (ADR-09 round 5): выход суммируется
+        // интерпретатором плана с выходом routed-экспертов слоя; отсутствие
+        // тензоров — группы нет (обратная совместимость планов: поведение
+        // без изменений). Суффиксы/формы — по факту слоя (d_ff shared может
+        // отличаться от routed); частичный набор — честный SchemaMismatch.
+        for (std::int64_t i = 0; i < L; ++i) {
+            const std::string sp =
+                "model.layers." + std::to_string(i) + ".mlp.shared_expert.";
+            const char* names[3] = {"gate", "up", "down"};
+            std::string sh[3];
+            int n_sh = 0;
+            for (int k = 0; k < 3; ++k) {
+                if (find_tensor(sp + names[k] + "_proj.weight")) {
+                    sh[k] = "_proj.weight";
+                    ++n_sh;
+                } else if (find_tensor(sp + names[k] + ".weight")) {
+                    sh[k] = ".weight";
+                    ++n_sh;
+                }
+            }
+            if (n_sh == 0) continue;
+            if (n_sh != 3)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) +
+                                      ": частичный набор shared-expert "
+                                      "(mlp.shared_expert.*) — непокрытая конфигурация");
+            const TensorInfo& tg = require_tensor(sp + "gate" + sh[0], "hf");
+            if (tg.shape.size() != 2 || tg.shape[0] <= 0 || tg.shape[1] != dm)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: mlp.shared_expert.gate: ожидалась матрица "
+                                  "[d_ff_shared, d_model]");
+            const std::int64_t dff_sh = tg.shape[0];
+            check_shape(sp + "up" + sh[1], {dff_sh, dm});
+            check_shape(sp + "down" + sh[2], {dm, dff_sh});
+            char lbuf[24];
+            std::snprintf(lbuf, sizeof lbuf, "l%03d.", static_cast<int>(i));
+            groups.push_back(make_group(std::string(lbuf) + "ffn.shared.gate", "attn",
+                                        {dff_sh, dm}, dtype_weights, sp + "gate" + sh[0]));
+            groups.push_back(make_group(std::string(lbuf) + "ffn.shared.up", "attn",
+                                        {dff_sh, dm}, dtype_weights, sp + "up" + sh[1]));
+            groups.push_back(make_group(std::string(lbuf) + "ffn.shared.down", "attn",
+                                        {dm, dff_sh}, dtype_weights, sp + "down" + sh[2]));
+        }
         moe_json = ",\"moe\":{\"n_experts\":" + fmt_int(static_cast<std::int64_t>(n_experts)) +
                    ",\"n_experts_active\":" + fmt_int(static_cast<std::int64_t>(n_active)) +
                    ",\"expert_d_ff\":" + fmt_int(dff) + ",\"router\":\"softmax-topk\"}";
-        ffn_op_json = "";
     } else {
         // --- 4c. MoE, стековные тензоры (Mixtral) ------------------------------
         const std::uint64_t n_experts = cfg_u64("num_local_experts", false, 0)
