@@ -36,6 +36,15 @@
   accuracy = доля exit 0; протокол-константы HUMANEVAL_PROMPT_TOKENS=64 /
   HUMANEVAL_MAX_STEPS=32 фиксируются в report.json.
 
+## Уточнения контракта (round 5, T-20261017200354)
+
+- `stell_logits` `positions:"last"`: JSON-контракт §2 ADR-11 не меняется;
+  уточнение стоимости — на стороне engine (проекция только последней
+  позиции, O(vocab) — см. ADR-11 «Уточнение round 5» и дубль в engine.md).
+  Serve-контур PPL (incremental-last в quality-gates, fixup round 4) —
+  без изменений; побитовая эквивалентность движкового last-пути —
+  обязательна (тест).
+
 ## Объём (из PLAN.md §4, поток E)
 
 - Оба API в одном процессе на порту 8080: /v1/chat/completions + /v1/messages;
