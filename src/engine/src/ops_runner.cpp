@@ -493,15 +493,20 @@ std::vector<float> OpsInterpreter::step_logits(SlotId slot,
     return forward_token(st, token);
 }
 
-std::vector<float> OpsInterpreter::run_prompt_logits(
+std::vector<std::vector<float>> OpsInterpreter::run_prompt_logits_all(
     const std::vector<std::int32_t>& prompt) {
     SlotState st{};
     reset_slot(st, spec_.n_layers);
-    std::vector<float> logits;
-    for (std::int32_t tok : prompt) {
-        logits = forward_token(st, tok);
-    }
-    return logits;
+    std::vector<std::vector<float>> rows;
+    rows.reserve(prompt.size());
+    for (std::int32_t tok : prompt) rows.push_back(forward_token(st, tok));
+    return rows;
+}
+
+std::vector<float> OpsInterpreter::run_prompt_logits(
+    const std::vector<std::int32_t>& prompt) {
+    const std::vector<std::vector<float>> rows = run_prompt_logits_all(prompt);
+    return rows.empty() ? std::vector<float>{} : rows.back();
 }
 
 // --- sampling ----------------------------------------------------------------

@@ -32,7 +32,9 @@ uint64_t stell_submit(stell_engine_t* e, const char* request_json, char** msg_ou
    [{"seq":N,"type":"token","token_id":X}, ...]; free() обязателен. */
 int  stell_poll(stell_engine_t* e, uint64_t session_id, char** out_json);
 
-/* Отмена: сессия выбрасывается из батча на ближайшем шаге (ADR-11 §3). */
+/* Отмена: сессия выбрасывается из батча на ближайшем шаге (ADR-11 §3).
+   Возврат — по конвенции модуля (ADR-11 §1, как engine_create/submit):
+   0 — успех; -1 — сессия не найдена или уже закрыта. */
 int  stell_cancel(stell_engine_t* e, uint64_t session_id);
 
 /* Round-1 расширение (однопоточный CPU-контур; ADR-11 §1: «поля только
@@ -44,6 +46,20 @@ void stell_step(stell_engine_t* e);
 /* Метрики/health — JSON (ADR-11 §4): снапшот, потокобезопасно;
    free() обязателен. */
 int  stell_metrics(stell_engine_t* e, char** out_json);
+
+/* Round-2 расширение (ADR-11 §1: «поля/символы только добавляются» —
+   ABI-совместимо, прецедент stell_step): логиты финального слоя (ДО softmax)
+   на готовых token id — quality-гейты (PPL) считают logprob по позициям.
+   request_json: {"prompt_tokens":[...], "positions":"last"|"all"}
+     — "positions" по умолчанию "last";
+     — "last" — логиты последней позиции промпта;
+     — "all" — по всем позициям промпта (teacher-forcing за один вызов).
+   out_json: {"logits":[[float,...],...], "n_positions":P, "n_vocab":V}
+     — P = 1 ("last") или число токенов промпта ("all"); V = vocab_size.
+   Возврат: 0 — успех; -1 — ошибка (out_json = {"error":"..."}; runner:"demo"
+   логиты не поддерживает — нужен runner:"ops"). Строки malloc — free() на
+   вызывающем (конвенция ADR-11 §1 для malloc-строк). */
+int  stell_logits(stell_engine_t* e, const char* request_json, char** out_json);
 
 #ifdef __cplusplus
 }

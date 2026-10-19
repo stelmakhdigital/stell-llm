@@ -63,6 +63,13 @@ public:
     // Логиты последнего токена промпта на свежем состоянии (golden-тест).
     std::vector<float> run_prompt_logits(const std::vector<std::int32_t>& prompt);
 
+    // Логиты ВСЕХ позиций промпта на свежем состоянии ([P][vocab]; режим
+    // "all" ABI-символа stell_logits, round 2): teacher-forcing за один
+    // вызов. Последняя строка == run_prompt_logits(prompt) побитово
+    // (тот же forward_token-цикл).
+    std::vector<std::vector<float>> run_prompt_logits_all(
+        const std::vector<std::int32_t>& prompt);
+
     // Слот освобождён (Scheduler, ADR-11 §3): сброс KV-кеша слота.
     void release_slot(SlotId slot) { slots_.erase(slot); }
 
