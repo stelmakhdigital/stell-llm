@@ -391,6 +391,110 @@ TEST(parallel_gpu_nccl_expert_alltoall_kv_stream) {
     CHECK(ok.get());
 }
 
+// --- [R1] round 4b: транспортная sanity — минимальная корректность пары -------
+
+// Самостоятельный TEST (отдельная фаза оркестратора, ДО expert-контракта,
+// вне bench_allowed_after-логики): минимальные allreduce+allgather F32 с
+// побитовым сравнением против CPU-паттернов, БЕЗ latency-замеров (латентности
+// остаются в bench-фазе с co-tenancy-пометкой). Диагностическая развилка
+// round 4: простые коллективы проходят → транспорт ОК (а expert_alltoall
+// не подтверждён → баг нашей обвязки → честный FAIL, поток C); падают тем
+// же 'unhandled cuda error' → транспорт/среда → честный pending. Тот же
+// ретрай-протокол (3 попытки) и watchdog-оркестратор.
+TEST(parallel_gpu_nccl_transport_sanity) {
+    const char* env = std::getenv("STELL_GPU_DEVICES");
+    const std::vector<int> devices = parse_devices(env ? env : STELL_GPU_TEST_DEVICES);
+    if (devices.size() < 2) {
+        std::printf("PENDING: нужно ≥2 устройств (STELL_GPU_DEVICES)\n");
+        g_phase_outcome = kOutcomeFewDevices;
+        return;
+    }
+    constexpr std::size_t N = 1024;
+    SafeFlag ok;
+    std::vector<std::thread> th;
+    for (rank_t r = 0; r < rank_t(devices.size()); ++r)
+        th.emplace_back([&, r] {
+            ParallelConfig cfg;
+            cfg.mode = CommMode::Nccl;
+            cfg.pp = 1;
+            cfg.tp = rank_t(devices.size());
+            cfg.ep = 1;
+            cfg.device_ids = devices;
+            cfg.rank = r;
+            cfg.group_id = 2;                        // отдельный бутстрап
+            cfg.timeout_ms = 30000;
+            try {
+                auto comm = make_communicator(cfg);
+                const rank_t world = comm->world_size();
+                float* dev_buf = nullptr;
+                float* dev_recv = nullptr;
+                check_cuda(cudaMalloc(&dev_buf, N * 4), "cudaMalloc");
+                check_cuda(cudaMalloc(&dev_recv, N * std::size_t(world) * 4), "cudaMalloc");
+                auto cleanup = [&] { cudaFree(dev_buf); cudaFree(dev_recv); };
+                try {
+                    std::vector<float> host(N);
+                    // allreduce F32: побитово == сумме CPU-паттернов ранков
+                    // (суммы целых < 2^22 — точны).
+                    for (std::size_t i = 0; i < N; ++i)
+                        host[i] = 1000.0f * float(r) + float(i);
+                    check_cuda(cudaMemcpy(dev_buf, host.data(), N * 4,
+                                          cudaMemcpyHostToDevice), "H2D");
+                    comm->allreduce(dev_buf, N, CommDType::F32);
+                    check_cuda(cudaMemcpy(host.data(), dev_buf, N * 4,
+                                          cudaMemcpyDeviceToHost), "D2H");
+                    for (std::size_t i = 0; i < N; ++i) {
+                        float expect = 0.f;
+                        for (rank_t s = 0; s < world; ++s)
+                            expect += 1000.0f * float(s) + float(i);
+                        if (!(host[i] == expect)) ok.fail();
+                    }
+                    // allgather F32: побитово == конкатенации send-паттернов.
+                    for (std::size_t i = 0; i < N; ++i)
+                        host[i] = 100.0f * float(r) + float(i);
+                    check_cuda(cudaMemcpy(dev_buf, host.data(), N * 4,
+                                          cudaMemcpyHostToDevice), "H2D");
+                    comm->allgather(dev_buf, dev_recv, N, CommDType::F32);
+                    std::vector<float> recv(N * std::size_t(world));
+                    check_cuda(cudaMemcpy(recv.data(), dev_recv, recv.size() * 4,
+                                          cudaMemcpyDeviceToHost), "D2H");
+                    for (rank_t s = 0; s < world; ++s)
+                        for (std::size_t i = 0; i < N; ++i)
+                            if (!(recv[std::size_t(s) * N + i] ==
+                                  100.0f * float(s) + float(i)))
+                                ok.fail();
+                } catch (...) {
+                    cleanup();
+                    throw;
+                }
+                cleanup();
+                std::printf("TRANSPORT-SANITY: rank%d: allreduce+allgather F32 побитово OK\n",
+                            int(r));
+            } catch (const CommError& e) {
+                std::printf("PENDING: CommError (rank %d): %s\n", int(r), e.what());
+                g_threw.store(true);
+                ok.fail();
+            } catch (...) {
+                std::printf("PENDING: неизвестная ошибка (rank %d)\n", int(r));
+                g_threw.store(true);
+                ok.fail();
+            }
+        });
+    for (auto& t : th) t.join();
+    if (!ok.get()) {
+        if (g_threw.load())
+            g_phase_outcome = "pending:транспортная sanity: co-tenancy/OOM/бутстрап "
+                              "(проверки не проведены)";
+        else
+            g_phase_outcome =
+                "fail:транспортная sanity: корректность allreduce/allgather "
+                "не подтверждена";
+        std::printf("PENDING: транспортная sanity не подтверждена — см. вывод выше\n");
+        return;
+    }
+    g_phase_outcome = kOutcomePass;
+    CHECK(ok.get());
+}
+
 // --- оркестратор [R3]: дочерние процессы под watchdog'ом ----------------------
 
 namespace {
@@ -398,7 +502,9 @@ namespace {
 constexpr int kDefaultWatchdogS = 240;   // зависание NCCL-коллектива — только извне
 
 const char* phase_filter(const char* phase) {
-    // bench-фаза — только латентности; correctness — контракт alltoall/kv_stream.
+    // transport — транспортная sanity (мин. allreduce+allgather F32);
+    // bench — только латентности; correctness — контракт alltoall/kv_stream.
+    if (std::strcmp(phase, "transport") == 0) return "parallel_gpu_nccl_transport";
     return std::strcmp(phase, "bench") == 0 ? "parallel_gpu_nccl_allreduce"
                                             : "parallel_gpu_nccl_expert_alltoall";
 }
@@ -493,6 +599,45 @@ int orchestrate() {
     close(out_fd);
     const std::string out_file(out_path);
 
+    // --- Фаза 0 [R1] round 4b: транспортная sanity — ДО expert-контракта,
+    //     вне bench_allowed_after-логики: минимальные 2-ранковые
+    //     allreduce+allgather F32 (диагностическая развилка «транспорт vs код»);
+    //     тот же ретрай-протокол (3 попытки) и watchdog ---------------------
+    std::string transport_outcome;
+    if (devices.size() >= 2) {
+        int attempt = 1;
+        for (;;) {
+            if (attempt == 1)
+                std::printf("GPU-VALIDATION: транспортная sanity, попытка 1 (минимальные "
+                            "allreduce+allgather F32 на паре %s)\n", devices_str.c_str());
+            else if (attempt == 2)
+                std::printf("GPU-VALIDATION: транспортная sanity, попытка 2 с NCCL_P2P_DISABLE=1\n");
+            else
+                std::printf("GPU-VALIDATION: транспортная sanity, попытка 3 с "
+                            "NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 (socket/NET)\n");
+            std::fflush(stdout);
+            std::remove(out_file.c_str());
+            const int rc = run_child_phase("transport", out_file.c_str(), attempt,
+                                           watchdog_s, "транспортной sanity");
+            if (rc == -1) { transport_outcome = "pending:fork не удался"; break; }
+            transport_outcome = read_outcome(out_file.c_str());
+            const GpuRetryVerdict v = p2p_retry_decide(attempt, transport_outcome);
+            if (v == GpuRetryVerdict::Pass) break;
+            if (v == GpuRetryVerdict::RetryWithP2pDisabled) { attempt = 2; continue; }
+            if (v == GpuRetryVerdict::RetryWithShmDisabled) { attempt = 3; continue; }
+            break;
+        }
+        if (outcome_is_pass(transport_outcome))
+            std::printf("GPU-VALIDATION: транспортная sanity OK — транспорт на паре "
+                        "подтверждён (простые коллективы побитово == CPU-эталону)\n");
+        else
+            std::printf("GPU-VALIDATION: транспортная sanity не подтверждена (%s)\n",
+                        transport_outcome.c_str());
+    } else {
+        transport_outcome = kOutcomeFewDevices;
+        std::printf("GPU-VALIDATION: транспортная sanity неприменима (меньше 2 карт)\n");
+    }
+
     // --- Фаза 1: корректность (ровно 3 попытки: 1 дефолт; 2 = без P2P, SHM;
     //     3 = без P2P и без SHM, NET/sockets) -------------------------------
     std::string outcome;
@@ -530,14 +675,31 @@ int orchestrate() {
         break;   // GiveUpPending: попытки исчерпаны
     }
 
-    // --- Вердикт фазы корректности -----------------------------------------
-    if (outcome_is_fail(outcome)) {
+    // --- Итоговый вердикт (транспортная sanity + expert-контракт) ----------
+    // Развилка [R1] round 4: транспорт ОК + expert не подтверждён → баг
+    // НАШЕЙ обвязки (counts-allgather) → честный FAIL (поток C); падение
+    // простых коллективов тем же 'unhandled cuda error' → транспорт/среда →
+    // честный pending.
+    const GpuValidationVerdict fv =
+        gpu_validation_verdict(transport_outcome, outcome);
+    if (fv == GpuValidationVerdict::FailExpert) {
+        std::printf("GPU-VALIDATION FAIL: транспорт ОК (минимальные allreduce+allgather "
+                    "подтвердили корректность на паре), expert-контракт НЕ подтверждён "
+                    "(%s) — баг нашей expert_alltoall (counts-allgather), починка в "
+                    "потоке C; underlying-ошибка NCCL — в сообщении CommError\n",
+                    outcome.c_str());
+        std::remove(out_file.c_str());
+        return 1;   // честный FAIL (маскировать pending'ом запрещено)
+    }
+    if (outcome_is_fail(transport_outcome) || outcome_is_fail(outcome)) {
         std::printf("GPU-VALIDATION FAIL: корректность NCCL-контракта НЕ подтверждена "
-                    "(побитовое равенство CPU-эталону нарушено) — см. вывод попыток выше\n");
+                    "(побитовое равенство CPU-эталону нарушено; транспорт: %s; "
+                    "expert: %s) — см. вывод попыток выше\n",
+                    transport_outcome.c_str(), outcome.c_str());
         std::remove(out_file.c_str());
         return 1;   // честный FAIL: маскировать pending'ом запрещено
     }
-    if (!bench_allowed_after(outcome)) {
+    if (fv == GpuValidationVerdict::Pending || !bench_allowed_after(outcome)) {
         std::printf("GPU-VALIDATION PENDING: %s "
                     "(checks=0 failures=0 — проверки корректности не проводились; "
                     "worker повторит в окне; co-tenancy: см. server-env)\n",
