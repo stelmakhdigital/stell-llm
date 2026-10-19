@@ -71,6 +71,43 @@ engine (core-2) — в процессе (см. отчёт раунда).**
 - NVFP4-веса = dequant(quantize(F16→f32)) по референсу quant.hpp;
 - greedy argmax: ничья → меньший индекс.
 
+## Mixtral-класс GGUF (round 2, R9) — logits_mini_mixtral.json
+
+- `mini_mixtral.gguf` (fixtures/, seed 0x00D3) — синтетический GGUF v3
+  mixtral-профиля: d_model=8, n_heads=2, n_kv_heads=1 (GQA), vocab=16,
+  n_layers=2, n_experts=4, n_experts_active=2, d_ff=16; нативные имена
+  тензоров формата GGUF (см. ADR-09 «Уточнение»): `token_embd.weight`,
+  `output_norm.weight`, `output.weight`, `blk.{i}.attn_*`,
+  `blk.{i}.ffn_gate_inp.weight` (роутер), `blk.{i}.exp_probs_b.weight`
+  (смещение роутера), стековные `blk.{i}.ffn_gate_exps/ffn_up_exps/
+  ffn_down_exps.weight` [n_experts, d_ff, d_model] — срезы экспертов по
+  старшей размерности (`source_slice` в описании).
+- n_experts / n_experts_active читаются конвертером из GGUF-метаданных
+  (`llama.expert_count` / `llama.expert_used_count`).
+- `fixtures/mini_mixtral.json` — описание модели, ПОБАЙТОВО равное выводу
+  конвертера `gguf_to_description` (roundtrip-проверка в
+  test_gguf_mixtral.cpp);
+- веса референса интерпретатор читает ИЗ файла (писатель GGUF проверяется);
+- pre-MoE норма = `blk.{i}.ffn_norm` (нативная раскладка); роутер =
+  `ffn_gate_inp` + `exp_probs_b`; остальное — как в «Семантика ops».
+- сравнение: test_models_gguf_mixtral, порог tolerance_rel = 1e-3
+  (фактический max_rel ≈ 1.6e-4 — расхождение порядка суммирования float32
+  в softmax/renorm между numpy и C++; greedy-токен совпадает).
+
+## Tokenizer-fixture (round 2, R10) — fixtures/tokenizer/
+
+- `tokenizer.json` — byte-level BPE (алфавит 256 байт-символов + 94 merge'а,
+  pretokenizer ByteLevel add_prefix_space=false use_regex=false — вся строка
+  один чанк; decoder ByteLevel); корпус и генератор —
+  `generate_tokenizer_fixture.py` (запускается в env hf, БЕЗ сети).
+- `tokenizer_ref.json` — эталонные id 25 фиксированных ASCII-строк от
+  эталонной реализации (см. `meta.reference_impl` в самом файле); committed,
+  тесты от Python не зависят.
+- C++-токенизатор (src/models, ByteLevelBpeTokenizer → ITokenizer engine,
+  инжект Scheduler::set_tokenizer) сверяется с этим файлом:
+  расхождение id = 0, идемпотентность encode→decode = 100%
+  (test_models_tokenizer).
+
 ## Как включить сравнение (когда core-2 допишет logits_tested)
 
 1. Прогон engine по fixture (см. отчёт раунда; `loader` путь, профиль из

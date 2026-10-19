@@ -1,4 +1,4 @@
-// Лоадер safetensors (HF) — контракт ADR-09 §3.
+// Лоадер safetensors — контракт ADR-09 §3.
 #include "tensor_file_formats.hpp"
 #include "quant.hpp"
 

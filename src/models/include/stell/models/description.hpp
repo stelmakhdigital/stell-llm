@@ -56,6 +56,12 @@ struct TensorGroupTemplate {
     std::string dtype;             // целевой dtype группы (профиль ADR-03)
     std::string source_pattern;    // имя тензора во входном формате (ADR-09 §1)
     bool kv_block = false;         // группа KV-кеша: весов в файле нет
+    // Номер среза стекового тензора по СТАРШЕЙ размерности (round 2, R9:
+    // стековные экспертные тензоры GGUF-микстра, напр. blk.N.ffn_gate_exps
+    // [n_experts, d_ff, d_model]): шаблон с токенами ("{expert}") или
+    // литерал; пусто = группа занимает тензор целиком. Срез непрерывен:
+    // старшая размерность — внешняя (row-major).
+    std::string source_slice;
     // cardinality в порядке документа JSON (итерация = внешний цикл → внутренний).
     std::vector<std::pair<std::string, std::uint32_t>> cardinality;
 };
@@ -79,6 +85,11 @@ struct ModelDescription {
     // Разрешённые source_pattern для каждой группы (тот же порядок, что groups);
     // для kv-групп паттерн указывает на KV-блок слоя, а не на весовой тензор.
     std::vector<std::string> group_source_patterns;
+    // Срез стекового тензора по старшей размерности для каждой группы (тот же
+    // порядок; −1 = группа занимает тензор целиком). Round 2 (R9): стековные
+    // экспертные тензоры GGUF-mixtral; срез непрерывен (row-major, старшая
+    // размерность — внешняя). См. TensorGroupTemplate::source_slice.
+    std::vector<std::int64_t> group_source_slices;
 };
 
 // Парсинг + валидация описания (ADR-09 §1: schema-версия, роли, dtype,

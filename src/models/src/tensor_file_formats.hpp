@@ -6,7 +6,7 @@
 
 namespace stell::models {
 
-// safetensors (HF): u64 header_len (LE) → JSON-заголовок → данные.
+// safetensors: u64 header_len (LE) → JSON-заголовок → данные.
 // Поддержанные dtype: F16, F32, F8_E4M3 (остальные — UnsupportedQuant при
 // обращении; itemsize известен для пропуска/валидации размеров).
 TensorFileMap parse_safetensors_header(std::FILE* f);
@@ -17,7 +17,8 @@ TensorFileMap parse_safetensors_header(std::FILE* f);
 // КОНВЕНЦИЯ SHAPE (round 2, зафиксировано): GGUF ne хранит dims в порядке
 // {in, out} для матриц ({n_embd, vocab} для token_embd и т.п.), при этом
 // байты в GGUF C-порядке совпадают с row-major [out, in] — то есть
-// РАЗВЕРНУТЫЙ порядок ne == логической форме (HF-конвенция). Поэтому
+// РАЗВЕРНУТЫЙ порядок ne == логической форме (конвенция раскладки
+// safetensors/JSON-конфигов). Поэтому
 // parse_gguf_header возвращает TensorInfo.shape = РАЗВЕРНУТЫЙ dims
 // (1-D тензоры не меняются); байты payload не меняются.
 TensorFileMap parse_gguf_header(std::FILE* f);
@@ -54,10 +55,8 @@ GgufMetaValue gguf_read_meta_value(std::FILE* f, std::uint32_t type);
 
 // Код квантованных GGML-блоков (subset round 2): Q4_0 (GGML 20) и Q8_0 (GGML 36).
 constexpr std::uint32_t kGgmlQ40 = 20, kGgmlQ80 = 36;
-
-inline bool is_quantized_ggml(const std::string& dtype_str) {
-    return dtype_str == "Q4_0" || dtype_str == "Q8_0";
-}
+// Имена/размеры блоков — в quant.hpp (is_quantized_ggml/ggml_block_bytes):
+// общие для лоадера и срезов стековных тензоров (file_weights_source.hpp).
 
 // Dequant квантованного GGUF-тензора → f32 (референс ggml-блоков):
 //   Q4_0: блок 32 эл. = 2 байта F16 delta (в НАЧАЛЕ блока) + 16 байт нибблов;

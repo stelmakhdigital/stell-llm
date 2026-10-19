@@ -3,7 +3,8 @@
 //
 // Фикстуры golden сгенерированы НЕЗАВИСИМОЙ реализацией (Python-интерпретатор
 // ops-графа, tests/models/golden/generate_golden.py) и сверены против
-// второго референса — HF LlamaForCausalLM / MixtralForCausalLM (CPU float32,
+// второго референса — эталонные реализации референсных архитектур
+// (см. golden/hf_crosscheck.py и golden/README.md; CPU float32,
 // см. hf_crosscheck.py и meta-блоки в файлах): max_rel_err ~1.5e-7.
 //
 // Фикстуры: tests/models/golden/logits_<fixture>.json (схема
@@ -136,7 +137,7 @@ void body() {
             ++skipped;
             std::printf(
                 "SKIP: %s — референс готов (независимый Python-интерпретатор + "
-                "HF-кроссчек, см. meta), прогона engine ещё нет: сравнение "
+                "кроссчек эталонной реализации, см. meta), прогона engine ещё нет: сравнение "
                 "включится, когда core-2 допишет logits_tested (схема: "
                 "logits_ref.schema.json)\n",
                 name.c_str());

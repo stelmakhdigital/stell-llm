@@ -24,9 +24,10 @@ ModelDescription load_mini_dense() {
 std::vector<SynthTensor> make_tensors() {
     // ВАЖНО (round 2, конвенция shape GGUF): для матриц GGUF ne хранит
     // {in, out} (байты C-порядка совпадают с row-major [out, in]); лоадер
-    // возвращает развернутый dims (логическую форму HF-конвенции). Писатeль
+    // возвращает развернутый dims (логическую форму по конвенции раскладки
+// safetensors/JSON-конфигов). Писатeль
     // write_gguf пишет dims КАК ЕСТЬ, поэтому тест передаёт GGUF-нативные
-    // dims (развернутые относительно HF-форм).
+    // dims (развернутые относительно логических форм).
     std::vector<SynthTensor> out;
     auto push_f32 = [&](const std::string& name, std::vector<std::int64_t> shape, float seed) {
         std::reverse(shape.begin(), shape.end());  // GGUF-native dims (ne[0] = input dim)

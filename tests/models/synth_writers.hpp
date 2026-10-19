@@ -1,5 +1,5 @@
 // Синтетические writer'ы входных форматов для тестов лоадеров:
-//   write_safetensors — safetensors (HF): u64 header_len LE + JSON + данные;
+//   write_safetensors — safetensors: u64 header_len LE + JSON + данные;
 //   write_gguf        — GGUF v3 subset, согласован с loader_gguf.cpp.
 // Оба писателя формируют little-endian байты (x86/ARM64 — LE, для тестов ок).
 #pragma once
@@ -41,7 +41,8 @@ inline void put_f32(std::vector<std::uint8_t>& out, float v) {
 
 // --- safetensors -------------------------------------------------------------
 // Данные начинаются после 8 + header_len; заголовок дополняется пробелами
-// до кратности 8 (как в HF). data_offsets — смещения внутри секции данных.
+// до кратности 8 (как в формате safetensors). data_offsets — смещения
+// внутри секции данных.
 void write_safetensors(const std::string& path, const std::vector<SynthTensor>& tensors) {
     std::string header = "{";
     for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -127,7 +128,7 @@ inline void put_meta_kv(std::vector<std::uint8_t>& out, const GgufMetaKV& kv) {
 // meta — произвольные метаданные (конвертер описаний читает их для arch/размеров).
 // dims тензора пишутся из SynthTensor.shape КАК ЕСТЬ — для GGUF-нативного
 // порядка тест передаёт dims {in, out} (см. loader_gguf.cpp: развернутый
-// порядок == логической форме HF).
+// порядок == логической форме (конвенция safetensors/JSON-конфигов).
 void write_gguf_meta(const std::string& path, const std::vector<SynthTensor>& tensors,
                      const std::vector<GgufMetaKV>& meta,
                      std::uint64_t alignment = 32) {
