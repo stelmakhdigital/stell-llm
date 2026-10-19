@@ -277,13 +277,13 @@ Mismatch = исключение `SchemaMismatch`/`UnsupportedQuant` (тишин�
   тест на фикстуре Qwen2Moe/OLMoE-класса со shared-экспертом — логиты ==
   референсу плана (побитово на CPU).
 
-## Уточнение (round 6, задача T-20261017200354) — оп-дополнение `ffn.shared.gate`
+## Уточнение (round 6, задача T-20261017200354) — оп-дополнение `ffn.shared.gate_scalar`
 
 Решение planner round 5 [Q5] → [R1] (вердикт round 4: approve). Схема §1,
 контракты §2–§4 и уточнения round 1/2/5 не меняются; ниже — op-дополнение
 к семантике shared-expert («Оп-дополнение `ffn.shared`» round 5).
 
-- **Скалярный сигмоид-гейт — op `ffn.shared.gate`.** Реальные модели класса
+- **Скалярный сигмоид-гейт — op `ffn.shared.gate_scalar`.** (Имя: контрактом раунда 5 имя `ffn.shared.gate` занято матрицей gate_proj shared-FFN — группы сосуществуют с разными именами; оба потока round 6 — core и models — пришли к `gate_scalar` независимо.) Реальные модели класса
   Qwen2Moe содержат тензор `mlp.shared_expert_gate` (форма d_model→1): выход
   shared-FFN умножается на скаляр
   `gate_scalar = sigmoid(dot(w_gate, hidden))`, где `w_gate` — тензор
@@ -305,7 +305,7 @@ Mismatch = исключение `SchemaMismatch`/`UnsupportedQuant` (тишин�
   из тензора `mlp.shared_expert_gate` (форма `[1, d_model]`, роль — как
   у `ffn.shared`, обычно `expert`); `source_pattern` — имя тензора
   во входном формате (для Qwen2Moe-семейства — `mlp.shared_expert_gate`).
-- **Отсутствие группы — прежнее поведение.** Нет `ffn.shared.gate` →
+- **Отсутствие группы — прежнее поведение.** Нет `ffn.shared.gate_scalar` →
   аддитивный вклад без гейта (поведение round 5); существующие планы
   валидны без перегенерации (обратная совместимость, как round 5).
 - **Частичный набор — честный SchemaMismatch.** Комбинация «gate есть,

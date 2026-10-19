@@ -39,7 +39,7 @@
 
 ## Решения round 6 (T-20261017200354, planner [Q5]/[Q1], вердикт round 4: approve)
 
-- **`ffn.shared.gate`** ([R1]): скалярный сигмоид-гейт shared-эксперта —
+- **`ffn.shared.gate_scalar`** ([R1]): скалярный сигмоид-гейт shared-эксперта —
   `sigmoid(dot(w_gate, hidden)) × shared_ffn_out`, суммирование с routed
   в фиксированном порядке (`routed_sum`, затем добавление gate-вклада —
   для побитового референса); группа из тензора `mlp.shared_expert_gate`
