@@ -78,6 +78,40 @@ co-tenancy не поднимается — shm-attach failure. Диагност�
    GPU-VALIDATION OK, `checks=1` (allreduce ≈ 0.8 µs). Логи —
    `bench/results/20261019-nccl-gpu-r3/`.
 
+### Исход попытки 3 (round 4, worker-прогон 2026-10-19) — ограничение среды ФИКСИРУЕТСЯ
+
+Попытка 3 (`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`, socket/NET) **не подняла
+транспорт**. Протокол round 4 (пара GPU0+GPU4, `ncclGetLastError` теперь в
+CommError):
+
+1. Транспортная sanity (новая фаза 0, round 4b): попытка 1 — ncclAllReduce →
+   `Error while attaching to shared memory segment /dev/shm/nccl-… (9.6 МиБ),
+   errno 11/115`; попытка 2 (P2P_DISABLE) — WATCHDOG-тайм-аут 240 с (зависание
+   коллектива); попытка 3 (SHM_DISABLE) — **`Failed to CUDA host alloc
+   9641984 bytes`** на обоих ранках.
+2. expert-фаза — те же три исхода; expert_alltoall не достигается (первый
+   коллективный вызов падает раньше).
+3. Вердикт по развилке `gpu_validation_verdict`: **Pending** (обе ветки сломаны
+   средой) — не FailExpert (транспорт не подтверждён, атрибуция нашей обвязке
+   невозможна).
+
+Факторы среды, проверенные и отпавшие:
+- `/dev/shm`: 32 ГБ, rw, пуст — исправен.
+- `RLIMIT_MEMLOCK`: 8.2 ГБ — достаточно; **изолированный** `cudaHostAlloc`
+  9.6 МиБ проходит (rc=0) — pinned-аллокат сам по себе работает.
+- Single-card world=1 (RTX 2060): GPU-VALIDATION OK, checks=1 — NCCL и наш
+  код корректны до межранкового bootstrap.
+
+Итог: **ограничение среды фиксируется окончательно** — межкарточный
+NCCL-bootstrap (shm-attach errno 11/115 + отказ CUDA host alloc внутри
+многоранкового процесса при работающем одиночном) не поднимается под
+co-tenancy strata. Гипотезы для чистого окна: вмешательство co-tenancy в
+IPC/pinned-бюджет процесса, NCCL 2.26.2 + данное ядро/ОС. Межкарточная
+корректность expert_alltoall/kv_stream — блокер среза 2 GPU-этапа, ждёт
+чистого окна (пара V100+V100 без strata; `NCCL_DEBUG=INFO` + strace attach).
+CPU-контракты + single-card подтверждение — постоянная база; фолбэка на
+неподтверждённую корректность нет.
+
 ### Попытка 3 — socket-транспорт (план round 4, [R1])
 
 - `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` — вынуждает NCCL на
