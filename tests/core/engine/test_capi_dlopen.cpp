@@ -61,7 +61,8 @@ static void run_steps(void* lib) {
     STELL_CHECK(strstr(m, "sessions_active") != NULL);
     free(m);
 
-    STELL_CHECK(cancel_fn(e, id) == 0);   // сессия завершена — cancel → false(0)
+    STELL_CHECK(cancel_fn(e, id) == -1);   // сессия завершена — cancel → -1
+                                           // (round 2: 0=успех, -1=не найдена/закрыта)
     destroy_fn(e);
 }
 

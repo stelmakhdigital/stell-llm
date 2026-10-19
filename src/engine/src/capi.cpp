@@ -252,7 +252,10 @@ int stell_poll(stell_engine_t* e, uint64_t session_id, char** out_json) {
 int stell_cancel(stell_engine_t* e, uint64_t session_id) {
     auto* ctx = reinterpret_cast<EngineCtx*>(e);
     if (!ctx) return -1;
-    return ctx->sched->cancel(session_id) ? 1 : 0;
+    // Конвенция ADR-11 §1: 0 = успех, -1 = ошибка (сессия не найдена/уже
+    // закрыта). Внутренний Scheduler::cancel → bool маппится здесь (round 2:
+    // было 1/0 bool — случайное отступление от конвенции модуля).
+    return ctx->sched->cancel(session_id) ? 0 : -1;
 }
 
 void stell_step(stell_engine_t* e) {
@@ -273,6 +276,73 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   (unsigned)ctx->pool->capacity());
     *out_json = strdup(buf);
     return 0;
+}
+
+// --- round 2: stell_logits (ADR-11 §1, новое ABI-расширение) -----------------
+// Логиты финального слоя (до softmax) на готовых token id; runner:"ops"
+// (OpsInterpreter) исполняет prefill всех prompt_tokens на свежем состоянии;
+// "positions":"last" — только последняя позиция, "all" — все (teacher-
+// forcing за один вызов). Сериализация float — %.9g (float32 ≈ 9 значащих
+// цифр — round-trip без потери; json_dump использует %g — 6 цифр, мало для
+// quality-гейтов с rel ≤ 1e-6).
+int stell_logits(stell_engine_t* e, const char* request_json, char** out_json) {
+    auto* ctx = reinterpret_cast<EngineCtx*>(e);
+    auto fail = [&](const std::string& what) -> int {
+        if (out_json)
+            *out_json = strdup(("{\"error\":\"" + json_escape(what) + "\"}").c_str());
+        return -1;
+    };
+    if (!ctx || !request_json || !out_json) return -1;
+    try {
+        Json req = json_parse(request_json);
+        std::vector<std::int32_t> prompt;
+        if (const Json* v = req.find("prompt_tokens")) {
+            if (v->t != Json::T::Array) return fail("prompt_tokens: not array");
+            for (const Json& t : v->arr)
+                prompt.push_back(static_cast<std::int32_t>(t.as_int()));
+        }
+        if (prompt.empty()) return fail("empty prompt_tokens");
+        std::string positions = "last";
+        if (const Json* v = req.find("positions"))
+            positions = v->as_string("last");
+        if (positions != "last" && positions != "all")
+            return fail("positions: допустимо last или all");
+
+        // Логиты даёт только ops-раннер (demo — детерминированные токены без
+        // модели; честный отказ, не заглушка).
+        auto* cpu = dynamic_cast<CpuModelRunner*>(ctx->runner.get());
+        if (!cpu) return fail("stell_logits: runner не поддерживает логиты (нужен ops)");
+        OpsInterpreter& interp = cpu->interpreter();
+
+        std::vector<std::vector<float>> rows;
+        if (positions == "all") {
+            rows = interp.run_prompt_logits_all(prompt);
+        } else {
+            rows.push_back(interp.run_prompt_logits(prompt));
+        }
+
+        std::string out = "{\"logits\":[";
+        char buf[40];
+        for (std::size_t p = 0; p < rows.size(); ++p) {
+            if (p) out += ',';
+            out += '[';
+            for (std::size_t i = 0; i < rows[p].size(); ++i) {
+                if (i) out += ',';
+                std::snprintf(buf, sizeof buf, "%.9g",
+                              static_cast<double>(rows[p][i]));
+                out += buf;
+            }
+            out += ']';
+        }
+        std::snprintf(buf, sizeof buf, "],\"n_positions\":%zu,\"n_vocab\":%u}",
+                      rows.size(),
+                      static_cast<unsigned>(interp.spec().vocab_size));
+        out += buf;
+        *out_json = strdup(out.c_str());
+        return 0;
+    } catch (const std::exception& ex) {
+        return fail(ex.what());
+    }
 }
 
 } // extern "C"

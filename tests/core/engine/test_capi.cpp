@@ -92,20 +92,29 @@ void run_demo_case() {
     STELL_CHECK(metrics.find("\"slots_total\":16") != std::string::npos);
     STELL_CHECK(metrics.find("\"slots_busy\":16") != std::string::npos);
 
-    // освобождаем слот: cancel одной из 16 сессий
-    STELL_CHECK(stell_cancel(e, ids.back()) == 1);
+    // освобождаем слот: cancel одной из 16 сессий (round 2: 0 = успех,
+    // -1 = ошибка — конвенция ADR-11 §1; было 1/0 bool)
+    STELL_CHECK(stell_cancel(e, ids.back()) == 0);
     (void)poll_json(e, ids.back(), &n);
+    // повторный cancel закрытой сессии → -1
+    STELL_CHECK(stell_cancel(e, ids.back()) == -1);
+    // cancel несуществующей сессии → -1
+    STELL_CHECK(stell_cancel(e, 999999) == -1);
 
     // --- cancel + finish(cancelled) ------------------------------------------
     uint64_t s2 = stell_submit(e,
         "{\"sampling\":{\"max_tokens\":10},\"prompt_tokens\":[4,5],\"eos_token\":-1}",
         nullptr);
     STELL_CHECK(s2 != 0);
-    STELL_CHECK(stell_cancel(e, s2) == 1);
+    STELL_CHECK(stell_cancel(e, s2) == 0);           // cancel активной → 0
     evs = poll_json(e, s2, &n);
     STELL_CHECK_MSG(evs.find("\"reason\":\"cancelled\"") != std::string::npos,
                     "cancel → finish cancelled");
-    STELL_CHECK(stell_cancel(e, s2) == 0);           // повторный cancel — 0
+    // следующее poll после выкачивания finish → сессия закрыта: 0 событий,
+    // повторный cancel → -1 (планировщик удалил запись, ADR-11 §3)
+    evs = poll_json(e, s2, &n);
+    STELL_CHECK(n == 0 && evs == "[]");
+    STELL_CHECK(stell_cancel(e, s2) == -1);          // повторный cancel → -1
 
     stell_engine_destroy(e);
 }

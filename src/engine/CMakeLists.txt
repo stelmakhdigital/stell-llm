@@ -211,3 +211,24 @@ target_compile_definitions(test_engine_capi_dlopen PRIVATE
 target_link_libraries(test_engine_capi_dlopen ${CMAKE_DL_LIBS})
 target_include_directories(test_engine_capi_dlopen PRIVATE ../../tests/core)
 add_test(NAME engine/capi_dlopen COMMAND test_engine_capi_dlopen)
+
+# --- round 2 (T-20261017200354): ABI stell_logits + физический путь весов ----
+
+add_executable(test_engine_capi_logits
+    ../../tests/core/engine/test_capi_logits.cpp
+)
+target_link_libraries(test_engine_capi_logits stell_engine)
+target_include_directories(test_engine_capi_logits PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_capi_logits PRIVATE
+    STELL_GOLDEN_FIXTURE="${CMAKE_SOURCE_DIR}/tests/models/golden"
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/capi_logits COMMAND test_engine_capi_logits)
+
+add_executable(test_engine_weight_path
+    ../../tests/core/engine/test_weight_path.cpp
+)
+target_link_libraries(test_engine_weight_path stell_engine)
+target_include_directories(test_engine_weight_path PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_weight_path PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/weight_path COMMAND test_engine_weight_path)
