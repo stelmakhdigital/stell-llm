@@ -649,4 +649,264 @@ prefetch hit-rate=%.2f, vram_slots=%zu, ram_capacity=%zu B\n",
                 cfg.vram_slots, cfg.ram_capacity);
 }
 
+// --- [R2a]/[R2b]/[R5] round 4: O_DIRECT, deep-prefetch, сверка VRAM-слотов --
+
+T_CASE(manager_odirect_full_cycle) {
+    // [R2a] round 4: полный цикл тиров при odirect=true — O_DIRECT-чтение
+    // идёт ПРЯМО в выровненные RAM-буферы менеджера (posix_memalign 4096);
+    // содержимое после pin→wait побитово == payload writer'а layout.
+    // Дефолт buffered не тронут (fallback-прецедент; фиксация ниже).
+    const auto groups = plan3();
+    const auto path = write_layout("/tmp/stell_tier_test_mgr_od.stelltier", groups);
+    TierConfig cfg = ram_cfg(path, 3);
+    cfg.odirect = true;
+    TierManager mgr(cfg);
+    mgr.set_plan(groups);
+    for (const auto& g : groups) {
+        auto a = mgr.pin(GroupKey{g.id, g.role});
+        a->wait();
+        mgr.unpin(GroupKey{g.id, g.role});
+    }
+    std::vector<std::uint8_t> got(kSlot), expected(kSlot);
+    for (const auto& g : groups) {
+        mgr.read_ram_slot(g.id, got.data(), got.size());
+        for (std::size_t k = 0; k < kSlot; ++k)
+            expected[k] = std::uint8_t(g.id.value);
+        T_REQUIRE(std::memcmp(got.data(), expected.data(), kSlot) == 0,
+                  "O_DIRECT: RAM-слот == payload writer'а (побитово)");
+    }
+    // Env OR-семантика (та же, что у verify_crc): cfg=false + env "1" → on;
+    // без env и в дефолте — buffered.
+    ::setenv("STELL_TIER_ODIRECT", "1", 1);
+    const TierConfig cfg_env = tier_config_from_env(cfg);
+    ::unsetenv("STELL_TIER_ODIRECT");
+    T_REQUIRE(cfg_env.odirect == true, "env STELL_TIER_ODIRECT=1 → odirect on");
+    T_REQUIRE(TierConfig{}.odirect == false,
+              "дефолт конфига — buffered (fallback-прецедент сохранён)");
+    T_REQUIRE(tier_config_from_env(TierConfig{}).odirect == false,
+              "без env — buffered");
+}
+
+T_CASE(manager_deep_prefetch_k_in_flight) {
+    // [R2b] round 4: k групп в полёте (батч-глубина очереди загрузок).
+    // Детерминизм через диагностический крюк io_delay_ms (модель латентности
+    // ОДНОЙ группы; прод: 0): k=4 — группы материализуются в фоне
+    // ПАРАЛЛЕЛЬНО (существенно быстрее суммы латентностей), k=1 (дефолт/
+    // прецедент) — последовательно (≈ сумма). Декод префетченных групп —
+    // без пауз загрузки (prefetch-hit). Честно: порог параллельности
+    // 3.5×delay допускает разбиение очереди на ≤3 батча гонкой worker'а —
+    // любая конфигурация строго быстрее полностью последовательной (4×).
+    const std::size_t slot = 256 * 1024; // кратен 4096 (ADR-12 §2.4)
+    const std::size_t n_groups = 16, layers = 8;
+    const std::size_t delay_ms = 60;
+
+    std::vector<TensorGroup> plan;
+    for (std::size_t i = 0; i < n_groups; ++i)
+        plan.push_back(make_group(
+            std::uint32_t(i),
+            "l" + std::to_string(i / 2) + ".g" + std::to_string(i % 2),
+            (i % 2 == 0) ? Role::Attn : Role::Expert, DType::F16, slot,
+            {std::int64_t(slot / 2), 2}));
+    const auto path =
+        write_layout_payloads("/tmp/stell_tier_test_mgr_r2b.stelltier", plan, slot);
+
+    auto make_cfg = [&](std::size_t k) {
+        TierConfig c;
+        c.vram_slots = 8;          // 8 групп (4 слоя) resident — без eviction
+        c.vram_slot_size = slot;
+        c.ram_capacity = n_groups * slot;
+        c.nvme_layout = path;
+        c.lookahead = 0;           // prefetch — явно (как от engine)
+        c.deep_prefetch_depth = k;
+        c.io_delay_ms = delay_ms;  // диагностический крюк (тесты; прод: 0)
+        return c;
+    };
+    std::vector<std::vector<GroupId>> lm(layers);
+    for (std::size_t i = 0; i < n_groups; ++i)
+        lm[i / 2].push_back(GroupId{std::uint32_t(i)});
+    auto keys_of = [&](std::size_t l) {
+        std::vector<GroupKey> ks;
+        for (GroupId gid : lm[l])
+            ks.push_back(GroupKey{gid, plan[gid.value].role});
+        return ks;
+    };
+
+    // --- k=4: 4 группы (слои 1–2) материализуются в фоне ---
+    TierManager mgr4(make_cfg(4));
+    mgr4.set_plan(plan);
+    mgr4.set_layer_map(lm);
+    mgr4.prefetch(keys_of(0)); // priming: слой 0 к «началу декода»
+    for (GroupId gid : lm[0]) wait_resident(mgr4, gid);
+
+    const auto t4 = std::chrono::steady_clock::now();
+    mgr4.prefetch(keys_of(1));
+    mgr4.prefetch(keys_of(2)); // 4 job'а → батч-глубина 4 (k в полёте)
+    for (std::size_t l : {std::size_t(1), std::size_t(2)})
+        for (GroupId gid : lm[l]) wait_resident(mgr4, gid);
+    const double ms4 = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t4).count();
+    T_REQUIRE(ms4 < 3.5 * double(delay_ms),
+              "k=4: 4 группы материализованы в фоне параллельно (строго быстрее 4× латентности)");
+
+    // --- k=1 (дефолт/прецедент): те же 4 группы — последовательно ---
+    TierManager mgr1(make_cfg(1));
+    mgr1.set_plan(plan);
+    mgr1.set_layer_map(lm);
+    mgr1.prefetch(keys_of(0));
+    for (GroupId gid : lm[0]) wait_resident(mgr1, gid);
+
+    const auto t1 = std::chrono::steady_clock::now();
+    mgr1.prefetch(keys_of(1));
+    mgr1.prefetch(keys_of(2));
+    for (std::size_t l : {std::size_t(1), std::size_t(2)})
+        for (GroupId gid : lm[l]) wait_resident(mgr1, gid);
+    const double ms1 = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t1).count();
+    T_REQUIRE(ms1 > 3.5 * double(delay_ms),
+              "k=1: те же 4 группы — последовательно (≈ 4× латентность)");
+    T_REQUIRE(ms1 > ms4, "k=4 быстрее k=1 на том же layout/задержке");
+
+    // --- декод без пауз на первых k группах (после материализации) ---
+    const std::uint64_t hits4_before = mgr4.stats().prefetch.hits;
+    for (std::size_t l : {std::size_t(1), std::size_t(2)}) { // «декод» слоёв
+        const auto tw = std::chrono::steady_clock::now();
+        auto a = mgr4.pin_layer(std::uint32_t(l));
+        a->wait();
+        const double pause = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tw).count();
+        T_REQUIRE(pause < double(delay_ms),
+                  "декод префетченной группы без паузы загрузки (< латентности)");
+        for (GroupId gid : lm[l])
+            mgr4.unpin(GroupKey{gid, plan[gid.value].role});
+    }
+    const std::uint64_t hits4 = mgr4.stats().prefetch.hits - hits4_before;
+    T_REQUIRE(hits4 == 4,
+              "pin 4 префетченных групп = 4 prefetch-hit (материализованы в фоне)");
+
+    std::printf(
+        "  [r2b deep-prefetch] k=4: %.1f ms (4 группы в полёте), k=1: %.1f ms"
+        " (последовательно), delay=%zu ms — prefetch-hit 4/4, паузы декода < %zu ms\n",
+        ms4, ms1, delay_ms, delay_ms);
+}
+
+T_CASE(manager_vram_slots_bitwise_direct_loader) {
+    // [R5] round 4: интеграционный тест resident > slots — после КАЖДОГО
+    // pin/DMA содержимое VRAM-слота побитово == эталону прямого лоадера
+    // (TierLayoutReader — чтение layout ВНЕ тиров). Сценарий жертвы =
+    // префетченная группа (регрессия bugfix ba42267: aliasing VRAM-слотов —
+    // resident > vram_slots, две группы в одном слоте — не ловился тестами
+    // логитов; прямая сверка слотов — единственный прямой тест инварианта
+    // «одна группа = один слот»). CPU-конфигурация: VRAM-слот эмулируется
+    // host-памятью (vram_storage_) с тем же кодовым путём записи слота
+    // (memcpy RAM→VRAM в process_batch); DMA-путь cudaMemcpy при STELL_CUDA
+    // покрыт серверной сборкой (пометка для среза 3 — co-tenancy bench).
+    const std::size_t slot = 4096;
+    const std::size_t n_groups = 6; // 6 групп > 2 слотов — churn гарантирован
+    std::vector<TensorGroup> plan;
+    for (std::size_t i = 0; i < n_groups; ++i)
+        plan.push_back(make_group(
+            std::uint32_t(i), "g" + std::to_string(i),
+            (i % 3 == 0) ? Role::Attn
+                         : ((i % 3 == 1) ? Role::Expert : Role::Kv),
+            DType::F16, slot, {std::int64_t(slot / 2), 2}));
+    const auto path =
+        write_layout_payloads("/tmp/stell_tier_test_mgr_r5.stelltier", plan, slot);
+
+    // Эталон: прямой лоадер (TierLayoutReader, минуя TierManager).
+    std::vector<std::vector<std::uint8_t>> ref(n_groups);
+    {
+        TierLayoutReader r(path);
+        for (std::size_t i = 0; i < n_groups; ++i) {
+            ref[i].resize(slot);
+            r.read_group(std::uint32_t(i), ref[i].data());
+        }
+    }
+
+    TierConfig cfg = ram_cfg(path, 2); // vram_slots = 2 << план (6 групп)
+    TierManager mgr(cfg);
+    mgr.set_plan(plan);
+
+    int checks = 0;
+    auto verify_resident = [&](const char* what) {
+        std::size_t resident = 0;
+        for (const auto& g : plan) {
+            if (!mgr.resident_in_vram(g.id)) continue;
+            ++resident;
+            std::vector<std::uint8_t> got(slot);
+            mgr.read_vram_slot(g.id, got.data(), got.size());
+            T_REQUIRE(std::memcmp(got.data(), ref[g.id.value].data(), slot) == 0,
+                      what);
+            ++checks;
+        }
+        T_REQUIRE(resident <= cfg.vram_slots,
+                  "resident-группы ≤ vram_slots (нет aliasing слотов)");
+        const TierStats st = mgr.stats();
+        T_REQUIRE(st.tier_bytes[0] == resident * slot,
+                  "tier_bytes[VRAM] == resident × slot_bytes");
+    };
+
+    // (1) Сценарий жертвы = префетченная группа: g0/g1 префетчены и
+    // материализованы в фоне; затем префетч g2/g3 — жертвы эвиции именно
+    // префетченные (unpinned). После каждой материализации — побитовая
+    // сверка ВСЕХ resident-слотов (aliasing ba42267 дал бы resident > slots
+    // и/или несовпадение байтов).
+    mgr.prefetch({GroupKey{plan[0].id, plan[0].role},
+                  GroupKey{plan[1].id, plan[1].role}});
+    wait_resident(mgr, plan[0].id);
+    wait_resident(mgr, plan[1].id);
+    verify_resident("слоты префетченных групп == эталону прямого лоадера");
+
+    mgr.prefetch({GroupKey{plan[2].id, plan[2].role},
+                  GroupKey{plan[3].id, plan[3].role}});
+    wait_resident(mgr, plan[2].id);
+    wait_resident(mgr, plan[3].id);
+    verify_resident("после эвиции префетченных жертв: новые слоты == эталону");
+
+    // (2) Полный churn-цикл: pin/unpin всех групп — сверка ПОСЛЕ каждого pin
+    // (после каждого pin/DMA содержимое слота побитово == эталону).
+    for (int round = 0; round < 3; ++round)
+        for (const auto& g : plan) {
+            auto a = mgr.pin(GroupKey{g.id, g.role});
+            a->wait();
+            verify_resident("после каждого pin/DMA слот == эталону прямого лоадера");
+            mgr.unpin(GroupKey{g.id, g.role});
+        }
+    T_REQUIRE(checks >= 12, "покрытие сверок достаточно (≥ 12 проверок слотов)");
+
+    // (3) Ошибки расширения на детерминированном менеджере (1 слот, всё
+    // закреплено): группа не resident → IoFailure; unknown → PlanMismatch;
+    // dst меньше слота → PlanMismatch.
+    TierManager mgr2(ram_cfg(path, 1));
+    mgr2.set_plan(plan);
+    {
+        auto a = mgr2.pin(GroupKey{plan[0].id, plan[0].role});
+        a->wait(); // единственный слот занят закреплённой g0
+    }
+    bool thrown = false;
+    std::vector<std::uint8_t> buf(slot);
+    try {
+        mgr2.read_vram_slot(GroupId{1}, buf.data(), buf.size());
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::IoFailure;
+    }
+    T_REQUIRE(thrown, "read_vram_slot не-resident группы → IoFailure");
+    thrown = false;
+    try {
+        mgr2.read_vram_slot(GroupId{99}, buf.data(), buf.size());
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "read_vram_slot unknown → PlanMismatch");
+    thrown = false;
+    try {
+        mgr2.read_vram_slot(GroupId{0}, buf.data(), slot - 1);
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "read_vram_slot dst_bytes < slot_bytes → PlanMismatch");
+
+    std::printf("  [r5 vram-slot bitwise] сверок слотов: %d (vram_slots=2, план=%zu групп)\n",
+                checks, n_groups);
+}
+
 T_MAIN

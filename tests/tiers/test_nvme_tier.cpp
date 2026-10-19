@@ -4,9 +4,15 @@
 #include "nvme_file.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <memory>
+#include <cstring>
+#include <stdlib.h>
 #include <vector>
 
 #include "harness.hpp"
+
+#include <cstdlib>
 
 using namespace stell::tiers;
 
@@ -72,6 +78,54 @@ T_CASE(nvme_unknown_group_is_io_failure) {
         thrown = e.code() == TierError::Code::IoFailure;
     }
     T_REQUIRE(thrown, "неизвестная группа → IoFailure");
+}
+
+T_CASE(nvme_odirect_bitwise_equals_buffered) {
+    // [R2a] round 4: ОДИН layout читается buffered и O_DIRECT — содержимое
+    // побитово равно. Оба пути O_DIRECT: (а) staging-чтение в НЕвыровненный
+    // dst (сырой контракт read_group), (б) прямое чтение в выровненный на
+    // 4096 буфер (прод-путь RAM-буферов менеджера).
+    const auto groups = make_plan();
+    const std::string path =
+        write_layout("/tmp/stell_tier_test_nvme_od.stelltier", groups);
+
+    // Эталон: buffered-чтение (дефолт/прецедент).
+    std::vector<std::vector<std::uint8_t>> ref(groups.size());
+    {
+        TierNvmeFile file(path);
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            ref[i].resize(kSlot);
+            file.read_group(groups[i].id.value, ref[i].data());
+        }
+    }
+
+    TierNvmeFile file(path, /*verify_payload_crc=*/false, /*odirect=*/true);
+    T_REQUIRE(file.odirect_active(),
+              "O_DIRECT-тракт активен (FS/ядро поддерживают O_DIRECT; на tmpfs "
+              "тест честно падает — odirect_active()==false)");
+
+    // (а) staging-путь: гарантированно невыровненный dst (сдвиг +1).
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        std::vector<std::uint8_t> buf(kSlot + 1, 0xEE); // шум до чтения
+        file.read_group(groups[i].id.value, buf.data() + 1);
+        T_REQUIRE(std::memcmp(buf.data() + 1, ref[i].data(), kSlot) == 0,
+                  "O_DIRECT (staging, невыровненный dst) == buffered побитово");
+        T_REQUIRE(buf[0] == 0xEE, "staging-чтение не пишет за границей слота");
+    }
+    // (б) прямой путь: dst выровнен на 4096 (posix_memalign — как RAM-буферы
+    // менеджера): чтение сразу в dst, без staging-копии.
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        void* raw = nullptr;
+        T_REQUIRE(posix_memalign(&raw, 4096, kSlot) == 0, "posix_memalign 4096");
+        std::unique_ptr<std::uint8_t, void (*)(void*)> up(
+            static_cast<std::uint8_t*>(raw), std::free);
+        std::memset(up.get(), 0xEE, kSlot);
+        file.read_group(groups[i].id.value, up.get());
+        T_REQUIRE(std::memcmp(up.get(), ref[i].data(), kSlot) == 0,
+                  "O_DIRECT (прямо в выровненный буфер) == buffered побитово");
+    }
+    T_REQUIRE(file.io_ops() == 2 * groups.size(), "io_ops counter (O_DIRECT-чтения)");
+    T_REQUIRE(file.io_bytes() == 2 * groups.size() * kSlot, "io_bytes counter");
 }
 
 T_CASE(nvme_tier_through_manager) {
