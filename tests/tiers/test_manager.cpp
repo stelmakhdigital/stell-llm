@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include <stdlib.h>
+
 #include "harness.hpp"
 
 using namespace stell::tiers;
@@ -339,7 +341,7 @@ T_CASE(manager_ram_capacity_eviction) {
     T_REQUIRE(st.tier_bytes[1] <= cfg.ram_capacity, "RAM-тир не превышает capacity");
 }
 
-// --- R1 (раунд 3): CRC-политика ----------------------------------------------
+// --- R1/R7 (раунд 3): CRC-политика и конфигурируемые границы тиров ----------
 
 static std::string write_layout_payloads(const std::string& path,
                                          const std::vector<TensorGroup>& groups,
@@ -476,6 +478,35 @@ T_CASE(manager_verify_slots_catches_corruption) {
               "сообщение ровно \"layout: payload CRC mismatch\"");
 }
 
+T_CASE(manager_env_config_override) {
+    // R7: параметризация границ тиров через окружение (поверх базового;
+    // нечисловое значение → базовое, консервативно).
+    ::setenv("STELL_TIER_VRAM_SLOTS", "7", 1);
+    ::setenv("STELL_TIER_VRAM_SLOT_BYTES", "8192", 1);
+    ::setenv("STELL_TIER_RAM_MB", "3", 1);
+    ::setenv("STELL_TIER_LOOKAHEAD", "0", 1);
+    ::setenv("STELL_TIER_VERIFY_CRC", "1", 1);
+    ::setenv("STELL_TIER_POLICY", "lcu", 1);
+    const TierConfig cfg = tier_config_from_env();
+    ::unsetenv("STELL_TIER_VRAM_SLOTS");
+    ::unsetenv("STELL_TIER_VRAM_SLOT_BYTES");
+    ::unsetenv("STELL_TIER_RAM_MB");
+    ::unsetenv("STELL_TIER_LOOKAHEAD");
+    ::unsetenv("STELL_TIER_VERIFY_CRC");
+    ::unsetenv("STELL_TIER_POLICY");
+    T_REQUIRE(cfg.vram_slots == 7, "env: vram_slots");
+    T_REQUIRE(cfg.vram_slot_size == 8192, "env: vram_slot_size");
+    T_REQUIRE(cfg.ram_capacity == 3u << 20, "env: ram_capacity (МиБ → байты)");
+    T_REQUIRE(cfg.lookahead == 0, "env: lookahead");
+    T_REQUIRE(cfg.verify_crc == true, "env: STELL_TIER_VERIFY_CRC=1");
+    T_REQUIRE(cfg.policy == EvictionPolicy::Lcu, "env: политика lcu");
+
+    ::setenv("STELL_TIER_VRAM_SLOTS", "не-число", 1);
+    const TierConfig cfg2 = tier_config_from_env(TierConfig{});
+    ::unsetenv("STELL_TIER_VRAM_SLOTS");
+    T_REQUIRE(cfg2.vram_slots == 4, "нечисловое env → базовое значение");
+}
+
 T_CASE(manager_vram_slot_accounting_under_churn) {
     // Регрессия bugfix раунда 3: acquire_slot при eviction забирает слот
     // жертвы себе (pop_back). Раньше возвращал free_slots_.back() без pop →
@@ -501,6 +532,121 @@ T_CASE(manager_vram_slot_accounting_under_churn) {
     const TierStats st = mgr.stats();
     T_REQUIRE(st.tier_bytes[0] == std::uint64_t(resident) * kSlot,
               "tier_bytes[VRAM] == resident × slot_bytes");
+}
+
+T_CASE(manager_co_tenancy_profile_full_cycle) {
+    // R7: профиль «свободно 2–11 ГБ на V100 при co-tenancy» — RAM-тир
+    // основной, VRAM-тир мал. Фикстура в масштабе 1:2048 (64 КиБ-слоты):
+    // 16 групп (8 слоёв × 2 группы), план 1 МиБ; VRAM-бюджет 384 КиБ → 6
+    // слотов (3 слоя — детерминизм victim-выбора при churn, см. run_pass).
+    // Полный цикл pin/read + замер p95-пауз и hit-rate prefetch.
+    const std::size_t slot = 64 * 1024; // кратен 4096 (ADR-12 §2.4)
+    const std::size_t n_groups = 16, layers = 8;
+    const std::size_t plan_bytes = n_groups * slot;
+
+    std::vector<TensorGroup> plan;
+    for (std::size_t i = 0; i < n_groups; ++i)
+        plan.push_back(make_group(std::uint32_t(i),
+            "l" + std::to_string(i / 2) + ".g" + std::to_string(i % 2),
+            (i % 2 == 0) ? Role::Attn : Role::Expert, DType::F16, slot,
+            {std::int64_t(slot / 2), 2}));
+    const auto path =
+        write_layout_payloads("/tmp/stell_tier_test_mgr_r7.stelltier", plan, slot);
+
+    const TierConfig cfg = tier_config_co_tenancy(6 * 64 * 1024, plan_bytes, slot);
+    // NVMe-тир задаёт вызывающий (профиль фиксирует только границы тиров):
+    TierConfig mut = cfg;
+    mut.nvme_layout = path;
+    T_REQUIRE(cfg.vram_slot_size == slot, "профиль: размер слота — из плана");
+    T_REQUIRE(cfg.vram_slots == 6, "профиль: VRAM-тир мал (384 КиБ / 64 КиБ = 6 слотов)");
+    T_REQUIRE(cfg.ram_capacity == plan_bytes, "профиль: RAM-тир основной (план целиком)");
+
+    // Кратность 4096 нарушена → PlanMismatch.
+    bool thrown = false;
+    try {
+        tier_config_co_tenancy(256 * 1024, plan_bytes, 512);
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "профиль: slot_bytes не кратен 4096 → PlanMismatch");
+
+    TierManager mgr(mut);
+    mgr.set_plan(plan);
+    std::vector<std::vector<GroupId>> lm(layers);
+    for (std::size_t i = 0; i < n_groups; ++i)
+        lm[i / 2].push_back(GroupId{std::uint32_t(i)});
+    mgr.set_layer_map(lm);
+
+    auto keys_of = [&](std::size_t l) {
+        std::vector<GroupKey> ks;
+        for (GroupId gid : lm[l]) ks.push_back(GroupKey{gid, plan[gid.value].role});
+        return ks;
+    };
+    auto run_pass = [&](bool with_prefetch) {
+        std::vector<double> pauses;
+        if (with_prefetch) {
+            // Priming: слой 0 префетчен до начала прохода (engine стартует с
+            // уже подгруженным первым слоем), иначе первый pin — честный промах.
+            mgr.prefetch(keys_of(0));
+            for (GroupId gid : lm[0]) wait_resident(mgr, gid);
+        }
+        for (std::size_t l = 0; l < layers; ++l) {
+            // Порядок engine-цикла: pin_layer(l) (текущий слой закреплён →
+            // неприкасаем для eviction), затем router-lookahead prefetch(l+1)
+            // — асинхронно; ожидание завершения prefetch ПОКА l закреплён
+            // (в реальном engine на это уходит compute слоя; здесь — детерминизм
+            // фикстуры: victim'ы нагрузки l+1 — непиновенные группы l−1/старые,
+            // не слой l). После этого pin(l+1) гарантированно hit.
+            const auto t0 = std::chrono::steady_clock::now();
+            auto a = mgr.pin_layer(std::uint32_t(l));
+            if (with_prefetch && l + 1 < layers) mgr.prefetch(keys_of(l + 1));
+            a->wait();
+            if (with_prefetch && l + 1 < layers)
+                for (GroupId gid : lm[l + 1]) wait_resident(mgr, gid);
+            pauses.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
+            for (GroupId gid : lm[l]) mgr.unpin(GroupKey{gid, plan[gid.value].role});
+        }
+        return pauses;
+    };
+    auto p95 = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[std::min(v.size() - 1, std::size_t(0.95 * double(v.size() - 1)))];
+    };
+
+    const std::uint64_t hits0 = mgr.stats().prefetch.hits;
+    const auto cold = run_pass(false); // холодный: NVMe→RAM→VRAM, без lookahead
+    const std::uint64_t misses_cold = mgr.stats().prefetch.misses;
+    const auto warm = run_pass(true);  // с router-lookahead prefetch
+    const TierStats st = mgr.stats();
+    const std::uint64_t hits = st.prefetch.hits - hits0;
+    const std::uint64_t misses = st.prefetch.misses - misses_cold;
+
+    T_REQUIRE(misses == 0,
+              "warm-проход на профиле (после cold): промахов prefetch нет");
+    T_REQUIRE(hits == n_groups, "hit-rate prefetch на профиле = 1.0 (16/16 в warm-проходе)");
+    T_REQUIRE(p95(warm) < 50.0,
+              "p95-пауза warm-прохода ≤ 50 мс (64 КиБ-слоты, CPU-контур)");
+    // (сравнение cold/warm пауз — в печати ниже, без ассершна: scheduling-шум
+    // не должен флакать тест; содержательно cold ≥ warm на любом носителе.)
+
+    // Полный цикл pin/read: содержимое слота через NVMe→RAM→VRAM == payload.
+    auto a = mgr.pin(GroupKey{GroupId{0}, Role::Attn});
+    a->wait();
+    std::vector<std::uint8_t> buf(slot), expected(slot);
+    mgr.read_ram_slot(GroupId{0}, buf.data(), buf.size());
+    for (std::size_t k = 0; k < slot; ++k)
+        expected[k] = std::uint8_t((0 * 131 + k * 7 + 5) & 0xFF);
+    T_REQUIRE(std::memcmp(buf.data(), expected.data(), slot) == 0,
+              "слот через полный цикл тиров == payload writer'а layout");
+    mgr.unpin(GroupKey{GroupId{0}, Role::Attn});
+
+    // Честная печать замеров профиля (фикстура; серверный NVMe-прогон —
+    // bench_p95_nvme.sh, worker после merge).
+    std::printf("  [r7-профиль co-tenancy] cold p95=%.3f ms, warm p95=%.3f ms, \
+prefetch hit-rate=%.2f, vram_slots=%zu, ram_capacity=%zu B\n",
+                p95(cold), p95(warm), double(hits) / double(hits + misses),
+                cfg.vram_slots, cfg.ram_capacity);
 }
 
 T_MAIN

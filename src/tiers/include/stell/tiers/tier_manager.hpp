@@ -133,7 +133,7 @@ public:
     // Для тестов/дашборда: resident-наличие группы в VRAM.
     bool resident_in_vram(GroupId id) const;
 
-    // --- расширение R1 (раунд 3; интерфейс ITierManager, ADR-08 §2,
+    // --- расширения R1/R7 (раунд 3; интерфейс ITierManager, ADR-08 §2,
     // --- НЕ расширяется — тот же прецедент, что set_layer_map/read_ram_slot)
 
     // R1 (ADR-12 §2.3, round 3): публичный verify-проход слотов NVMe-тира —
@@ -144,7 +144,7 @@ public:
     // вызвать его может кто угодно — калибровщик, harness, тесты, стартовый
     // проход. Дисциплина «холодной» операции (как set_plan): НЕ вызывать
     // параллельно с pin/prefetch. Возвращает число проверенных слотов;
-    // при порче → TierError(IoFailure, "layout: payload CRC mismatch").
+    // при verify-порче → TierError(IoFailure, "layout: payload CRC mismatch").
     std::size_t verify_slots();
 
     // Метрика R1: сколько раз payload-CRC фактически пересчитывался (по всем
@@ -240,5 +240,43 @@ private:
 
 // Тесты/утилиты: имя бэкенда I/O NVMe-тира ("io_uring" | "fallback").
 std::string nvme_io_backend();
+
+// --- R7 (раунд 3): конфигурируемые границы тиров -----------------------------
+
+// (1) Параметризация окружением поверх базового конфига (env → поля; не
+// заданные переменные оставляют базовое значение):
+//   STELL_TIER_VRAM_SLOTS       — число VRAM-слотов;
+//   STELL_TIER_VRAM_SLOT_BYTES  — размер VRAM-слота (байтов, кратен 4096);
+//   STELL_TIER_RAM_MB           — capacity RAM-тира (МиБ);
+//   STELL_TIER_LOOKAHEAD        — глубина router-lookahead prefetch;
+//   STELL_TIER_HISTORY_CAP      — предел истории предиктора;
+//   STELL_TIER_VERIFY_CRC       — 1 → payload-CRC при pin/read (см. TierConfig);
+//   STELL_TIER_POLICY           — "lru" | "lcu";
+//   STELL_TIER_NVME_LAYOUT      — путь stell-tier файла.
+// Нечисловые/некорректные значения → берётся базовое значение (консервативно).
+// Профиль co-tenancy задаётся комбинацией: напр. свободно 2–11 ГБ на V100 →
+// STELL_TIER_VRAM_SLOTS небольшим, STELL_TIER_RAM_MB — под основной тир.
+TierConfig tier_config_from_env(TierConfig base = {});
+
+// (2) Именованный профиль «co-tenancy на V100» (planner [R7], round 3):
+// свободно 2–11 ГБ VRAM (strata держит 21–30 ГБ) → VRAM-тир МАЛ, RAM-тир —
+// основной. Параметры:
+//   vram_budget_bytes — бюджет tiers под VRAM-тир: доля свободной VRAM,
+//       которую калибровщик/engine выделил тиру (с запасом под активации
+//       и внутренние буферы CUDA); ДОЛЖЕН быть ≤ фактически свободной VRAM —
+//       это ответственность вызывающего (замер free VRAM — вне tiers).
+//   plan_bytes        — суммарный размер плана (Σ slot_bytes);
+//   slot_bytes        — размер слота плана (кратен 4096, ADR-12 §2.4).
+// Результат: vram_slots = budget/slot (мин. 1, больше плана не выделяем —
+// при co-tenancy VRAM-тир меньше плана); ram_capacity = план целиком
+// (RAM-тир основной: pinned RAM на сервере — сотни ГБ, вмещает план;
+// допущение зафиксировано). NVMe-тир: путь stell-tier файла задаёт
+// вызывающий (TierConfig::nvme_layout / STELL_TIER_NVME_LAYOUT) — профиль
+// фиксирует только ГРАНИЦЫ тиров. slot_bytes вне кратности 4096 →
+// TierError(PlanMismatch). Остальные поля — дефолт TierConfig (Lru,
+// lookahead 2); уточнение — поверх через tier_config_from_env().
+TierConfig tier_config_co_tenancy(std::size_t vram_budget_bytes,
+                                  std::size_t plan_bytes,
+                                  std::size_t slot_bytes);
 
 } // namespace stell::tiers
