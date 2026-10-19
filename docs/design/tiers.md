@@ -39,6 +39,26 @@
   выделяем), RAM = план целиком, NVMe = весь план; `slot_bytes` не кратен
   4096 → `TierError(PlanMismatch)`.
 
+## Решения round 4 (T-20261017200354, planner [Q6]/[Q2] → [R2])
+
+- **O_DIRECT-бэкенд `TierNvmeFile`** ([Q6]): IORING_OP_READ на fd, открытом
+  с `O_DIRECT`; буферы/офсеты уже кратны и выровнены 4096 по layout v1;
+  включается флагом конфигурации (`STELL_TIER_ODIRECT` / `TierConfig`),
+  buffered-путь остаётся дефолтом; риски O_DIRECT (выравнивание, отсутствие
+  readahead) локализованы в одном бэкенде с fallback-прецедентом
+  (io_uring → pread). Обоснование: fadvise не гарантирует eviction под
+  давлением page cache co-tenancy; O_DIRECT даёт детерминированный cold
+  и убирает двойное буферирование. Тест: побитовое равенство O_DIRECT- и
+  buffered-чтения одного layout-файла.
+- **Deep-prefetch** ([Q2]): параметр глубины k групп в полёте (k=1/2/4)
+  в tier-профиле (router-lookahead уже даёт прогноз; пауза между слоями
+  перекрывается чтением k слоёв вперёд).
+- **Матрица серверного прогона** [R2]: slot size {16 МиБ, 4 МиБ} × I/O
+  {buffered, O_DIRECT} × k {1, 4}, профиль остатка в `bench/results/`,
+  co-tenancy-пометка обязательна. Замер — **не вердикт по цели §4**
+  (p95 ≤ 5 мс): вердикт — только по чистому окну; цель не отменяется.
+  Целевой профиль: «слоты 4 МиБ + prefetch k≥4 + O_DIRECT».
+
 ## Объём (из PLAN.md §4, поток B)
 
 - Tier Manager: VRAM-slots / pinned RAM / NVMe (io_uring).

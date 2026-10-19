@@ -44,6 +44,23 @@
   (каталог safetensors-шардов HF) + `STELL_R7_REAL_DESC_JSON` (описание
   ADR-09 схемы 1.0), без правки кода; веса в git не попадают.
 
+## Решения round 4 (T-20261017200354, planner [Q4]/[Q3] → [R4]/[R3])
+
+- **`hf_to_description`** ([Q4]): config.json каталога модели + метаданные
+  safetensors-шардов → `ModelDescription` (схема ADR-09; имена тензоров —
+  нативные HF, маппинг в группы по `source_pattern`) — по прецеденту
+  `gguf_to_description`. Roundtrip-тест на синтетическом каталоге шардов
+  (fixture): побитовые логиты == референсу плана; error-кейсы: нет
+  config.json, шард не соответствует плану →
+  `LoaderError(SchemaMismatch/TensorNotFound)`.
+- **Real-weights пайплайн [R7]** ([Q3]): открытая MoE ≤ ~10 ГБ
+  (Qwen/Mixtral-класса) с HF → `~/models` на сервере (вне репозитория,
+  `.gitignore`; веса/датасеты в git не попадают — проверка в приёмке);
+  прогон конвейера по `STELL_R7_REAL_WEIGHTS_DIR`/`STELL_R7_REAL_DESC_JSON`
+  (streaming-конвертация → tier-профиль co-tenancy → p95-пауз/
+  префетч/hit-rate), без правки кода. Невозможность — честный pending
+  с точной причиной (сеть/диск/права).
+
 ## Объём (из PLAN.md §4, поток D)
 
 - Реестр архитектур: dense llama/qwen-класс; MoE glm/qwen-moe/deepseek-класс
