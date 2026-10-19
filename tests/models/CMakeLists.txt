@@ -16,6 +16,7 @@ add_executable(test_models_weights_safetensors test_weights_safetensors.cpp)
 add_executable(test_models_weights_gguf test_weights_gguf.cpp)
 add_executable(test_models_weights_quant test_weights_quant.cpp)
 add_executable(test_models_convert_stelltier test_convert.cpp)
+add_executable(test_models_convert_streaming test_convert_streaming.cpp)
 add_executable(test_models_golden_logits golden/golden_logits.cpp)
 add_executable(test_models_golden_fixtures test_golden_fixtures.cpp)
 add_executable(test_models_gguf_description test_gguf_description.cpp)
@@ -30,6 +31,7 @@ foreach(t
     test_models_weights_gguf
     test_models_weights_quant
     test_models_convert_stelltier
+    test_models_convert_streaming
     test_models_golden_logits
     test_models_golden_fixtures
     test_models_gguf_description
@@ -51,6 +53,11 @@ foreach(t
     endif()
 endforeach()
 
+# Потоковая конвертация (round 3, R7): тест линкует engine — интерпретатор
+# ops-графа (ADR-09 §4: логиты по физическому пути stell-tier == референсу
+# того же плана). Мост TU-изолирован в engine (plain_spec.hpp без типов tiers).
+target_link_libraries(test_models_convert_streaming PRIVATE stell_engine)
+
 add_test(NAME models_json COMMAND test_models_json)
 add_test(NAME models_description COMMAND test_models_description)
 add_test(NAME models_registry COMMAND test_models_registry)
@@ -58,6 +65,7 @@ add_test(NAME models_weights_safetensors COMMAND test_models_weights_safetensors
 add_test(NAME models_weights_gguf COMMAND test_models_weights_gguf)
 add_test(NAME models_weights_quant COMMAND test_models_weights_quant)
 add_test(NAME models_convert_stelltier COMMAND test_models_convert_stelltier)
+add_test(NAME models_convert_streaming COMMAND test_models_convert_streaming)
 add_test(NAME models_golden_logits COMMAND test_models_golden_logits)
 add_test(NAME models_golden_fixtures COMMAND test_models_golden_fixtures)
 add_test(NAME models_gguf_description COMMAND test_models_gguf_description)
