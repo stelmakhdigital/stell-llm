@@ -92,6 +92,68 @@ inline std::vector<float> fill_weights(const std::string& name, std::size_t n) {
     return out;
 }
 
+// Хелперы round 5: честные slot_bytes группы (конвенция description.cpp
+// models: payload dtype + выравнивание слота до 4096) и сборщик PlainGroup
+// для синтетических описаний (F16/F32-профили тестов).
+inline std::size_t test_payload_bytes(const std::string& dtype, std::size_t n) {
+    if (dtype == "F16") return n * 2;
+    if (dtype == "F32") return n * 4;
+    throw std::runtime_error("synth: dtype '" + dtype + "' не поддержан хелпером");
+}
+inline std::size_t test_align_slot(std::size_t v) { return (v + 4095) / 4096 * 4096; }
+
+inline stell::engine::PlainGroup make_group(
+    std::uint32_t id, const std::string& name, const std::string& dtype,
+    std::vector<std::int64_t> shape, const std::string& pattern,
+    bool kv_block = false) {
+    stell::engine::PlainGroup g{};
+    g.id = id;
+    g.name = name;
+    g.role = kv_block ? stell::engine::PlainRoleKv : stell::engine::PlainRoleAttn;
+    g.dtype = dtype == "F32" ? stell::engine::PlainDTypeF32
+                             : stell::engine::PlainDTypeF16;
+    g.shape = std::move(shape);
+    std::size_t n = 1;
+    for (auto d : g.shape) n *= static_cast<std::size_t>(d);
+    g.slot_bytes = test_align_slot(test_payload_bytes(dtype, n));
+    g.source_pattern = pattern;
+    g.kv_block = kv_block;
+    return g;
+}
+
+// ops-граф слоя для синтетических описаний (конвенция фикстур mini_*):
+// rmsnorm(eps 1e-5), attention(sm70_fp32_qk_pv) + опционально ffn(silu_mul)
+// и moe_gather_scatter(sm70_moe_gs) — per-layer маршрутизация [R3] решает
+// применимость ffn/moe по составу групп слоя.
+inline std::vector<stell::engine::PlainOp> base_ops(bool with_ffn, bool with_moe) {
+    std::vector<stell::engine::PlainOp> ops;
+    {
+        stell::engine::PlainOp op{};
+        op.op = "rmsnorm";
+        op.params.push_back({"eps", 1e-5, "", true});
+        ops.push_back(op);
+    }
+    {
+        stell::engine::PlainOp op{};
+        op.op = "attention";
+        op.params.push_back({"kernel", 0.0, "sm70_fp32_qk_pv", false});
+        ops.push_back(op);
+    }
+    if (with_ffn) {
+        stell::engine::PlainOp op{};
+        op.op = "ffn";
+        op.params.push_back({"activation", 0.0, "silu_mul", false});
+        ops.push_back(op);
+    }
+    if (with_moe) {
+        stell::engine::PlainOp op{};
+        op.op = "moe_gather_scatter";
+        op.params.push_back({"kernel", 0.0, "sm70_moe_gs", false});
+        ops.push_back(op);
+    }
+    return ops;
+}
+
 // safetensors writer (раскладка tests/models/synth_writers.hpp: u64 header_len +
 // JSON + payload; заголовок добивается пробелами до кратности 8; data_offsets —
 // смещения внутри секции данных).

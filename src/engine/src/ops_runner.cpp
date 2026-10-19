@@ -53,6 +53,105 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
                                         "' (ADR-09 §1: новая операция = новое ядро)");
     }
 
+    // --- per-layer план (ADR-09 «Уточнение round 5», [R3]) ------------------
+    // Профиль слоя определяется по наличию группы "l%03zu.mlp.router":
+    // слой с router (+ expert-группы) → MoE-контур; без → dense ffn путь.
+    // Однородный план — частный случай (дефолт не меняется); непокрытые
+    // конфигурации — честный SchemaMismatch (fail-fast §3 не ослабляется):
+    // частичный набор MoE-групп, мёртвые op'ы графа, рассинхрон class/moe.
+    bool any_moe_layer = false, any_dense_layer = false;
+    bool ops_has_ffn = false, ops_has_moe = false;
+    for (const PlainOp& op : spec_.ops) {
+        ops_has_ffn = ops_has_ffn || op.op == "ffn";
+        ops_has_moe = ops_has_moe || op.op == "moe_gather_scatter";
+    }
+    for (std::size_t l = 0; l < spec_.n_layers; ++l) {
+        const std::string p = layer_prefix(l);
+        const PlainGroup* grouter = group(p + "mlp.router");
+        const bool router = grouter != nullptr;
+        const bool experts = group(p + "e000.up") != nullptr &&
+                             group(p + "e000.down") != nullptr;
+        if (router != experts) {
+            throw std::invalid_argument(
+                "SchemaMismatch: слой " + std::to_string(l) +
+                " — частичный набор MoE-групп (" +
+                (router ? "mlp.router без expert-групп l000.e000.{up,down}" :
+                          "expert-группы без mlp.router") +
+                ") — per-layer маршрутизация не покрывает конфигурацию "
+                "(ADR-09 round 5: fail-fast не ослабляется)");
+        }
+        const bool sh_g = group(p + "ffn.shared.gate") != nullptr;
+        const bool sh_u = group(p + "ffn.shared.up") != nullptr;
+        const bool sh_d = group(p + "ffn.shared.down") != nullptr;
+        if (router) {
+            any_moe_layer = true;
+            // Полнота expert-набора СЛОЯ: слой обслуживает router.rows
+            // экспертов — каждая пара e%03u.{up,down} обязана присутствовать.
+            if (grouter->shape.size() != 2)
+                throw std::invalid_argument(
+                    "SchemaMismatch: слой " + std::to_string(l) +
+                    " — роутер не матрица [n_experts, d_model]");
+            const std::size_t n_exp_l = static_cast<std::size_t>(grouter->shape[0]);
+            for (std::size_t e = 0; e < n_exp_l; ++e) {
+                char eb[32];
+                std::snprintf(eb, sizeof eb, "e%03zu", e);
+                if (!group(p + eb + ".up") || !group(p + eb + ".down"))
+                    throw std::invalid_argument(
+                        "SchemaMismatch: слой " + std::to_string(l) + ", эксперт " +
+                        std::to_string(e) + " — нет пары групп e%03u.{up,down}");
+            }
+            // [R4]: состав ffn.shared — {up,down} или {gate,up,down}; частичный
+            // набор (gate без up и т.п.) — честный mismatch.
+            if ((sh_g && !sh_u) || (sh_u != sh_d)) {
+                throw std::invalid_argument(
+                    "SchemaMismatch: слой " + std::to_string(l) +
+                    " — частичный набор групп ffn.shared.{gate,up,down}");
+            }
+        } else {
+            any_dense_layer = true;
+            // Dense-слой исполняет op ffn: группы обязаны быть полными;
+            // ffn.shared на dense-слое не исполняется ни одним op'ом (мёртвые
+            // группы — тихий неверный план, запрещён).
+            if (!group(p + "ffn.up") || !group(p + "ffn.down"))
+                throw std::invalid_argument(
+                    "SchemaMismatch: dense-слой " + std::to_string(l) +
+                    " — неполный набор групп ffn.{up,down}");
+            if (sh_g || sh_u || sh_d)
+                throw std::invalid_argument(
+                    "SchemaMismatch: слой " + std::to_string(l) +
+                    " — группы ffn.shared на dense-слое (без mlp.router) не "
+                    "исполняются ни одним op'ом");
+        }
+    }
+    if (spec_.is_moe != any_moe_layer) {
+        throw std::invalid_argument(
+            "SchemaMismatch: class=" + std::string(spec_.is_moe ? "moe" : "dense") +
+            " не согласован с составом слоёв (" +
+            (any_moe_layer ? "есть слои с mlp.router" : "moe-групп нет ни в одном слое") +
+            ")");
+    }
+    if (ops_has_moe && !any_moe_layer) {
+        throw std::invalid_argument(
+            "SchemaMismatch: ops содержит moe_gather_scatter, но ни один слой не "
+            "имеет mlp.router — MoE-контур плана мёртв (тихий неверный план "
+            "запрещён, ADR-09 round 5)");
+    }
+    if (any_moe_layer && !ops_has_moe) {
+        throw std::invalid_argument(
+            "SchemaMismatch: есть MoE-слои (mlp.router), но в ops нет "
+            "moe_gather_scatter — MoE-группы не исполняются ни одним op'ом");
+    }
+    if (ops_has_ffn && !any_dense_layer) {
+        throw std::invalid_argument(
+            "SchemaMismatch: ops содержит ffn, но ни один слой не dense (без "
+            "mlp.router) — dense-контур плана мёртв");
+    }
+    if (any_dense_layer && !ops_has_ffn) {
+        throw std::invalid_argument(
+            "SchemaMismatch: есть dense-слои (без mlp.router), но в ops нет ffn — "
+            "FFN плотных слоёв не исполняется ни одним op'ом");
+    }
+
     // Материализация весов: dequant → F32 матрицы (ядра kernels CPU-референс).
     for (const PlainGroup& g : spec_.groups) {
         if (g.kv_block) continue;                    // KV-группа весов не имеет (ADR-09 §3)
@@ -253,33 +352,45 @@ void OpsInterpreter::op_attention(std::size_t layer, std::vector<float>& hidden,
     st.v[layer].insert(st.v[layer].end(), v.begin(), v.end());
 }
 
-void OpsInterpreter::op_ffn(std::size_t layer, std::vector<float>& hidden) {
-    const PlainGroup* gup = group(layer_prefix(layer) + "ffn.up");
-    const PlainGroup* gdn = group(layer_prefix(layer) + "ffn.down");
+// Dense-FFN вычисление (ADR-09 §1 op "ffn"; переиспользуется shared-expert'ом
+// — ADR-09 «Уточнение round 5», [R4]): группы <prefix>.gate (опциональна —
+// вклейка golden D), <prefix>.up, <prefix>.down. gate → SwiGLU
+// m = silu(gate·x)·(up·x), иначе m = silu(up·x); возврат y = down·m БЕЗ
+// residual-добавления (суммирование с hidden — на стороне вызывающей op).
+std::vector<float> OpsInterpreter::ffn_forward(const std::string& prefix,
+                                               const std::vector<float>& x,
+                                               const std::string& what) const {
+    const PlainGroup* gup = group(prefix + ".up");
+    const PlainGroup* gdn = group(prefix + ".down");
     if (!gup || !gdn)
-        throw std::invalid_argument("ops runner: неполные группы ffn слоя " +
-                                    std::to_string(layer));
+        throw std::invalid_argument("ops runner: неполные группы " + what +
+                                    " (" + prefix + ".up/.down)");
     const Mat *up = mat(gup->id), *dn = mat(gdn->id);
-    if (!up || !dn) throw std::invalid_argument("ops runner: нет весов ffn слоя");
-    // Честная конвенция фикстуры: "silu_mul" при отсутствии gate-группы =
-    // silu(up(x)) → down (gate-fusion требует парной группы — в fixtures нет).
-    // Round 2 (вклейка golden D): в mini_dense ДОБАВЛЕНА ffn.gate → SwiGLU:
-    // m = silu(gate·h)·(up·h). Fallback без gate сохранён (round-1 описания).
+    if (!up || !dn)
+        throw std::invalid_argument("ops runner: нет весов " + what);
     std::vector<float> m_vec;
-    if (const PlainGroup* ggate = group(layer_prefix(layer) + "ffn.gate")) {
+    if (const PlainGroup* ggate = group(prefix + ".gate")) {
         const Mat* gt = mat(ggate->id);
         if (!gt)
-            throw std::invalid_argument("ops runner: нет весов ffn.gate слоя");
-        std::vector<float> g = matvec(*gt, hidden);
+            throw std::invalid_argument("ops runner: нет весов " + what + ".gate");
+        std::vector<float> g = matvec(*gt, x);
         for (float& f : g) f = silu(f);
-        std::vector<float> u = matvec(*up, hidden);
+        std::vector<float> u = matvec(*up, x);
         m_vec.resize(g.size());
         for (std::size_t i = 0; i < g.size(); ++i) m_vec[i] = g[i] * u[i];
     } else {
-        m_vec = matvec(*up, hidden);
+        m_vec = matvec(*up, x);
         for (float& f : m_vec) f = silu(f);
     }
-    std::vector<float> y = matvec(*dn, m_vec);
+    return matvec(*dn, m_vec);
+}
+
+void OpsInterpreter::op_ffn(std::size_t layer, std::vector<float>& hidden) {
+
+    const std::vector<float> y =
+        ffn_forward(layer_prefix(layer) + "ffn", hidden,
+                    "ffn слоя " + std::to_string(layer));
+
     for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] += y[i];
 }
 
@@ -398,7 +509,21 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
     std::vector<float> y(d_model, 0.0f);
     stell::kernels::moe_scatter_add(expert_out.data(), expert_ids.data(), weights.data(),
                                     /*n_tokens=*/1, k_top, d_model, y.data());
+
+    // --- shared-expert (ADR-09 «Уточнение round 5», [R4]) --------------------
+    // Группа l%03zu.ffn.shared.{gate,up,down}: dense-FFN семантика (тот же
+    // ffn-путь, новая операция ядра не вводится); выход суммируется с суммой
+    // выходов routed-экспертов. Вход shared-эксперта — ТОТ ЖЕ вход MoE-контура
+    // (hidden до residual-добавления routed-суммы); отсутствие группы —
+    // поведение без изменений (shared_out пуст, аддитивного вклада нет).
+    std::vector<float> shared_out;
+    if (group(layer_prefix(layer) + "ffn.shared.up") ||
+        group(layer_prefix(layer) + "ffn.shared.down")) {
+        shared_out = ffn_forward(layer_prefix(layer) + "ffn.shared", hidden,
+                                 "ffn.shared слоя " + std::to_string(layer));
+    }
     for (std::size_t i = 0; i < d_model; ++i) hidden[i] += y[i];
+    for (std::size_t i = 0; i < shared_out.size(); ++i) hidden[i] += shared_out[i];
 }
 
 void OpsInterpreter::unpin_layer(std::size_t layer) {
@@ -416,11 +541,17 @@ void OpsInterpreter::unpin_layer(std::size_t layer) {
 void OpsInterpreter::layer_body(std::size_t layer, std::vector<float>& hidden,
                                 SlotState& st) {
     pin_and_prefetch(layer);                       // tiering: pin перед слоем
+    // Per-layer маршрутизация (ADR-09 «Уточнение round 5», [R3]): слой БЕЗ
+    // группы mlp.router — dense ffn путь; С ней — MoE-контур. ops-граф описания
+    // общий; op, неприменимая профилю данного слоя, пропускается (однородный
+    // план — частный случай: у dense-описания нет moe-op, у MoE-описания нет
+    // ffn-op — маршрутизация вырождается в прежнее поведение).
+    const bool moe_layer = group(layer_prefix(layer) + "mlp.router") != nullptr;
     for (const PlainOp& op : spec_.ops) {
         if (op.op == "rmsnorm") op_rmsnorm(layer, hidden);
         else if (op.op == "attention") op_attention(layer, hidden, st);
-        else if (op.op == "ffn") op_ffn(layer, hidden);
-        else if (op.op == "moe_gather_scatter") op_moe(layer, hidden);
+        else if (op.op == "ffn") { if (!moe_layer) op_ffn(layer, hidden); }
+        else if (op.op == "moe_gather_scatter") { if (moe_layer) op_moe(layer, hidden); }
         else throw std::invalid_argument("ops runner: неизвестная op '" + op.op + "'");
     }
     unpin_layer(layer);                            // слот свободен для следующего слоя
@@ -428,7 +559,8 @@ void OpsInterpreter::layer_body(std::size_t layer, std::vector<float>& hidden,
 
 // --- forward / step ----------------------------------------------------------
 
-std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t token) {
+std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t token,
+                                                 bool with_logits) {
     if (token < 0 || token >= static_cast<std::int32_t>(spec_.vocab_size))
         throw std::invalid_argument("ops runner: токен вне словаря (" +
                                     std::to_string(token) + ")");
@@ -445,6 +577,7 @@ std::vector<float> OpsInterpreter::forward_token(SlotState& st, std::int32_t tok
     // токена = st.pos (общий счёт последовательности, не per-layer).
     for (std::size_t l = 0; l < spec_.n_layers; ++l) layer_body(l, hidden, st);
     ++st.pos;
+    if (!with_logits) return {};   // [R1]: projection последней позиции — см. run_prompt_logits
 
     // Финальная норма + logits (группа "norm_final"; голова — "head", при
     // отсутствии — weight tying на embedding, честная пометка).
@@ -485,9 +618,10 @@ std::vector<float> OpsInterpreter::step_logits(SlotId slot,
     SlotState& st = slots_[slot];
     if (!st.inited) {
         reset_slot(st, spec_.n_layers);
-        // Prefill: все токены промпта, кроме последнего (кеш KV слота).
+        // Prefill: все токены промпта, кроме последнего (кеш KV слота);
+        // логиты промежуточных позиций prefill не нужны — [R1] last-only.
         for (std::size_t i = 0; i + 1 < prompt.size(); ++i)
-            (void)forward_token(st, prompt[i]);
+            (void)forward_token(st, prompt[i], /*with_logits=*/false);
         st.inited = true;
     }
     return forward_token(st, token);
@@ -499,14 +633,27 @@ std::vector<std::vector<float>> OpsInterpreter::run_prompt_logits_all(
     reset_slot(st, spec_.n_layers);
     std::vector<std::vector<float>> rows;
     rows.reserve(prompt.size());
-    for (std::int32_t tok : prompt) rows.push_back(forward_token(st, tok));
+    for (std::int32_t tok : prompt) rows.push_back(forward_token(st, tok, /*with_logits=*/true));
     return rows;
 }
 
 std::vector<float> OpsInterpreter::run_prompt_logits(
     const std::vector<std::int32_t>& prompt) {
-    const std::vector<std::vector<float>> rows = run_prompt_logits_all(prompt);
-    return rows.empty() ? std::vector<float>{} : rows.back();
+    // [R1] round 5 (ADR-11 «Уточнение round 5», planner Q1): positions:"last"
+    // вычисляет projection логитов ТОЛЬКО последней позиции — промежуточные
+    // позиции исполняют forward без материализации матрицы логитов O(vocab)
+    // (стоимость projection O(vocab), а не O(prefix×vocab); прежний путь
+    // run_prompt_logits_all(...).back() скрыто материализовал n_positions ×
+    // n_vocab логитов ради одной строки). Результат побитово == прежнему:
+    // projection — чистая функция hidden/KV-состояния, состояние не меняет.
+    // KV-инкрементальность (пересчёт префикса при повторных вызовах) —
+    // отдельная задача (решение planner round 5 [Q1]: ABI-семантику не менять).
+    SlotState st{};
+    reset_slot(st, spec_.n_layers);
+    if (prompt.empty()) return {};
+    for (std::size_t i = 0; i + 1 < prompt.size(); ++i)
+        (void)forward_token(st, prompt[i], /*with_logits=*/false);
+    return forward_token(st, prompt.back(), /*with_logits=*/true);
 }
 
 // --- sampling ----------------------------------------------------------------

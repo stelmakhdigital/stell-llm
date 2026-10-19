@@ -237,3 +237,47 @@ target_include_directories(test_engine_weight_path PRIVATE ../../tests/core)
 target_compile_definitions(test_engine_weight_path PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/weight_path COMMAND test_engine_weight_path)
+
+# --- round 5 (T-20261017200354): [R1] last-only projection -------------------
+
+add_executable(test_engine_prompt_last
+    ../../tests/core/engine/test_prompt_last.cpp
+)
+target_link_libraries(test_engine_prompt_last stell_engine)
+target_include_directories(test_engine_prompt_last PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_prompt_last PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/prompt_last COMMAND test_engine_prompt_last)
+
+# --- round 5: [R3] per-layer план (смешанные dense/MoE слои) ------------------
+
+add_executable(test_engine_ops_mixed
+    ../../tests/core/engine/test_ops_mixed.cpp
+)
+target_link_libraries(test_engine_ops_mixed stell_engine)
+target_include_directories(test_engine_ops_mixed PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_mixed PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_mixed COMMAND test_engine_ops_mixed)
+
+# --- round 5: [R4] shared-expert (ffn.shared, dense-FFN + сумма) --------------
+
+add_executable(test_engine_ops_shared
+    ../../tests/core/engine/test_ops_shared.cpp
+)
+target_link_libraries(test_engine_ops_shared stell_engine)
+target_include_directories(test_engine_ops_shared PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_shared PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_shared COMMAND test_engine_ops_shared)
+
+# --- round 5: [R6] source_slice через мост (fused qkv, одно открытие) ---------
+
+add_executable(test_engine_weights_slice
+    ../../tests/core/engine/test_weights_slice.cpp
+)
+target_link_libraries(test_engine_weights_slice stell_engine)
+target_include_directories(test_engine_weights_slice PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_weights_slice PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/weights_slice COMMAND test_engine_weights_slice)

@@ -41,7 +41,11 @@
 namespace stell::engine {
 
 // Каталог операций + интерпретатор графа (ADR-09 §1: неизвестная операция =
-// ошибка загрузки модели — «новая операция = новое ядро»).
+// ошибка загрузки модели — «новая операция = новое ядро»). Round 5: per-layer
+// план (ADR-09 «Уточнение round 5», [R3]) — слой с группой l%03zu.mlp.router
+// исполняет MoE-контур, слой без неё — dense ffn; непокрытые конфигурации —
+// честный SchemaMismatch; [R4] — группа ffn.shared (shared-expert, dense-FFN,
+// выход суммируется с routed-экспертами), отсутствие — без изменений.
 class OpsInterpreter {
 public:
     // tiers — реальный TierManager (конкретный класс: ADR-08 «Уточнение»
@@ -60,7 +64,10 @@ public:
     std::vector<float> step_logits(SlotId slot, const std::vector<std::int32_t>& prompt,
                                    std::int32_t token);
 
-    // Логиты последнего токена промпта на свежем состоянии (golden-тест).
+    // Логиты последнего токена промпта на свежем состоянии (golden-тест;
+    // [R1] round 5, ADR-11 «Уточнение round 5»: positions:"last" вычисляет
+    // projection только последней позиции — O(vocab), не O(prefix×vocab);
+    // результат побитово == run_prompt_logits_all(prompt).back()).
     std::vector<float> run_prompt_logits(const std::vector<std::int32_t>& prompt);
 
     // Логиты ВСЕХ позиций промпта на свежем состоянии ([P][vocab]; режим
@@ -105,9 +112,16 @@ private:
     void op_ffn(std::size_t layer, std::vector<float>& hidden);
     void op_moe(std::size_t layer, std::vector<float>& hidden);
 
+    // Dense-FFN вычисление по префиксу имени групп (<prefix>.gate/.up/.down);
+    // общий путь op "ffn" и shared-expert'а ([R4]) — возврат БЕЗ residual.
+    std::vector<float> ffn_forward(const std::string& prefix,
+                                   const std::vector<float>& x,
+                                   const std::string& what) const;
+
     void pin_and_prefetch(std::size_t layer);         // ADR-08 §2/§5 (+ prefetch)
     void unpin_layer(std::size_t layer);              // снятие пина после слоя
-    std::vector<float> forward_token(SlotState& st, std::int32_t token);
+    std::vector<float> forward_token(SlotState& st, std::int32_t token,
+                                     bool with_logits = true);
     static void reset_slot(SlotState& st, std::size_t n_layers);
 
     const PlainGroup* group(const std::string& name) const;         // поиск по имени

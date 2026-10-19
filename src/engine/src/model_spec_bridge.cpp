@@ -96,6 +96,9 @@ stell::models::ModelDescription compat_description(const PlainSpec& spec) {
         cg.slot_bytes = g.slot_bytes;
         d.groups.push_back(std::move(cg));
         d.group_source_patterns.push_back(g.source_pattern);
+        // [R6] round 5 (planner Q7): срез стековного тензора доезжает до
+        // лоадера — без него sliced-группы (fused-тензоры) недоступны движку.
+        d.group_source_slices.push_back(g.source_slice);
     }
     return d;
 }
@@ -129,8 +132,13 @@ PlainSpec plain_spec_from_description(const stell::models::ModelDescription& des
         for (const auto& [key, v] : op.params) po.params.push_back(plain_param(key, v));
         spec.ops.push_back(std::move(po));
     }
-    for (std::size_t i = 0; i < desc.groups.size(); ++i)
-        spec.groups.push_back(plain_group(desc.groups[i], desc.group_source_patterns[i]));
+    for (std::size_t i = 0; i < desc.groups.size(); ++i) {
+        PlainGroup pg = plain_group(desc.groups[i], desc.group_source_patterns[i]);
+        // [R6] round 5: PlainGroup несёт source_slice (−1 = тензор целиком)
+        pg.source_slice = i < desc.group_source_slices.size()
+                              ? desc.group_source_slices[i] : -1;
+        spec.groups.push_back(std::move(pg));
+    }
     return spec;
 }
 
@@ -145,44 +153,40 @@ LoadedWeights load_plain_weights(const std::string& uri, const PlainSpec& spec,
                                  PlainWeightsFormat fmt) {
     const stell::models::ModelDescription desc = compat_description(spec);
 
-    // Интеграционная находка round 2 (честно): лоадер NVFP4W4A16 квантует на
-    // read() ТОЛЬКО группы dtype NVFP4/W4A16 (ADR-03), а F32/F16 группы
-    // профиля (нормы/роутер mini-фикстур) он отклоняет (UnsupportedQuant).
-    // Поэтому engine-мост открывает ДВА источника: квантующий лоадер — для
-    // квантованных групп, plain-лоадер (Safetensors/GGUF) — для остальных.
-    // Открытый вопрос потоку D: смешанный профиль внутри одного IWeightsSource.
+    // [R6] round 5 (planner Q7, ADR-08/09): открытие источника — РОВНО ОДНО.
+    // Ранее мост открывал ДВА источника (round 2: plain-лоадер для F16/F32
+    // групп + квантующий для NVFP4/W4A16 — обход, пока профильный лоадер не
+    // обслуживал описание целиком); с round 2-фикса NVFP4W4A16-лоадер
+    // обслуживает ВЕСЬ план одним источником (квантование на read; плоские
+    // группы — тот же fill_plain, побитовая идентичность путей с конвертером).
+    // Своего открытия лоадера движком по стороннему описанию нет: sliced-
+    // группы (source_slice) читаются общим IWeightsSource — контракты
+    // ADR-08/ADR-09 не дублируются.
     bool has_quant = false;
     for (const PlainGroup& g : spec.groups)
         if (!g.kv_block && (g.dtype == PlainDTypeNVFP4 || g.dtype == PlainDTypeW4A16))
             has_quant = true;
 
-    std::unique_ptr<stell::models::IWeightsSource> quant_src;
-    std::unique_ptr<stell::models::IWeightsSource> plain_src;
-    if (has_quant && fmt != PlainWeightsStellTier) {
-        auto lq = stell::models::make_loader(
-            static_cast<stell::models::WeightsFormat>(PlainWeightsNVFP4W4A16));
-        quant_src = lq->open(uri, desc);
-    }
-    {
-        auto lp = stell::models::make_loader(
-            static_cast<stell::models::WeightsFormat>(fmt));
-        plain_src = lp->open(uri, desc);
-    }
+    PlainWeightsFormat effective = fmt;
+    if (fmt != PlainWeightsStellTier &&
+        (has_quant || fmt == PlainWeightsNVFP4W4A16))
+        effective = PlainWeightsNVFP4W4A16;   // весь план одним источником
+
+    auto loader = stell::models::make_loader(
+        static_cast<stell::models::WeightsFormat>(effective));
+    std::unique_ptr<stell::models::IWeightsSource> src = loader->open(uri, desc);
 
     LoadedWeights out{};
+    out.source_opens = 1;
     for (const PlainGroup& g : spec.groups) {
         if (g.kv_block) continue;                    // KV-группы весов не имеют (ADR-09 §3)
         std::vector<std::uint8_t> buf(g.slot_bytes, 0);
-        stell::models::IWeightsSource* src =
-            (g.dtype == PlainDTypeNVFP4 || g.dtype == PlainDTypeW4A16) && quant_src
-                ? quant_src.get() : plain_src.get();
         src->read(stell::tiers::GroupKey{stell::tiers::GroupId{g.id},
                                          static_cast<stell::tiers::Role>(g.role)},
                   buf.data(), buf.size());
         out.slots[g.id] = std::move(buf);
     }
-    if (quant_src) quant_src->close();
-    plain_src->close();
+    src->close();
     return out;
 }
 
