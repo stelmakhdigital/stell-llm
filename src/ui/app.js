@@ -132,20 +132,31 @@ function renderLogs(logs) {
     logs.length ? logs.join("\n") : "(пусто)";
 }
 
-/* Статистика stell_logits (расширение ABI round 2, [R1]): снапшот движка
- * может нести блок logits (например {"requests_total":…}); до merge core
- * блока нет — секция честно показывает отсутствие данных, не роняя UI. */
+/* Статистика stell_logits в /metrics — СТРОГИЙ формат (ADR-11 §4, round 3,
+ * [R5], планировщик [Q5]): ровно 4 поля-счётчика, payload (массивы логитов)
+ * в /metrics не передаётся никогда. Рендер — строго эти 4 KV (лишние ключи
+ * движка игнорируются — формат фиксирован ADR, не «каково придёт»); до
+ * merge core-4 блока нет — секция честно показывает отсутствие данных,
+ * не роняя UI. */
+const LOGITS_FIELDS = [
+  ["requests_total", "вызовов stell_logits"],
+  ["errors_total", "ошибок stell_logits"],
+  ["last_n_vocab", "vocab последнего вызова"],
+  ["last_positions", "позиций последнего вызова"],
+];
+
 function renderLogits(logits) {
   const host = document.getElementById("logits-stats");
   host.innerHTML = "";
   if (!logits || typeof logits !== "object" || !Object.keys(logits).length) {
     host.innerHTML = "<div>нет данных (снапшот движка без logits-статистики — " +
-      "расширение ABI round 2 включится после merge core [R1])</div>";
+      "поле появится после merge core-4 [R5])</div>";
     return;
   }
   const table = document.createElement("table");
-  table.innerHTML = Object.entries(logits)
-    .map(([k, v]) => `<tr><td>${k}</td><td>${v ?? "—"}</td></tr>`).join("\n");
+  table.innerHTML = LOGITS_FIELDS
+    .map(([k, label]) => `<tr><td>${label}</td><td>${logits[k] ?? "—"}</td></tr>`)
+    .join("\n");
   host.appendChild(table);
 }
 

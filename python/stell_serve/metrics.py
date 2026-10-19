@@ -10,6 +10,28 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
+# Строгий формат logits-снапшота /metrics (ADR-11 §4, round 3, [R5] —
+# решение планировщика [Q5]): статистика вызовов `stell_logits` БЕЗ payload
+# (массивы логитов в /metrics не передаются никогда — размер). Ровно 4 поля;
+# дашборд рендерит строго эти 4 KV.
+LOGITS_SNAPSHOT_FIELDS = (
+    "requests_total",     # всего вызовов stell_logits
+    "errors_total",       # из них ошибочных (out_json с {"error"…}, rc=-1)
+    "last_n_vocab",       # n_vocab последнего вызова
+    "last_positions",     # n_positions последнего вызова
+)
+
+
+def is_valid_logits_snapshot(obj: Any) -> bool:
+    """Проверка строгого формата logits-снапшота ([R5]): ровно 4 поля
+    LOGITS_SNAPSHOT_FIELDS, все значения — числа (payload-массивы/объекты
+    в /metrics запрещены контрактом)."""
+    return (isinstance(obj, dict)
+            and set(obj) == set(LOGITS_SNAPSHOT_FIELDS)
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in obj.values()))
+
+
 def _percentile(sorted_values: List[float], q: float) -> Optional[float]:
     if not sorted_values:
         return None
