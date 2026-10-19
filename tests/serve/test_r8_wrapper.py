@@ -209,12 +209,14 @@ def test_real_provenance_dtype_orig_from_description(synthetic_spec):
     """provenance несёт dtype-происхождение: dtype_weights из описания
     (определяет weights_format), dtype_orig — исходный dtype до конверсии
     ([R5] models: BF16-источник → 'bf16'); поле отсутствует в описании —
-    честный None (не догадки)."""
+    честный None ПЛЮС пометка dtype_orig_note «описание перегенерировать»
+    ([R2] round 6, полный provenance — НЕ молчаливое None)."""
     prov = real_provenance(synthetic_spec, "lib.so", False, None,
                            weights_format="nvfp4w4a16")
     assert prov["dtype_weights"] == "NVFP4"
     assert prov["weights_format"] == "nvfp4w4a16"   # маппинг — в run_gates_real
     assert prov["dtype_orig"] is None        # синтетическое описание без поля
+    assert "перегенерировать" in prov["dtype_orig_note"]   # [R2] round 6
     # дефолт weights_format не изменён (plain-сценарий):
     assert real_provenance(synthetic_spec, "lib.so", False, None)["weights_format"]\
         == "safetensors"

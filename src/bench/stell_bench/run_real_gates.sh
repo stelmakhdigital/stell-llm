@@ -30,6 +30,30 @@
 #                          артефакта фазы "after" (обе цифры в provenance).
 #   STELL_R8_DRY_RUN       1 → только напечатать итоговую команду и выйти.
 #
+# Перезапуск точки регрессии после перегенерации описания ([R2] round 6,
+# протокол для worker на сервере):
+#   Описание модели (description.json ADR-09) перегенерирует models/worker
+#   с полем dtype_orig (полный provenance точек регрессии — правило
+#   docs/design/server-env.md); побитовая сверка слотов/логитов до/после —
+#   обязательна (конверсия не менялась, поле информационное). Затем точка
+#   регрессии R8 перезапускается этой же обёрткой точечной командой:
+#
+#     STELL_R8_RESULTS_DIR=bench/results/20261020-quality-gates-real-r5\
+#       STELL_R8_CO_TENANCY=1 STELL_R8_WALL_PHASE=after\
+#       STELL_R8_WALL_BEFORE=4800.0\
+#       bash src/bench/stell_bench/run_real_gates.sh
+#
+#   - STELL_R8_RESULTS_DIR закреплён за существующим каталогом артефакта
+#     (иначе обёртка по умолчанию создаст каталог с сегодняшней датой);
+#   - wall-поля сохраняются честно: wall_phase="after" и
+#     wall_before_seconds=4800.0 (цифра фазы "before", убитой timeout'ом)
+#     переезжают в новый provenance; wall_seconds нового прогона замеряется
+#     заново (новый запуск — новая честная цифра, НЕ задним числом);
+#   - dtype_orig в новом report.json будет заполнен из перегенерированного
+#     описания; до перегенерации runner честно пишет dtype_orig=None плюс
+#     пометку dtype_orig_note «описание перегенерировать» ([R2] round 6).
+#   - co-tenancy-пометка сохраняется (--co-tenancy — машина осталась общей).
+#
 # Артефакты в STELL_R8_RESULTS_DIR:
 #   report.json — штатный отчёт runner'а (пишется при завершении прогона);
 #                 обёртка дополняет provenance wall-полями (wall_seconds,
