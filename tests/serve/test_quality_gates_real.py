@@ -19,13 +19,15 @@ import pytest
 
 pytest.importorskip("numpy", reason="генератор синтетических весов требует numpy")
 
+from stell_bench import quality_gates_runner as qgr                   # noqa: E402
 from stell_bench.bpe_tokenizer import BpeTokenizer                       # noqa: E402
 from stell_bench.quality_gates_runner import (                            # noqa: E402
     ENV_REAL_MODEL_DIR, GSM8K_MAX_STEPS, GSM8K_PROMPT_TOKENS,
-    HUMANEVAL_MAX_STEPS, HUMANEVAL_PROMPT_TOKENS, PPL_MAX_TOKENS,
-    REAL_DESCRIPTION_NAME, REAL_TOKENIZER_NAME, REAL_WEIGHTS_NAME,
-    RealModelSpec, _GatesSnapshot, main, real_provenance,
-    resolve_real_model, run_gates_real, run_gates_real_pending,
+    HUMANEVAL_MAX_STEPS, HUMANEVAL_PROMPT_TOKENS, PPL_ALL_MAX_ELEMENTS,
+    PPL_MAX_TOKENS, REAL_DESCRIPTION_NAME, REAL_TOKENIZER_NAME,
+    REAL_WEIGHTS_NAME, RealModelSpec, _GatesSnapshot, logprob_of, main,
+    ppl_mode_for, real_provenance, resolve_real_model, run_gates_real,
+    run_gates_real_pending, run_ppl_gate,
 )
 from stell_bench.synthetic_model import (                                 # noqa: E402
     DEFAULT_SEED, build_realistic_profile,
@@ -62,6 +64,10 @@ def test_protocol_constants():
     assert PPL_MAX_TOKENS == 128
     assert GSM8K_PROMPT_TOKENS == 64 and GSM8K_MAX_STEPS == 16
     assert HUMANEVAL_PROMPT_TOKENS == 64 and HUMANEVAL_MAX_STEPS == 32
+    # R8 fixup: порог режима PPL (элементов логитов за один вызов) —
+    # серверный прогон tiny-qwen2moe (vocab=151646) завис на "all"
+    # (128 × 151646 ≈ 19.4 млн ≈ 300+ МиБ JSON):
+    assert PPL_ALL_MAX_ELEMENTS == 2_000_000
 
 
 def test_resolve_from_directory(synthetic_spec, synthetic_model_dir):
@@ -303,3 +309,159 @@ def test_bpe_tokenizer_matches_reference_impl():
                       / "tokenizer_ref.json").read_text())
     for s, ids in zip(ref["strings"], ref["ids"]):
         assert tok.encode(s) == ids
+
+
+# ---------------------------------------------------------------------------
+# R8 fixup: PPL на больших словарях (серверный прогон tiny-qwen2moe,
+# vocab=151646, завис на positions:"all" — 128 × 151646 ≈ 19.4 млн логитов
+# ≈ 300+ МиБ JSON за один вызов). Порог PPL_ALL_MAX_ELEMENTS → режим
+# 'incremental-last': teacher-forcing по позициям, повторные positions:"last"
+# по растущему префиксу (по строке логитов за вызов). Чанки "all" с окном
+# контекста честно невозможны: каузальная семантика требует полный префикс
+# для каждой строки (ABI не имеет смещения контекста).
+# ---------------------------------------------------------------------------
+
+class _UniformStub:
+    """Равномерный стаб источника логитов: PPL = vocab (nll = log V)."""
+
+    def __init__(self, vocab: int) -> None:
+        self._vocab = vocab
+        self.n_calls_last = 0
+        self.n_calls_all = 0
+        self.name = f"stub:uniform(vocab={vocab})"
+
+    def logits_last(self, tokens):
+        self.n_calls_last += 1
+        return [0.0] * self._vocab
+
+    def logits_all(self, tokens):
+        self.n_calls_all += 1
+        return [[0.0] * self._vocab for _ in tokens]
+
+    def close(self) -> None:
+        pass
+
+
+class _PrefixDependentStub:
+    """Детерминированный стаб: строка логитов зависит от длины префикса —
+    для сверки путей 'all' и 'incremental-last' (та же каузальная семантика:
+    rows[i] = logits_last(tokens[:i+1]))."""
+
+    def __init__(self, vocab: int) -> None:
+        self._vocab = vocab
+        self.name = f"stub:prefix-dependent(vocab={vocab})"
+
+    def _row(self, prefix_len: int):
+        # детерминированная волна, значения в (-0.5, 0.5)
+        return [((prefix_len * 31 + j * 7) % 97) / 97.0 - 0.5
+                for j in range(self._vocab)]
+
+    def logits_last(self, tokens):
+        return self._row(len(tokens))
+
+    def logits_all(self, tokens):
+        return [self._row(i + 1) for i in range(len(tokens))]
+
+    def close(self) -> None:
+        pass
+
+
+def test_ppl_mode_threshold():
+    """Порог переключения: n_vocab × n_positions > PPL_ALL_MAX_ELEMENTS →
+    incremental-last, иначе all (граница включительно — '>')."""
+    assert ppl_mode_for(350, 128) == "all"                  # синтет. профиль R8
+    assert ppl_mode_for(16, 128) == "all"                   # mini-фикстуры
+    assert ppl_mode_for(151646, 128) == "incremental-last"  # tiny-qwen2moe
+    boundary = PPL_ALL_MAX_ELEMENTS
+    assert ppl_mode_for(boundary // 128, 128) == "all"        # ровно порог → all
+    assert ppl_mode_for(boundary // 128 + 1, 128) == "incremental-last"
+
+
+def test_ppl_incremental_math_matches_all_path(monkeypatch):
+    """Эквивалентность путей: инкрементальный last даёт ТО ЖЕ значение PPL,
+    что и один вызов positions:"all" (та же каузальная семантика строк).
+    Переключение режима — monkeypatch порога (математика не меняется)."""
+    src = _PrefixDependentStub(350)
+    try:
+        gate_all = run_ppl_gate(src, "stub-eq", vocab=350)   # порог дефолт
+        monkeypatch.setattr(qgr, "PPL_ALL_MAX_ELEMENTS", 10)  # порог занижен
+        gate_inc = run_ppl_gate(src, "stub-eq", vocab=350)
+    finally:
+        src.close()
+    assert gate_all.value == gate_inc.value          # побитово
+    assert gate_all.items == gate_inc.items == PPL_MAX_TOKENS - 1
+    assert any("режим PPL: all" in n for n in gate_all.notes)
+    assert any("режим PPL: incremental-last" in n for n in gate_inc.notes)
+
+
+def test_ppl_big_vocab_incremental_stub_no_hang():
+    """Большой vocab (120000 ≥ 100к), полный протокол (128 позиций):
+    PPL считается через инкрементальный last — 127 вызовов по ОДНОЙ строке
+    (~1.2 МиБ), не 300+ МиБ одним вызовом; PPL = vocab (равномерный стаб)."""
+    vocab = 120_000
+    src = _UniformStub(vocab)
+    try:
+        gate = qgr.run_ppl_gate(src, "stub-big-vocab", vocab=vocab)
+    finally:
+        src.close()
+    assert gate.pending is False
+    assert gate.items == PPL_MAX_TOKENS - 1
+    assert src.n_calls_last == gate.items            # вызовы по строке за раз
+    assert src.n_calls_all == 0                      # "all" НЕ вызывался
+    assert abs(gate.value - vocab) < 1e-6            # PPL = exp(log V) = V
+    note = [n for n in gate.notes if "режим PPL" in n][0]
+    assert "incremental-last" in note and "120000" in note
+
+
+def test_real_provenance_ppl_mode(synthetic_spec):
+    """PPL-режим честно фиксируется в provenance ('all' / 'incremental-last'):
+    точный — из фактического прогона; fallback — по протоколу (vocab × 128)."""
+    prov_all = real_provenance(synthetic_spec, "lib", False, None,
+                               ppl_mode="all")
+    assert prov_all["ppl_mode"] == "all"
+    # fallback (без явного режима) — по протоколу: vocab=350 × 128 ≤ порога
+    assert real_provenance(synthetic_spec, "lib", False, None)["ppl_mode"] == "all"
+    big = RealModelSpec(synthetic_spec.desc_path, synthetic_spec.weights_path,
+                        {**synthetic_spec.desc, "vocab_size": 151646},
+                        root=synthetic_spec.root)
+    assert real_provenance(big, "lib", False, None)["ppl_mode"] == \
+        "incremental-last"
+
+
+def test_ppl_big_vocab_live_engine_incremental(real_engine_lib, tmp_path,
+                                               monkeypatch):
+    """Живой ABI-прогон PPL на каталоге с vocab=120000: инкрементальный путь,
+    НЕ виснет (позиции ограничены для теста: PPL_MAX_TOKENS→24 — выше порога
+    120000×23 > 2M, протокол прогона остаётся 128 — константа не меняется)."""
+    d = tmp_path / "bigvocab"
+    build_realistic_profile(d, vocab_size=120_000, with_tokenizer=False)
+    spec = resolve_real_model(model_dir=str(d))
+    assert spec is not None and spec.vocab_size == 120_000
+
+    from stell_serve.engine import CtypesEngineBackend
+
+    monkeypatch.setattr(qgr, "PPL_MAX_TOKENS", 24)   # лимит позиций ДЛЯ ТЕСТА
+    backend = CtypesEngineBackend(real_engine_lib)
+    source = None
+    try:
+        assert backend.supports_logits
+        backend.create({"runner": "ops",
+                        "engine": {"max_slots": 16, "batch_step_max": 16},
+                        "model": {"description": str(spec.desc_path),
+                                  "weights": str(spec.weights_path),
+                                  "weights_format": "nvfp4w4a16",
+                                  "tokenizer": "byte"}})
+        source = qgr.AbiLogitsSource(backend)
+        gate = run_ppl_gate(source, spec.name, vocab=spec.vocab_size,
+                            notes_extra=["big-vocab R8 fixup: live incremental"])
+    finally:
+        if source is not None:
+            source.close()
+        else:
+            backend.close()
+    assert gate.pending is False
+    assert gate.items == 24 - 1                      # 23 позиции предсказания
+    assert gate.value is not None and gate.value > 0.0
+    note = [n for n in gate.notes if "режим PPL" in n][0]
+    assert "incremental-last" in note
+    assert any("big-vocab R8 fixup" in n for n in gate.notes)
