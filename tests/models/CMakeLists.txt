@@ -20,6 +20,7 @@ add_executable(test_models_convert_streaming test_convert_streaming.cpp)
 add_executable(test_models_golden_logits golden/golden_logits.cpp)
 add_executable(test_models_golden_fixtures test_golden_fixtures.cpp)
 add_executable(test_models_gguf_description test_gguf_description.cpp)
+add_executable(test_models_hf_description test_hf_description.cpp)
 add_executable(test_models_gguf_mixtral test_gguf_mixtral.cpp)
 add_executable(test_models_tokenizer test_tokenizer.cpp)
 
@@ -35,6 +36,7 @@ foreach(t
     test_models_golden_logits
     test_models_golden_fixtures
     test_models_gguf_description
+    test_models_hf_description
     test_models_gguf_mixtral
     test_models_tokenizer)
     target_include_directories(${t} PRIVATE
@@ -58,6 +60,10 @@ endforeach()
 # того же плана). Мост TU-изолирован в engine (plain_spec.hpp без типов tiers).
 target_link_libraries(test_models_convert_streaming PRIVATE stell_engine)
 
+# Round 4 ([R4]): hf_to_description — roundtrip логитов через engine-
+# интерпретатор (тот же мост, что и test_convert_streaming).
+target_link_libraries(test_models_hf_description PRIVATE stell_engine)
+
 add_test(NAME models_json COMMAND test_models_json)
 add_test(NAME models_description COMMAND test_models_description)
 add_test(NAME models_registry COMMAND test_models_registry)
@@ -69,5 +75,6 @@ add_test(NAME models_convert_streaming COMMAND test_models_convert_streaming)
 add_test(NAME models_golden_logits COMMAND test_models_golden_logits)
 add_test(NAME models_golden_fixtures COMMAND test_models_golden_fixtures)
 add_test(NAME models_gguf_description COMMAND test_models_gguf_description)
+add_test(NAME models_hf_description COMMAND test_models_hf_description)
 add_test(NAME models_gguf_mixtral COMMAND test_models_gguf_mixtral)
 add_test(NAME models_tokenizer COMMAND test_models_tokenizer)

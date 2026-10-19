@@ -16,6 +16,7 @@ target_sources(stell_models PRIVATE
     src/loader_safetensors.cpp
     src/loader_gguf.cpp
     src/gguf_description.cpp
+    src/hf_description.cpp
     src/loader_quant.cpp
     src/loader_stelltier.cpp
     src/weights_factory.cpp
@@ -58,3 +59,9 @@ endif()
 add_executable(stell_convert_streaming tools/convert_streaming.cpp)
 target_link_libraries(stell_convert_streaming PRIVATE stell_models)
 target_compile_options(stell_convert_streaming PRIVATE -Wall -Wextra)
+
+# Round 4 ([R4]/[R3-подготовка]): CLI описания модели из HF-чекпоинта —
+# генерация STELL_R7_REAL_DESC_JSON для прогонов [R7] на реальных весах.
+add_executable(stell_hf_description tools/hf_description.cpp)
+target_link_libraries(stell_hf_description PRIVATE stell_models)
+target_compile_options(stell_hf_description PRIVATE -Wall -Wextra)
