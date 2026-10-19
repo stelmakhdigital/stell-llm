@@ -1,0 +1,26 @@
+GPU-VALIDATION: фаза корректности, попытка 1 (карты [4]: протокол [Q1] — пара GPU0 V100 + GPU4 RTX 2060; переопределить: STELL_GPU_DEVICES)
+[test_parallel_gpu] (фильтр)
+PENDING: нужно ≥2 устройств (STELL_GPU_DEVICES)
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION: попытка 2 с NCCL_P2P_DISABLE=1 (ring через host/shm — корректность обязана подтверждаться и без P2P)
+[test_parallel_gpu] (фильтр)
+PENDING: нужно ≥2 устройств (STELL_GPU_DEVICES)
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION: корректность неприменима (меньше 2 карт) — переходим к bench-фазе (TP1-режим scaling-бенчмарка [R8])
+[test_parallel_gpu] (фильтр)
+NCCL: версия 2.26.2, устройств в прогоне: 1 (0,4)
+COTENANCE: GPU 4: свободно 5.92 GB / 6.02 GB (чужой процесс strata держит остальное)
+NCCL-BENCH allreduce F32, медиана µs по 100 итерациям (co-tenancy: замер под нагрузкой strata, с целями §5 НЕ сравнивать если среди карт есть RTX 2060 / нет NVLink):
+NCCL-BENCH: size=     1 floats (     0 KB): rank0=0.8µs
+NCCL-BENCH: size=    64 floats (     0 KB): rank0=0.8µs
+NCCL-BENCH: size=   256 floats (     1 KB): rank0=0.8µs
+NCCL-BENCH: size=  1024 floats (     4 KB): rank0=0.8µs
+NCCL-BENCH: size=  4096 floats (    16 KB): rank0=0.8µs
+NCCL-BENCH: size= 16384 floats (    64 KB): rank0=0.8µs
+NCCL-BENCH: size= 65536 floats (   256 KB): rank0=0.8µs
+NCCL-BENCH: size=262144 floats (  1024 KB): rank0=0.8µs
+  OK   parallel_gpu_nccl_allreduce_allgather_latency
+  checks=1 failures=0
+GPU-VALIDATION OK: корректность + латентности (см. NCCL-BENCH выше; co-tenancy-пометка обязательна)

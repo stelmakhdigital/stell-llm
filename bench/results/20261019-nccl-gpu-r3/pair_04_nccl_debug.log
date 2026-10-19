@@ -1,0 +1,304 @@
+GPU-VALIDATION: фаза корректности, попытка 1 (карты [0,4]: протокол [Q1] — пара GPU0 V100 + GPU4 RTX 2060; переопределить: STELL_GPU_DEVICES)
+[test_parallel_gpu] (фильтр)
+arkalaust-AI:67317:67318 [0] NCCL INFO cudaDriverVersion 13000
+arkalaust-AI:67317:67318 [0] NCCL INFO NCCL version 2.26.2+cuda12.8
+arkalaust-AI:67317:67318 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal net plugin.
+arkalaust-AI:67317:67318 [0] NCCL INFO NET/IB : No device found.
+arkalaust-AI:67317:67318 [0] NCCL INFO NET/IB : Using [RO]; OOB wlp12s0:192.168.1.114<0>
+arkalaust-AI:67317:67318 [0] NCCL INFO NET/Socket : Using [0]wlp12s0:192.168.1.114<0> [1]br-5ee67ed7d921:172.18.0.1<0> [2]vethc5ad1e8:fe80::104e:9aff:fef6:fdec%vethc5ad1e8<0> [3]vetha0ffb94:fe80::2cc3:49ff:feb9:c903%vetha0ffb94<0>
+arkalaust-AI:67317:67318 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so. 
+arkalaust-AI:67317:67318 [0] NCCL INFO Using network Socket
+arkalaust-AI:67317:67319 [4] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so. 
+arkalaust-AI:67317:67319 [4] NCCL INFO Using network Socket
+arkalaust-AI:67317:67319 [4] NCCL INFO ncclCommInitRank comm 0x763490a800a0 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xc8a6d3b27a52a8ef - Init START
+arkalaust-AI:67317:67318 [0] NCCL INFO ncclCommInitRank comm 0x76348cb4c5b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xc8a6d3b27a52a8ef - Init START
+arkalaust-AI:67317:67319 [4] NCCL INFO RAS client listening socket at 127.0.0.1<28028>
+arkalaust-AI:67317:67319 [4] NCCL INFO Setting affinity for GPU 4 to 0fffffff
+arkalaust-AI:67317:67318 [0] NCCL INFO Setting affinity for GPU 0 to 0fffffff
+arkalaust-AI:67317:67319 [4] NCCL INFO comm 0x763490a800a0 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+arkalaust-AI:67317:67319 [4] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0
+arkalaust-AI:67317:67319 [4] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67317:67318 [0] NCCL INFO comm 0x76348cb4c5b0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+arkalaust-AI:67317:67318 [0] NCCL INFO Channel 00/02 : 0 1
+arkalaust-AI:67317:67318 [0] NCCL INFO Channel 01/02 : 0 1
+arkalaust-AI:67317:67318 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1
+arkalaust-AI:67317:67318 [0] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67317:67318 [0] NCCL INFO Check P2P Type intraNodeP2pSupport 0 directMode 1
+arkalaust-AI:67317:67331 [4] NCCL INFO [Proxy Service] Device 4 CPU core 7
+arkalaust-AI:67317:67333 [4] NCCL INFO [Proxy Service UDS] Device 4 CPU core 8
+arkalaust-AI:67317:67332 [0] NCCL INFO [Proxy Service] Device 0 CPU core 8
+arkalaust-AI:67317:67334 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 24
+arkalaust-AI:67317:67319 [4] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67317:67319 [4] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67317:67318 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67317:67318 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67317:67318 [0] NCCL INFO CC Off, workFifoBytes 1048576
+arkalaust-AI:67317:67319 [4] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+arkalaust-AI:67317:67319 [4] NCCL INFO ncclCommInitRank comm 0x763490a800a0 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xc8a6d3b27a52a8ef - Init COMPLETE
+arkalaust-AI:67317:67319 [4] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.44 (kernels 0.37, alloc 0.05, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.00, rest 0.00)
+arkalaust-AI:67317:67318 [0] NCCL INFO ncclCommInitRank comm 0x76348cb4c5b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xc8a6d3b27a52a8ef - Init COMPLETE
+arkalaust-AI:67317:67318 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.44 (kernels 0.37, alloc 0.05, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.00, rest 0.00)
+arkalaust-AI:67317:67319 [4] NCCL INFO Using network Socket
+arkalaust-AI:67317:67318 [0] NCCL INFO Using network Socket
+arkalaust-AI:67317:67319 [4] NCCL INFO ncclCommInitRank comm 0x763493c83da0 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xc24a884116de6145 - Init START
+arkalaust-AI:67317:67318 [0] NCCL INFO ncclCommInitRank comm 0x76343c507cd0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xc24a884116de6145 - Init START
+arkalaust-AI:67317:67319 [4] NCCL INFO Setting affinity for GPU 4 to 0fffffff
+arkalaust-AI:67317:67318 [0] NCCL INFO Setting affinity for GPU 0 to 0fffffff
+arkalaust-AI:67317:67319 [4] NCCL INFO comm 0x763493c83da0 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+arkalaust-AI:67317:67318 [0] NCCL INFO comm 0x76343c507cd0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+arkalaust-AI:67317:67319 [4] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0
+arkalaust-AI:67317:67319 [4] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67317:67318 [0] NCCL INFO Channel 00/02 : 0 1
+arkalaust-AI:67317:67318 [0] NCCL INFO Channel 01/02 : 0 1
+arkalaust-AI:67317:67318 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1
+arkalaust-AI:67317:67318 [0] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67317:67318 [0] NCCL INFO Check P2P Type intraNodeP2pSupport 0 directMode 1
+arkalaust-AI:67317:67335 [4] NCCL INFO [Proxy Service] Device 4 CPU core 18
+arkalaust-AI:67317:67336 [0] NCCL INFO [Proxy Service] Device 0 CPU core 5
+arkalaust-AI:67317:67337 [4] NCCL INFO [Proxy Service UDS] Device 4 CPU core 1
+arkalaust-AI:67317:67338 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 7
+arkalaust-AI:67317:67319 [4] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67317:67319 [4] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67317:67318 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67317:67318 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67317:67318 [0] NCCL INFO CC Off, workFifoBytes 1048576
+arkalaust-AI:67317:67319 [4] NCCL INFO ncclCommInitRank comm 0x763493c83da0 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xc24a884116de6145 - Init COMPLETE
+arkalaust-AI:67317:67319 [4] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.02 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.01, rest 0.00)
+arkalaust-AI:67317:67318 [0] NCCL INFO ncclCommInitRank comm 0x76343c507cd0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xc24a884116de6145 - Init COMPLETE
+arkalaust-AI:67317:67318 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.02 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.01, rest 0.00)
+arkalaust-AI:67317:67319 [4] NCCL INFO AllGather: opCount 0 sendbuff 0x763458600c00 recvbuff 0x763458600e00 count 3 datatype 2 op 0 root 0 comm 0x763490a800a0 [nranks=2] stream 0x763490a744f0
+arkalaust-AI:67317:67339 [0] NCCL INFO Recv: opCount 0 sendbuff (nil) recvbuff 0x763458600200 count 1 datatype 5 op 0 root 0 comm 0x763493c83da0 [nranks=2] stream 0x763493f85f20
+arkalaust-AI:67317:67340 [0] NCCL INFO Recv: opCount 0 sendbuff (nil) recvbuff 0x763458800200 count 1 datatype 5 op 0 root 1 comm 0x76343c507cd0 [nranks=2] stream 0x76343c82a5d0
+arkalaust-AI:67317:67318 [0] NCCL INFO AllGather: opCount 0 sendbuff 0x763458800c00 recvbuff 0x763458800e00 count 3 datatype 2 op 0 root 0 comm 0x76348cb4c5b0 [nranks=2] stream 0x76348ca8dc30
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67343 [0] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67343 [0] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-rY6yv7 (size 9637888), error: Operation now in progress (115)
+arkalaust-AI:67317:67344 [0] NCCL INFO Channel 00 : 0[0] -> 1[4] via SHM/direct/direct
+arkalaust-AI:67317:67343 [0] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67317:67343 [0] NCCL INFO transport/shm.cc:203 -> 1
+arkalaust-AI:67317:67343 [0] NCCL INFO transport.cc:216 -> 1
+arkalaust-AI:67317:67343 [0] NCCL INFO group.cc:133 -> 1
+arkalaust-AI:67317:67343 [0] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67317:67340 [0] NCCL INFO group.cc:422 -> 1
+arkalaust-AI:67317:67340 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67317:67340 [0] NCCL INFO enqueue.cc:2299 -> 1
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67342 [4] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67342 [4] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-6SzlJj (size 9637888), error: Resource temporarily unavailable (11)
+arkalaust-AI:67317:67341 [4] NCCL INFO Channel 00 : 1[4] -> 0[0] via SHM/direct/direct
+arkalaust-AI:67317:67342 [4] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67317:67342 [4] NCCL INFO transport/shm.cc:203 -> 1
+arkalaust-AI:67317:67342 [4] NCCL INFO transport.cc:216 -> 1
+arkalaust-AI:67317:67342 [4] NCCL INFO group.cc:133 -> 1
+arkalaust-AI:67317:67342 [4] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67317:67339 [0] NCCL INFO group.cc:422 -> 1
+arkalaust-AI:67317:67339 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67317:67339 [0] NCCL INFO enqueue.cc:2299 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO Channel 01 : 0[0] -> 1[4] via SHM/direct/direct
+arkalaust-AI:67317:67341 [4] NCCL INFO Channel 01 : 1[4] -> 0[0] via SHM/direct/direct
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67341 [4] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67341 [4] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-i8z40P (size 9637888), error: Operation now in progress (115)
+arkalaust-AI:67317:67341 [4] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67317:67341 [4] NCCL INFO transport/shm.cc:169 -> 1
+arkalaust-AI:67317:67341 [4] NCCL INFO transport.cc:197 -> 1
+arkalaust-AI:67317:67341 [4] NCCL INFO transport/generic.cc:19 -> 1
+arkalaust-AI:67317:67341 [4] NCCL INFO group.cc:148 -> 1
+arkalaust-AI:67317:67341 [4] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67317:67319 [4] NCCL INFO group.cc:460 -> 1
+arkalaust-AI:67317:67319 [4] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67317:67319 [4] NCCL INFO enqueue.cc:2299 -> 1
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67344 [0] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:06] arkalaust-AI:67317:67344 [0] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-6tbKYN (size 9637888), error: Resource temporarily unavailable (11)
+PENDING: CommError (rank 1): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+arkalaust-AI:67317:67344 [0] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO transport/shm.cc:169 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO transport.cc:197 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO transport/generic.cc:19 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO group.cc:148 -> 1
+arkalaust-AI:67317:67344 [0] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67317:67318 [0] NCCL INFO group.cc:460 -> 1
+arkalaust-AI:67317:67318 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67317:67318 [0] NCCL INFO enqueue.cc:2299 -> 1
+arkalaust-AI:67317:67347 [0] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67317:67347 [0] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67317:67347 [0] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67317:67336 [0] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67317:67347 [4] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67317:67347 [4] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67317:67347 [4] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67317:67335 [4] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67317:67347 [0] NCCL INFO comm 0x76343c507cd0 rank 0 nranks 2 cudaDev 0 busId 5000 - Abort COMPLETE
+arkalaust-AI:67317:67347 [4] NCCL INFO comm 0x763493c83da0 rank 1 nranks 2 cudaDev 4 busId 9000 - Abort COMPLETE
+arkalaust-AI:67317:67348 [0] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67317:67348 [0] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67317:67348 [0] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67317:67332 [0] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67317:67348 [4] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67317:67348 [4] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67317:67348 [4] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67317:67331 [4] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67317:67348 [0] NCCL INFO comm 0x76348cb4c5b0 rank 0 nranks 2 cudaDev 0 busId 5000 - Abort COMPLETE
+arkalaust-AI:67317:67348 [4] NCCL INFO comm 0x763490a800a0 rank 1 nranks 2 cudaDev 4 busId 9000 - Abort COMPLETE
+PENDING: CommError (rank 0): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён — см. вывод выше
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION: попытка 2 с NCCL_P2P_DISABLE=1 (ring через host/shm — корректность обязана подтверждаться и без P2P)
+[test_parallel_gpu] (фильтр)
+arkalaust-AI:67349:67350 [0] NCCL INFO cudaDriverVersion 13000
+arkalaust-AI:67349:67350 [0] NCCL INFO NCCL version 2.26.2+cuda12.8
+arkalaust-AI:67349:67350 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal net plugin.
+arkalaust-AI:67349:67350 [0] NCCL INFO NET/IB : No device found.
+arkalaust-AI:67349:67350 [0] NCCL INFO NET/IB : Using [RO]; OOB wlp12s0:192.168.1.114<0>
+arkalaust-AI:67349:67350 [0] NCCL INFO NET/Socket : Using [0]wlp12s0:192.168.1.114<0> [1]br-5ee67ed7d921:172.18.0.1<0> [2]vethc5ad1e8:fe80::104e:9aff:fef6:fdec%vethc5ad1e8<0> [3]vetha0ffb94:fe80::2cc3:49ff:feb9:c903%vetha0ffb94<0>
+arkalaust-AI:67349:67350 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so. 
+arkalaust-AI:67349:67350 [0] NCCL INFO Using network Socket
+arkalaust-AI:67349:67351 [4] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so. 
+arkalaust-AI:67349:67351 [4] NCCL INFO Using network Socket
+arkalaust-AI:67349:67351 [4] NCCL INFO ncclCommInitRank comm 0x7a592ca80100 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xb061fdded2c64e29 - Init START
+arkalaust-AI:67349:67350 [0] NCCL INFO ncclCommInitRank comm 0x7a5934b4c910 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xb061fdded2c64e29 - Init START
+arkalaust-AI:67349:67351 [4] NCCL INFO RAS client listening socket at 127.0.0.1<28028>
+arkalaust-AI:67349:67351 [4] NCCL INFO NCCL_P2P_DISABLE set by environment to 1
+arkalaust-AI:67349:67351 [4] NCCL INFO Setting affinity for GPU 4 to 0fffffff
+arkalaust-AI:67349:67350 [0] NCCL INFO Setting affinity for GPU 0 to 0fffffff
+arkalaust-AI:67349:67351 [4] NCCL INFO comm 0x7a592ca80100 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+arkalaust-AI:67349:67351 [4] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0
+arkalaust-AI:67349:67351 [4] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67349:67350 [0] NCCL INFO comm 0x7a5934b4c910 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+arkalaust-AI:67349:67350 [0] NCCL INFO Channel 00/02 : 0 1
+arkalaust-AI:67349:67350 [0] NCCL INFO Channel 01/02 : 0 1
+arkalaust-AI:67349:67350 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1
+arkalaust-AI:67349:67350 [0] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67349:67350 [0] NCCL INFO Check P2P Type intraNodeP2pSupport 0 directMode 1
+arkalaust-AI:67349:67362 [4] NCCL INFO [Proxy Service] Device 4 CPU core 0
+arkalaust-AI:67349:67364 [4] NCCL INFO [Proxy Service UDS] Device 4 CPU core 19
+arkalaust-AI:67349:67365 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 0
+arkalaust-AI:67349:67363 [0] NCCL INFO [Proxy Service] Device 0 CPU core 8
+arkalaust-AI:67349:67351 [4] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67349:67351 [4] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67349:67350 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67349:67350 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67349:67350 [0] NCCL INFO CC Off, workFifoBytes 1048576
+arkalaust-AI:67349:67351 [4] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+arkalaust-AI:67349:67351 [4] NCCL INFO ncclCommInitRank comm 0x7a592ca80100 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xb061fdded2c64e29 - Init COMPLETE
+arkalaust-AI:67349:67351 [4] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.43 (kernels 0.36, alloc 0.05, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.00, rest 0.00)
+arkalaust-AI:67349:67350 [0] NCCL INFO ncclCommInitRank comm 0x7a5934b4c910 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xb061fdded2c64e29 - Init COMPLETE
+arkalaust-AI:67349:67350 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.43 (kernels 0.36, alloc 0.05, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.00, rest 0.00)
+arkalaust-AI:67349:67351 [4] NCCL INFO Using network Socket
+arkalaust-AI:67349:67350 [0] NCCL INFO Using network Socket
+arkalaust-AI:67349:67351 [4] NCCL INFO ncclCommInitRank comm 0x7a592fc84020 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xf378462f30990a6e - Init START
+arkalaust-AI:67349:67350 [0] NCCL INFO ncclCommInitRank comm 0x7a58e05079b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xf378462f30990a6e - Init START
+arkalaust-AI:67349:67351 [4] NCCL INFO Setting affinity for GPU 4 to 0fffffff
+arkalaust-AI:67349:67350 [0] NCCL INFO Setting affinity for GPU 0 to 0fffffff
+arkalaust-AI:67349:67351 [4] NCCL INFO comm 0x7a592fc84020 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+arkalaust-AI:67349:67351 [4] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0
+arkalaust-AI:67349:67350 [0] NCCL INFO comm 0x7a58e05079b0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+arkalaust-AI:67349:67351 [4] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67349:67350 [0] NCCL INFO Channel 00/02 : 0 1
+arkalaust-AI:67349:67350 [0] NCCL INFO Channel 01/02 : 0 1
+arkalaust-AI:67349:67350 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1
+arkalaust-AI:67349:67350 [0] NCCL INFO P2P Chunksize set to 131072
+arkalaust-AI:67349:67350 [0] NCCL INFO Check P2P Type intraNodeP2pSupport 0 directMode 1
+arkalaust-AI:67349:67366 [4] NCCL INFO [Proxy Service] Device 4 CPU core 10
+arkalaust-AI:67349:67369 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 9
+arkalaust-AI:67349:67367 [0] NCCL INFO [Proxy Service] Device 0 CPU core 4
+arkalaust-AI:67349:67368 [4] NCCL INFO [Proxy Service UDS] Device 4 CPU core 17
+arkalaust-AI:67349:67351 [4] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67349:67351 [4] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67349:67350 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+arkalaust-AI:67349:67350 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+arkalaust-AI:67349:67350 [0] NCCL INFO CC Off, workFifoBytes 1048576
+arkalaust-AI:67349:67351 [4] NCCL INFO ncclCommInitRank comm 0x7a592fc84020 rank 1 nranks 2 cudaDev 4 nvmlDev 4 busId 9000 commId 0xf378462f30990a6e - Init COMPLETE
+arkalaust-AI:67349:67351 [4] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.02 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.00, rest 0.01)
+arkalaust-AI:67349:67350 [0] NCCL INFO ncclCommInitRank comm 0x7a58e05079b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 5000 commId 0xf378462f30990a6e - Init COMPLETE
+arkalaust-AI:67349:67350 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.02 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.01, rest 0.00)
+arkalaust-AI:67349:67370 [0] NCCL INFO Recv: opCount 0 sendbuff (nil) recvbuff 0x7a58fc600200 count 1 datatype 5 op 0 root 0 comm 0x7a592fc84020 [nranks=2] stream 0x7a592ff861d0
+arkalaust-AI:67349:67351 [4] NCCL INFO AllGather: opCount 0 sendbuff 0x7a58fc600c00 recvbuff 0x7a58fc600e00 count 3 datatype 2 op 0 root 0 comm 0x7a592ca80100 [nranks=2] stream 0x7a592ca74550
+arkalaust-AI:67349:67371 [0] NCCL INFO Recv: opCount 0 sendbuff (nil) recvbuff 0x7a58fc800200 count 1 datatype 5 op 0 root 1 comm 0x7a58e05079b0 [nranks=2] stream 0x7a58e082a170
+arkalaust-AI:67349:67350 [0] NCCL INFO AllGather: opCount 0 sendbuff 0x7a58fc800c00 recvbuff 0x7a58fc800e00 count 3 datatype 2 op 0 root 0 comm 0x7a5934b4c910 [nranks=2] stream 0x7a5934a8def0
+arkalaust-AI:67349:67373 [4] NCCL INFO Channel 00 : 1[4] -> 0[0] via SHM/direct/direct
+arkalaust-AI:67349:67375 [0] NCCL INFO Channel 00 : 0[0] -> 1[4] via SHM/direct/direct
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67374 [0] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67374 [0] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-NC9EhN (size 9637888), error: Operation now in progress (115)
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67372 [4] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67372 [4] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-lroldy (size 9637888), error: Resource temporarily unavailable (11)
+arkalaust-AI:67349:67374 [0] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67349:67374 [0] NCCL INFO transport/shm.cc:203 -> 1
+arkalaust-AI:67349:67374 [0] NCCL INFO transport.cc:216 -> 1
+arkalaust-AI:67349:67374 [0] NCCL INFO group.cc:133 -> 1
+arkalaust-AI:67349:67374 [0] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67349:67373 [4] NCCL INFO Channel 01 : 1[4] -> 0[0] via SHM/direct/direct
+arkalaust-AI:67349:67371 [0] NCCL INFO group.cc:422 -> 1
+arkalaust-AI:67349:67371 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67349:67371 [0] NCCL INFO enqueue.cc:2299 -> 1
+arkalaust-AI:67349:67372 [4] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67349:67372 [4] NCCL INFO transport/shm.cc:203 -> 1
+arkalaust-AI:67349:67372 [4] NCCL INFO transport.cc:216 -> 1
+arkalaust-AI:67349:67372 [4] NCCL INFO group.cc:133 -> 1
+arkalaust-AI:67349:67372 [4] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67349:67370 [0] NCCL INFO group.cc:422 -> 1
+arkalaust-AI:67349:67370 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67349:67370 [0] NCCL INFO enqueue.cc:2299 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO Channel 01 : 0[0] -> 1[4] via SHM/direct/direct
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67373 [4] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67373 [4] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-AKOMww (size 9637888), error: Resource temporarily unavailable (11)
+arkalaust-AI:67349:67373 [4] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67349:67373 [4] NCCL INFO transport/shm.cc:169 -> 1
+arkalaust-AI:67349:67373 [4] NCCL INFO transport.cc:197 -> 1
+arkalaust-AI:67349:67373 [4] NCCL INFO transport/generic.cc:19 -> 1
+arkalaust-AI:67349:67373 [4] NCCL INFO group.cc:148 -> 1
+arkalaust-AI:67349:67373 [4] NCCL INFO group.cc:75 -> 1 [Async thread]
+arkalaust-AI:67349:67351 [4] NCCL INFO group.cc:460 -> 1
+arkalaust-AI:67349:67351 [4] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67349:67351 [4] NCCL INFO enqueue.cc:2299 -> 1
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67375 [0] misc/shmutils.cc:117 NCCL WARN Cuda failure 'OS call failed or operation not supported on this OS'
+
+[2026-10-19 12:04:08] arkalaust-AI:67349:67375 [0] misc/shmutils.cc:128 NCCL WARN Error while attaching to shared memory segment /dev/shm/nccl-0y9n26 (size 9637888), error: Operation now in progress (115)
+arkalaust-AI:67349:67375 [0] NCCL INFO transport/shm.cc:634 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO transport/shm.cc:169 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO transport.cc:197 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO transport/generic.cc:19 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO group.cc:148 -> 1
+arkalaust-AI:67349:67375 [0] NCCL INFO group.cc:75 -> 1 [Async thread]
+PENDING: CommError (rank 1): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+arkalaust-AI:67349:67350 [0] NCCL INFO group.cc:460 -> 1
+arkalaust-AI:67349:67350 [0] NCCL INFO group.cc:581 -> 1
+arkalaust-AI:67349:67350 [0] NCCL INFO enqueue.cc:2299 -> 1
+arkalaust-AI:67349:67378 [0] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67349:67378 [0] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67349:67378 [0] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67349:67378 [4] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67349:67378 [4] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67349:67378 [4] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67349:67367 [0] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67349:67366 [4] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67349:67378 [0] NCCL INFO comm 0x7a58e05079b0 rank 0 nranks 2 cudaDev 0 busId 5000 - Abort COMPLETE
+arkalaust-AI:67349:67378 [4] NCCL INFO comm 0x7a592fc84020 rank 1 nranks 2 cudaDev 4 busId 9000 - Abort COMPLETE
+arkalaust-AI:67349:67379 [0] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67349:67379 [0] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67349:67379 [0] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67349:67379 [4] NCCL INFO misc/socket.cc:64 -> 3
+arkalaust-AI:67349:67379 [4] NCCL INFO misc/socket.cc:80 -> 3
+arkalaust-AI:67349:67379 [4] NCCL INFO misc/socket.cc:829 -> 3
+arkalaust-AI:67349:67363 [0] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67349:67362 [4] NCCL INFO misc/socket.cc:881 -> 3
+arkalaust-AI:67349:67379 [0] NCCL INFO comm 0x7a5934b4c910 rank 0 nranks 2 cudaDev 0 busId 5000 - Abort COMPLETE
+arkalaust-AI:67349:67379 [4] NCCL INFO comm 0x7a592ca80100 rank 1 nranks 2 cudaDev 4 busId 9000 - Abort COMPLETE
+PENDING: CommError (rank 0): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён — см. вывод выше
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION PENDING: pending:GPU-контракт expert_alltoall/kv_stream: co-tenancy/OOM/бутстрап (проверки не проведены) (checks=0 failures=0 — проверки корректности не проводились; worker повторит в окне; co-tenancy: см. server-env)

@@ -1,0 +1,15 @@
+GPU-VALIDATION: фаза корректности, попытка 1 (карты [0,4]: протокол [Q1] — пара GPU0 V100 + GPU4 RTX 2060; переопределить: STELL_GPU_DEVICES)
+[test_parallel_gpu] (фильтр)
+PENDING: CommError (rank 1): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: CommError (rank 0): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён — см. вывод выше
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION: попытка 2 с NCCL_P2P_DISABLE=1 (ring через host/shm — корректность обязана подтверждаться и без P2P)
+[test_parallel_gpu] (фильтр)
+PENDING: CommError (rank 1): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: CommError (rank 0): NcclFailure: expert_alltoall: ncclAllGather(counts): unhandled cuda error (run with NCCL_DEBUG=INFO for details)
+PENDING: GPU-контракт expert_alltoall/kv_stream не подтверждён — см. вывод выше
+  OK   parallel_gpu_nccl_expert_alltoall_kv_stream
+  checks=0 failures=0
+GPU-VALIDATION PENDING: pending:GPU-контракт expert_alltoall/kv_stream: co-tenancy/OOM/бутстрап (проверки не проведены) (checks=0 failures=0 — проверки корректности не проводились; worker повторит в окне; co-tenancy: см. server-env)
