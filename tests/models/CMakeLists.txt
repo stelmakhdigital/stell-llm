@@ -13,6 +13,7 @@ add_executable(test_models_json test_json.cpp)
 add_executable(test_models_description test_description.cpp)
 add_executable(test_models_registry test_registry.cpp)
 add_executable(test_models_weights_safetensors test_weights_safetensors.cpp)
+add_executable(test_models_weights_dir_mixed test_weights_dir_mixed.cpp)
 add_executable(test_models_weights_gguf test_weights_gguf.cpp)
 add_executable(test_models_weights_quant test_weights_quant.cpp)
 add_executable(test_models_convert_stelltier test_convert.cpp)
@@ -29,6 +30,7 @@ foreach(t
     test_models_description
     test_models_registry
     test_models_weights_safetensors
+    test_models_weights_dir_mixed
     test_models_weights_gguf
     test_models_weights_quant
     test_models_convert_stelltier
@@ -68,6 +70,7 @@ add_test(NAME models_json COMMAND test_models_json)
 add_test(NAME models_description COMMAND test_models_description)
 add_test(NAME models_registry COMMAND test_models_registry)
 add_test(NAME models_weights_safetensors COMMAND test_models_weights_safetensors)
+add_test(NAME models_weights_dir_mixed COMMAND test_models_weights_dir_mixed)
 add_test(NAME models_weights_gguf COMMAND test_models_weights_gguf)
 add_test(NAME models_weights_quant COMMAND test_models_weights_quant)
 add_test(NAME models_convert_stelltier COMMAND test_models_convert_stelltier)
