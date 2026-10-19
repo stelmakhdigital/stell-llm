@@ -191,6 +191,28 @@ ctest --test-dir build/cpu -R models_convert_streaming --output-on-failure
    регрессии) или требуется W4A16/NVFP4-профиль со scale-F16 — тот же
    диапазон; вопрос замеряется на [R8].
 
+## Дополнение (fixup по серверному прогону [R3])
+
+Серверный прогон на реальных весах (`hf-tiny-v2/tiny-random-Qwen2MoeForCausalLM`:
+2 слоя × 8 экспертов, hidden=32, vocab=151646, embed F16 [151646,32] ≈ 9.7 МиБ)
+поймал ложный отказ конвертера: `"converter: tensor bytes > slot_bytes for
+ group 'embed'"`.
+
+- Гипотеза «slot_bytes из крупнейшей группы» не подтвердилась: расчёт
+  `slot_bytes_for(dtype, shape)` корректен (embed F16: payload 9 705 344 Б →
+  слот 9 707 520 Б, align 4096 — вмещает; ёмкости тиров 2/11 ГиБ на слот не
+  влияют).
+- Реальная причина: чекпоинт сгенерирован в **F32** (torch default) — тензора
+  embed 19 410 688 Б при F16-группе; предохранитель `t.bytes > slot_bytes`
+  в plain-ветке `make_slot` срабатывал ДО допустимой конвертации F32→F16 и
+  кидал SchemaMismatch (валидация размеров уже была в `plain_fill_slot`).
+- Fixup: предохранитель убран (валидация — в `plain_fill_slot`: payload ==
+  expected_payload(g), payload ≤ dst_bytes → честные SchemaMismatch);
+  добавлена честная проверка `raw.size() == n × itemsize` в конверсионной
+  ветке. Регрессия в `test_convert_streaming` (секция 4b): синтетический
+  план vocab 151646/hidden 32, F32-чекпоинт, каталог с одним шардом —
+  streaming-путь побитово == прямому лоадеру; ctest 47/47.
+
 ## Коммиты
 
 | Хеш | Суть |
@@ -198,4 +220,4 @@ ctest --test-dir build/cpu -R models_convert_streaming --output-on-failure
 | `cb231d9` | [R6]/R3-подготовка: каталог шардов — единый IWeightsSource + BF16 + общий plain_fill_slot |
 | `d185efa` | [R4]: hf_to_description + CLI stell_hf_description + тесты roundtrip/error-кейсов |
 | `67c9b15` | [R6]: mixed-шардовый тест (один источник, без профильных ветвлений) |
-| (следующий) | R3-подготовка: профиль co-tenancy в real-weights ветке + отчёт |
+| (следующий) | fixup [R3]: ложный отказ конвертера на F32-чекпоинте (конвертация F32→F16) + регрессия |

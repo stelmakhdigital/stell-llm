@@ -76,11 +76,14 @@ std::vector<std::uint8_t> make_slot(const stell::tiers::TensorGroup& g,
         else
             quantize_w4a16(src.data(), numel, slot.data());
     } else {
-        if (t.bytes > slot.size() && t.bytes != expected_payload(g))
-            throw LoaderError(LoaderError::Code::SchemaMismatch,
-                              "converter: tensor bytes > slot_bytes for group '" + g.name + "'");
         // Plain-ветка — общий путь с лоадерами (plain_fill_slot): копия либо
         // допустимая конвертация F32/BF16→F16, хвост слота — нули.
+        // Round 4 fixup (найдено прогоном [R3] на реальных весах,
+        // tiny-random-Qwen2Moe): предохранитель «t.bytes > slot_bytes»
+        // срабатывал ДО конверсии и ложно отвергал конвертируемые источники
+        // (F32-тензор 2n→4n байт при F16-группе) — валидация размеров
+        // честно выполняется в plain_fill_slot (payload == expected_payload(g)
+        // и payload ≤ dst_bytes → SchemaMismatch; тиша запрещена).
         std::vector<std::uint8_t> raw(t.bytes);
         if (std::fseek(f, static_cast<long>(t.offset), SEEK_SET) != 0 ||
             std::fread(raw.data(), 1, t.bytes, f) != t.bytes)
