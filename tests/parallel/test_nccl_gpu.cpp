@@ -1,5 +1,6 @@
 // tests/parallel: GPU-тест NCCL-backend (ADR-02/ADR-10 §2) — задача 3 раунда 2,
-// ретрай-протокол P2P — [R3] раунда 3 (planner round 2 [Q1]).
+// ретрай-протокол P2P — [R3] раунда 3 (planner round 2 [Q1]), третья попытка
+// (socket/NET-транспорт) — [R1] раунда 4.
 //
 // Собирается ТОЛЬКО при STELL_CUDA=ON + libnccl (сервер, cuda 12.8 + libnccl).
 //
@@ -10,13 +11,17 @@
 //   При неудаче/зависании попытки 1 (зависание P2P-коллективов при
 //   ncclCommInitRank COMPLETE — типичный признак вмешательства co-tenancy
 //   в direct-pointer P2P) — АВТОМАТИЧЕСКАЯ попытка 2 с NCCL_P2P_DISABLE=1:
-//   корректность обязана подтверждаться и без P2P (ring через host/shm).
+//   NCCL сам выбирает SHM-транспорт (ring через host/shm); корректность
+//   обязана подтверждаться и без P2P. При неудаче попытки 2 (shm-attach
+//   errno 115/11 — round 3) — АВТОМАТИЧЕСКАЯ попытка 3 с
+//   NCCL_P2P_DISABLE=1 + NCCL_SHM_DISABLE=1: вынуждает NCCL на
+//   NET/sockets-транспорт между картами. РОВНО три попытки.
 //   Ретрай исполняется самим тестом: бинарник перезапускает себя дочерним
 //   процессом под watchdog'ом (зависание NCCL-коллектива не перехватывается
-//   внутри процесса). Третьей попытки нет. Логика решений — чистый заголовок
-//   p2p_retry.hpp, юнит-тест на CPU: tests/parallel/test_p2p_retry.cpp.
+//   внутри процесса). Логика решений — чистый заголовок p2p_retry.hpp,
+//   юнит-тест на CPU: tests/parallel/test_p2p_retry.cpp.
 //   Ручной вариант для worker'а (если ретрай подавлен или нужен отдельный шаг):
-//     NCCL_P2P_DISABLE=1 STELL_GPU_DEVICES=0,4 ctest -R parallel_gpu --output-on-failure
+//     NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 STELL_GPU_DEVICES=0,4 ctest -R parallel_gpu --output-on-failure
 //   LATENCY-БЕНЧ (V100↔V100 по NVLink, для целей PLAN.md §5) — отдельная фаза,
 //   ТОЛЬКО при наличии окна (после подтверждения корректности; пропуск —
 //   env STELL_GPU_BENCH=0), с co-tenancy-пометкой; замеры на RTX 2060
@@ -398,8 +403,8 @@ const char* phase_filter(const char* phase) {
                                             : "parallel_gpu_nccl_expert_alltoall";
 }
 
-int run_child_phase(const char* phase, const char* out_file,
-                    bool disable_p2p, int watchdog_s, const char* tag) {
+int run_child_phase(const char* phase, const char* out_file, int attempt,
+                    int watchdog_s, const char* tag) {
     const pid_t pid = fork();
     if (pid < 0) {
         std::printf("PENDING: fork не удался (%s) — честный pending\n", tag);
@@ -408,16 +413,20 @@ int run_child_phase(const char* phase, const char* out_file,
     if (pid == 0) {
         // Дочерний процесс: свежий образ (CUDA/NCCL-состояние родителя не
         // наследуется — exec), окружение + метки фазы и файла результата.
+        const char* p2p_dis = p2p_disable_env(attempt);
+        const char* shm_dis = shm_disable_env(attempt);
         std::vector<std::string> env_store;
         for (char** e = environ; e && *e; ++e) {
             std::string kv(*e);
-            // NCCL_P2P_DISABLE попытки 2 — заменить унаследованный.
-            if (disable_p2p && kv.rfind("NCCL_P2P_DISABLE=", 0) == 0) continue;
+            // NCCL_P2P_DISABLE/NCCL_SHM_DISABLE попытки — заменить унаследованные.
+            if (p2p_dis[0] && kv.rfind("NCCL_P2P_DISABLE=", 0) == 0) continue;
+            if (shm_dis[0] && kv.rfind("NCCL_SHM_DISABLE=", 0) == 0) continue;
             env_store.push_back(std::move(kv));
         }
         env_store.push_back(std::string("STELL_GPU_TEST_PHASE=") + phase);
         env_store.push_back(std::string("STELL_GPU_TEST_OUT=") + out_file);
-        if (disable_p2p) env_store.push_back("NCCL_P2P_DISABLE=1");
+        if (p2p_dis[0]) env_store.push_back(std::string("NCCL_P2P_DISABLE=") + p2p_dis);
+        if (shm_dis[0]) env_store.push_back(std::string("NCCL_SHM_DISABLE=") + shm_dis);
         std::vector<char*> envp;
         for (auto& kv : env_store) envp.push_back(kv.data());
         envp.push_back(nullptr);
@@ -484,7 +493,8 @@ int orchestrate() {
     close(out_fd);
     const std::string out_file(out_path);
 
-    // --- Фаза 1: корректность (до 2 попыток, вторая — с NCCL_P2P_DISABLE=1) --
+    // --- Фаза 1: корректность (ровно 3 попытки: 1 дефолт; 2 = без P2P, SHM;
+    //     3 = без P2P и без SHM, NET/sockets) -------------------------------
     std::string outcome;
     int attempt = 1;
     for (;;) {
@@ -493,14 +503,17 @@ int orchestrate() {
                         "протокол [Q1] — пара GPU0 V100 + GPU4 RTX 2060; "
                         "переопределить: STELL_GPU_DEVICES)\n",
                         devices_str.c_str());
-        else
+        else if (attempt == 2)
             std::printf("GPU-VALIDATION: попытка 2 с NCCL_P2P_DISABLE=1 "
                         "(ring через host/shm — корректность обязана подтверждаться "
                         "и без P2P)\n");
+        else
+            std::printf("GPU-VALIDATION: попытка 3 с NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 "
+                        "(socket/NET-транспорт — SHM-транспорт тоже сломан средой, "
+                        "round 3: shm-attach errno 115/11)\n");
         std::fflush(stdout);
         std::remove(out_file.c_str());   // исход предыдущей попытки не выдавать за текущую
-        const int rc = run_child_phase("correctness", out_file.c_str(),
-                                       std::string(p2p_disable_env(attempt)) == "1",
+        const int rc = run_child_phase("correctness", out_file.c_str(), attempt,
                                        watchdog_s, "корректности");
         if (rc == -1) {   // fork не удался — повтор бесполезен, честный pending
             outcome = "pending:fork не удался";
@@ -508,10 +521,12 @@ int orchestrate() {
         }
         outcome = read_outcome(out_file.c_str());   // rc == -2 → файл пуст (зависание)
         // Решение протокола: pass → стоп; неудача попытки 1 → ретрай без P2P;
-        // неудача попытки 2 (или зависание) → GiveUp.
+        // неудача попытки 2 → ретрай без SHM; неудача попытки 3 (или зависание)
+        // → GiveUp (исход попытки 3 окончателен).
         const GpuRetryVerdict v = p2p_retry_decide(attempt, outcome);
         if (v == GpuRetryVerdict::Pass) break;
         if (v == GpuRetryVerdict::RetryWithP2pDisabled) { attempt = 2; continue; }
+        if (v == GpuRetryVerdict::RetryWithShmDisabled) { attempt = 3; continue; }
         break;   // GiveUpPending: попытки исчерпаны
     }
 
@@ -537,6 +552,10 @@ int orchestrate() {
         std::printf("GPU-VALIDATION: корректность подтверждена БЕЗ P2P "
                     "(NCCL_P2P_DISABLE=1, ring через host/shm) — co-tenancy "
                     "вмешалась в direct-pointer P2P; пометить в отчёте\n");
+    else if (attempt == 3)
+        std::printf("GPU-VALIDATION: корректность подтверждена БЕЗ P2P и БЕЗ SHM "
+                    "(NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1, socket/NET-транспорт) — "
+                    "среда сломала и direct-pointer P2P, и SHM; пометить в отчёте\n");
     else
         std::printf("GPU-VALIDATION: корректность подтверждена (побитово == CPU-эталону)\n");
 
@@ -550,7 +569,7 @@ int orchestrate() {
     }
     std::fflush(stdout);
     std::remove(out_file.c_str());
-    const int rc = run_child_phase("bench", out_file.c_str(), /*disable_p2p=*/false,
+    const int rc = run_child_phase("bench", out_file.c_str(), /*attempt=*/1,
                                    watchdog_s, "bench");
     const std::string bench_outcome =
         (rc == -2) ? "pending:bench-прогон завис (убит watchdog'ом)" : read_outcome(out_file.c_str());
