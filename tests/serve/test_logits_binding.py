@@ -97,11 +97,26 @@ def test_mock_has_no_logits_symbol(mock_engine_lib):
 
 @pytest.fixture()
 def real_logits_backend(real_engine_lib):
-    from stell_serve.app import default_engine_cfg
+    """Реальный движок над mini_dense (runner:"ops", safetensors) — той же
+    моделью, что и golden-фикстура (аналог test_capi_logits в tests/core)."""
     from stell_serve.engine import CtypesEngineBackend
 
+    fx = _ROOT / "tests" / "models" / "golden" / "logits_mini_dense.json"
+    profile = json.loads(fx.read_text()).get("profile", "")
+    wf = "safetensors" if profile.upper() == "F16" else "nvfp4w4a16"
+    fixtures = _ROOT / "tests" / "models" / "fixtures"
+    cfg = {
+        "runner": "ops",
+        "engine": {"max_slots": 4},
+        "model": {
+            "description": str(fixtures / "mini_dense.json"),
+            "weights": str(fixtures / "mini_dense.safetensors"),
+            "weights_format": wf,
+            "tokenizer": "byte",
+        },
+    }
     backend = CtypesEngineBackend(real_engine_lib)
-    backend.create(default_engine_cfg("engine-demo"))
+    backend.create(cfg)
     yield backend
     backend.close()
 
