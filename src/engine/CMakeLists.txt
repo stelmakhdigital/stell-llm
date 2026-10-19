@@ -270,3 +270,14 @@ target_include_directories(test_engine_ops_shared PRIVATE ../../tests/core)
 target_compile_definitions(test_engine_ops_shared PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/ops_shared COMMAND test_engine_ops_shared)
+
+# --- round 5: [R6] source_slice через мост (fused qkv, одно открытие) ---------
+
+add_executable(test_engine_weights_slice
+    ../../tests/core/engine/test_weights_slice.cpp
+)
+target_link_libraries(test_engine_weights_slice stell_engine)
+target_include_directories(test_engine_weights_slice PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_weights_slice PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/weights_slice COMMAND test_engine_weights_slice)

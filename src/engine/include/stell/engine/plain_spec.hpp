@@ -77,6 +77,11 @@ struct PlainGroup {
     std::vector<std::int64_t> shape;
     std::size_t slot_bytes = 0;           // ADR-08 §1: фиксируется при разметке
     std::string source_pattern;           // ADR-09 §1: имя тензора во входном формате
+    std::int64_t source_slice = -1;       // [R6] round 5: срез стековного тензора
+                                          // по старшей размерности (−1 = тензор
+                                          // целиком); мост обязан нести срез в
+                                          // compat-описание для лоадера (ADR-09
+                                          // «Уточнение round 5», planner Q7)
     bool kv_block = false;                // KV-группа: весов в файле нет
 };
 
@@ -112,6 +117,10 @@ struct PlainSpec {
 // KV-группы в карте отсутствуют.
 struct LoadedWeights {
     std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> slots;
+
+    // [R6] round 5: сколько источников IWeightsSource открыл мост (честная
+    // метрика контракта «открытие источника ровно одно», planner Q7).
+    std::size_t source_opens = 0;
 };
 
 // --- мост к модулю models (реализация: src/model_spec_bridge.cpp) ------------
