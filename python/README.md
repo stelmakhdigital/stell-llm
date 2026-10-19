@@ -33,6 +33,12 @@ ctypes. Разрешение пути (`engine.resolve_engine_lib`):
    (engine не владеет детокенизатором) — serve подставляет текст
    decimal-детокенизатором; запрос кодируется в формат engine
    (`{"sampling":…, "prompt_tokens":…, "eos_token":-1}`);
+   расширения ABI round 2: `stell_logits` (логиты финального слоя по готовым
+   токенам, "positions":"last"|"all" — гейты качества/дашборд) —
+   доступность классифицируется по наличию символа (`supports_logits`);
+   `stell_cancel` — конвенция ADR-11 0/-1 (legacy 1/0 pre-merge сборок
+   распознаётся по отсутствию `stell_logits` — оба изменения приходят
+   одним merge core);
 3. локальная ABI-копия `build/cpu/src/serve/libstell_core_serve.so`
    (таргет `stell_core_serve_check` из src/serve — те же исходники
    src/engine для контрактных тестов, пока core не вклеил свой таргет);

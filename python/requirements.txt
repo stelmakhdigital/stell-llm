@@ -4,3 +4,4 @@ sse-starlette
 pydantic
 httpx
 pytest
+numpy  # quality-gates runner: fallback-источник логитов (golden-ref) до merge core [R1]
