@@ -26,8 +26,10 @@ function render() {
     renderSlots(snap.engine || {});
     renderFeatures(snap.features, snap.build, snap.parallel);
     renderLogs(snap.serve?.logs || []);
+    renderLogits(snap.logits);
     text(document.getElementById("updated"),
-      `обновлено: ${new Date().toLocaleTimeString()} · запросов: ${snap.serve?.requests_total ?? 0}`);
+      `обновлено: ${new Date().toLocaleTimeString()} · запросов: ${snap.serve?.requests_total ?? 0}` +
+      ` · отмен: ${snap.serve?.cancelled_total ?? 0}`);
   }).catch(() => {
     text(document.getElementById("status"), "недоступен (нет /metrics)");
   });
@@ -69,6 +71,7 @@ function renderEngine(snap) {
   cards.innerHTML = "";
   [["state", e.state], ["sessions_active", e.sessions_active],
    ["slots_busy", e.slots_busy], ["slots_total", e.slots_total],
+   ["cancelled_total", e.cancelled_total],
    ["decode tok/s", lat.tok_s?.decode], ["prefill tok/s", lat.tok_s?.prefill]]
     .forEach(([k, v]) => {
       const c = document.createElement("div");
@@ -127,6 +130,23 @@ function renderFeatures(features, build, parallel) {
 function renderLogs(logs) {
   document.getElementById("log-view").textContent =
     logs.length ? logs.join("\n") : "(пусто)";
+}
+
+/* Статистика stell_logits (расширение ABI round 2, [R1]): снапшот движка
+ * может нести блок logits (например {"requests_total":…}); до merge core
+ * блока нет — секция честно показывает отсутствие данных, не роняя UI. */
+function renderLogits(logits) {
+  const host = document.getElementById("logits-stats");
+  host.innerHTML = "";
+  if (!logits || typeof logits !== "object" || !Object.keys(logits).length) {
+    host.innerHTML = "<div>нет данных (снапшот движка без logits-статистики — " +
+      "расширение ABI round 2 включится после merge core [R1])</div>";
+    return;
+  }
+  const table = document.createElement("table");
+  table.innerHTML = Object.entries(logits)
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v ?? "—"}</td></tr>`).join("\n");
+  host.appendChild(table);
 }
 
 render();

@@ -18,6 +18,24 @@
 - **CPU-fallback mock** `libstell_mock_core.so` (src/serve/mock): события несут
   готовый текст; шаги ведёт сам движок. kind="mock".
 
+Расширения ABI round 2 (планировщик T-20261017200354, Q1/Q2; ADR-11 «поля
+только добавляются» — новые символы ABI-совместимы):
+
+- `stell_logits(e, request_json, out_json)` — логиты финального слоя
+  (до softmax) по готовым prompt_tokens; request
+  `{"prompt_tokens":[…], "positions":"last"|"all"}`, ответ
+  `{"logits":[[…]],"n_positions":P,"n_vocab":V}`, возврат 0/-1
+  (ошибка — `{"error":…}` в out_json); строки malloc/free — конвенция
+  ADR-11 §1. Символ добавляет поток core ([R1]); до его merge биндинг
+  честно сообщает о недоступности (`supports_logits == False`), а
+  quality-gates runner использует fallback-источник логитов.
+- `stell_cancel` — конвенция ADR-11 §1 выровнена на **0 = успех,
+  -1 = сессия не найдена/уже закрыта** (планировщик Q2; mock уже 0/-1).
+  Реальный движок до merge core ([R2]) возвращает 1/0
+  (scheduler.cancel → bool): биндинг распознаёт legacy-сборку по
+  отсутствию `stell_logits` (оба изменения входят в один merge core) и
+  применяет старую интерпретацию; после merge — только 0/-1.
+
 Пока core не вклеил свой SHARED-таргет, реальный путь покрыт локальной
 ABI-совместимой сборкой src/engine из src/serve/CMakeLists.txt
 (`stell_core_serve_check` → build/cpu/src/serve/libstell_core_serve.so);
@@ -37,6 +55,10 @@ __all__ = [
     "default_engine_lib", "resolve_engine_lib",
     "byte_tokenizer", "decimal_detokenizer",
 ]
+
+# Значения "positions" в stell_logits (планировщик Q1): логиты последней
+# позиции или всех позиций промпта (teacher-forcing для PPL одним вызовом).
+_LOGITS_POSITIONS = ("last", "all")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -114,7 +136,21 @@ class EngineBackend:
         raise NotImplementedError
 
     def cancel(self, session_id: int) -> None:
+        """Отмена сессии (ADR-11 §3): 0 = успех, -1 = не найдена/закрыта
+        (конвенция ADR-11 §1, планировщик Q2); EngineError при -1."""
         raise NotImplementedError
+
+    def logits(self, prompt_tokens: List[int],
+               positions: str = "last") -> Dict[str, Any]:
+        """Логиты финального слоя (до softmax) по готовым токенам —
+        stell_logits (расширение ABI round 2, планировщик Q1). Только
+        реальный движок после merge core [R1]."""
+        raise NotImplementedError
+
+    @property
+    def supports_logits(self) -> bool:
+        """True, если .so экспортирует stell_logits ([R1], merge core)."""
+        return False
 
     def step(self) -> None:
         """Один шаг декода батча (только реальный движок: stell_step, ABI-
@@ -183,6 +219,18 @@ class CtypesEngineBackend(EngineBackend):
             self._step = step_fn
         except AttributeError:
             self._step = None
+        # stell_logits — ABI-совместимое расширение round 2 (планировщик Q1;
+        # [R1], символ добавляет поток core): getattr — та же совместимая
+        # проверка, что у stell_step. Доступность классифицируется строго по
+        # наличию символа в .so (никаких догадок по имени файла).
+        try:
+            logits_fn = lib.stell_logits
+            logits_fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                  ctypes.POINTER(ctypes.c_char_p)]
+            logits_fn.restype = ctypes.c_int
+            self._logits = logits_fn
+        except AttributeError:
+            self._logits = None
         # освобождение строк, возвращённых движком (уточнение ADR-11 round 1:
         # malloc-строки, освобождает вызывающий): расширение stell_free (mock),
         # иначе free() из libc того же процесса (in-process .so — тот же heap).
@@ -293,12 +341,54 @@ class CtypesEngineBackend(EngineBackend):
 
     def cancel(self, session_id: int) -> None:
         rc = self.lib.stell_cancel(self._require_handle(), ctypes.c_uint64(session_id))
-        # Расхождение кодов возврата (зафиксировано в отчёте round 2; контракт
-        # не меняется): mock — 0 ок / <0 неизвестная сессия; реальный движок —
-        # 1 ок / 0 неизвестная сессия (scheduler.cancel → bool).
-        ok = (rc != 0) if self.kind == "real" else (rc == 0)
+        # Конвенция ADR-11 §1 (планировщик Q2, round 2): 0 = успех,
+        # -1 = сессия не найдена/уже закрыта. Mock — уже 0/-1. Реальный
+        # движок до merge core ([R2]) возвращает legacy 1/0
+        # (scheduler.cancel → bool); legacy-сборка распознаётся по
+        # отсутствию stell_logits (оба изменения — один merge core):
+        # там 1 = успех, 0 = неизвестная сессия. После merge core путь
+        # единый: 0 ок, всё остальное — ошибка.
+        if self.kind == "real" and self._logits is None:
+            ok = rc != 0              # legacy 1/0 (pre-merge ABI-копия/движок)
+        else:
+            ok = rc == 0              # ADR-11: 0 = успех, -1 = ошибка
         if not ok:
             raise EngineError(f"cancel failed for session {session_id} (rc={rc})")
+
+    @property
+    def supports_logits(self) -> bool:
+        return self._logits is not None
+
+    def logits(self, prompt_tokens: List[int],
+               positions: str = "last") -> Dict[str, Any]:
+        """Логиты финального слоя (до softmax) по готовым токенам —
+        stell_logits (планировщик Q1, [R1]).
+
+        request: {"prompt_tokens": […], "positions": "last"|"all"}
+        ответ:   {"logits": [[f32,…],…], "n_positions": P, "n_vocab": V}
+        возврат: 0/-1; при ошибке out_json = {"error": …}; строки malloc —
+        free() вызывающим (конвенция ADR-11 §1).
+
+        EngineError, если символ не экспортирован (до merge core [R1]) —
+        quality-гейты в этом случае используют fallback-источник логитов
+        (см. stell_bench.quality_gates_runner)."""
+        if self._logits is None:
+            raise EngineError(
+                "stell_logits недоступен: .so не экспортирует символ "
+                "(ABI-расширение round 2, включится после merge core [R1])")
+        if positions not in _LOGITS_POSITIONS:
+            raise EngineError(f"positions must be one of {_LOGITS_POSITIONS}")
+        raw = json.dumps({"prompt_tokens": [int(t) for t in prompt_tokens],
+                          "positions": positions}).encode()
+        out = ctypes.c_char_p()
+        rc = self._logits(self._require_handle(), raw, ctypes.byref(out))
+        payload: Dict[str, Any] = {}
+        if out:
+            payload = json.loads(ctypes.string_at(out).decode())
+            self._release_ptr(out)
+        if rc != 0 or "error" in payload:
+            raise EngineError(payload.get("error", f"stell_logits failed (rc={rc})"))
+        return payload
 
     def metrics(self) -> Dict[str, Any]:
         out = ctypes.c_char_p()
