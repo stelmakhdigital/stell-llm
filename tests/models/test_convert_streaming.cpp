@@ -568,6 +568,118 @@ void body() {
     }
 
     // =========================================================================
+    // 4b. Регрессия [R3] (реальный прогон tiny-random-Qwen2Moe): F32-чекпоинт
+    //     (torch default) при F16-группах плана — конвертация F32→F16 в
+    //     plain-ветке writer'а. Прежний предохранитель «t.bytes > slot_bytes»
+    //     срабатывал ДО конверсии (embed F32 19 410 688 Б > слот 9 707 520 Б)
+    //     и ложно отвергал конвертируемый источник.
+    //     Проверка: синтетический план с крупной embed (vocab 151646, hidden 32,
+    //     F16; эксперты NVFP4, роутер/нормы F32) через streaming-путь — слоты
+    //     ПОБИТОВО == прямому лоадеру того же плана; расчёт slot_bytes группы
+    //     (align 4096, payload по dtype группы) вмещает payload.
+    // =========================================================================
+    {
+        const char* kBigEmbedJson = R"({
+  "schema": "1.0",
+  "name": "big-embed-f32-src",
+  "class": "moe",
+  "dtype_weights": "NVFP4",
+  "vocab_size": 151646,
+  "d_model": 32,
+  "n_layers": 1,
+  "n_heads": 2,
+  "d_head": 16,
+  "kv": { "dtype": "F16", "n_kv_heads": 1, "d_kv": 16, "quant": null },
+  "moe": { "n_experts": 2, "n_experts_active": 2, "expert_d_ff": 32,
+           "router": "softmax-topk" },
+  "ops": [
+    { "op": "rmsnorm", "io": ["hidden"], "params": { "eps": 1e-6 } },
+    { "op": "attention", "io": ["hidden", "kv"], "params": { "kernel": "sm70_fp32_qk_pv" } },
+    { "op": "moe_gather_scatter", "io": ["hidden", "experts"], "params": { "kernel": "sm70_moe_gs" } }
+  ],
+  "tensor_groups": [
+    { "name": "embed", "role": "attn", "shape": [151646, 32], "dtype": "F16",
+      "source_pattern": "model.embed_tokens.weight" },
+    { "name": "norm_final", "role": "attn", "shape": [32], "dtype": "F32",
+      "source_pattern": "model.norm.weight" },
+    { "name": "l{layer}.attn.norm", "role": "attn", "shape": [32], "dtype": "F32",
+      "source_pattern": "model.layers.{layer}.input_layernorm.weight",
+      "cardinality": { "layer": 1 } },
+    { "name": "l{layer}.attn.wq", "role": "attn", "shape": [32, 32], "dtype": "NVFP4",
+      "source_pattern": "model.layers.{layer}.self_attn.q_proj.weight",
+      "cardinality": { "layer": 1 } },
+    { "name": "l{layer}.kv", "role": "kv", "shape": [16, 32], "dtype": "F16",
+      "source_pattern": "layers.{layer}.kv_cache", "kv_block": true,
+      "cardinality": { "layer": 1 } },
+    { "name": "l{layer}.mlp.router", "role": "expert", "shape": [2, 32], "dtype": "F32",
+      "source_pattern": "model.layers.{layer}.mlp.router.weight",
+      "cardinality": { "layer": 1 } },
+    { "name": "l{layer}.e{expert}.gate", "role": "expert", "shape": [32, 32], "dtype": "NVFP4",
+      "source_pattern": "model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+      "cardinality": { "layer": 1, "expert": 2 } },
+    { "name": "l{layer}.e{expert}.down", "role": "expert", "shape": [32, 32], "dtype": "NVFP4",
+      "source_pattern": "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+      "cardinality": { "layer": 1, "expert": 2 } }
+  ]
+})";
+        const ModelDescription big = parse_model_description(kBigEmbedJson, "big-embed");
+        const ModelDescription* bigp = &big;
+
+        // Инвариант расчёта: slot_bytes группы embed (payload по dtype ГРУППЫ,
+        // align 4096) вмещает payload и не зависит от dtype источника.
+        const auto& embed_g = big.groups[0];
+        CHECK(embed_g.name == "embed");
+        CHECK(embed_g.slot_bytes == 9707520ul);  // ceil(9705344/4096)*4096
+        // F32-тензор источника больше слота — ровно кейс реального прогона.
+        CHECK(151646ul * 32ul * 4ul > embed_g.slot_bytes);
+
+        // F32-чекпоинт (как tiny-random-Qwen2Moe): embed/нормы/роутер — F32,
+        // матрицы — F16 (смешанный dtype источника).
+        const std::vector<SourceTensorDesc> src = {
+            {"model.embed_tokens.weight", "F32", {151646, 32}},
+            {"model.norm.weight", "F32", {32}},
+            {"model.layers.0.input_layernorm.weight", "F32", {32}},
+            {"model.layers.0.self_attn.q_proj.weight", "F16", {32, 32}},
+            {"model.layers.0.mlp.router.weight", "F32", {2, 32}},
+            {"model.layers.0.mlp.experts.0.gate_proj.weight", "F16", {32, 32}},
+            {"model.layers.0.mlp.experts.0.down_proj.weight", "F16", {32, 32}},
+            {"model.layers.0.mlp.experts.1.gate_proj.weight", "F16", {32, 32}},
+            {"model.layers.0.mlp.experts.1.down_proj.weight", "F16", {32, 32}},
+        };
+        // Каталог с одним шардом — точная топология серверного прогона.
+        const std::string dir1 = "/tmp/stell_stream_bigembed_dir";
+        std::filesystem::remove_all(dir1);
+        std::filesystem::create_directories(dir1);
+        write_safetensors_stream(dir1 + "/model.safetensors", src);
+        const std::string single1 = "/tmp/stell_stream_bigembed_single.safetensors";
+        write_safetensors_stream(single1, src);
+
+        const std::string out1 = "/tmp/stell_stream_bigembed_out";
+        StellTierConverter conv;
+        conv.convert_streaming(*bigp, dir1, out1);  // <- прежний код кидал SchemaMismatch
+        const std::string layout1 = out1 + "/" + big.name + ".stelltier";
+
+        const se::PlainSpec spec1 = se::plain_spec_from_description(*bigp);
+        const se::ExecutionPlan plan1 = se::build_execution_plan(spec1);
+        const se::LoadedWeights direct1 =
+            load_plain_weights(single1, spec1, se::PlainWeightsNVFP4W4A16);
+        const se::LoadedWeights via1 =
+            se::load_plain_weights(layout1, spec1, se::PlainWeightsStellTier);
+        CHECK(direct1.slots.size() == via1.slots.size());
+        CHECK(via1.slots.size() == 9);  // 2 верхних + 4 слоя + 2×2 эксперта (без kv)
+        for (const auto& [gid, buf] : via1.slots) {
+            const auto it = direct1.slots.find(gid);
+            CHECK_MSG(it != direct1.slots.end(), "группы нет в прямом пути");
+            CHECK_MSG(it->second.size() == buf.size() &&
+                          std::memcmp(it->second.data(), buf.data(), buf.size()) == 0,
+                      "слот группы (id " + std::to_string(gid) +
+                          ") layout != прямому лоадеру — F32→F16 конвертация writer'а");
+        }
+        std::printf("регрессия [R3] (F32-чекпоинт, embed F16 [151646,32]): streaming-путь "
+                    "побитно == прямому лоадеру: OK\n");
+    }
+
+    // =========================================================================
     // 5. Реальные веса (Mixtral-8x7B и т.п.): честный pending по постановке
     //    planner'а ([R7]: «если реальные веса недоступны в раунде — пайплайн и
     //    конфигурация закоммичены, прогон честно pending с причиной»).

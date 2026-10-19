@@ -93,6 +93,16 @@ inline void plain_fill_slot(const stell::tiers::TensorGroup& g, const TensorInfo
     const bool src_bf16 = t.dtype == stell::tiers::DType::F16 && t.bf16;
     if (g.dtype == stell::tiers::DType::F16 && (src_f32 || src_bf16)) {
         // F32/BF16 → F16 (допустимая конвертация лоадера, ADR-09 §3).
+        // Источник обязан содержать itemsize*n байт (round 4 fixup: честная
+        // проверка до индексации — усечённый/несогласованный тензор →
+        // SchemaMismatch, не выход за границы буфера).
+        if (raw.size() != n * t.itemsize)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "group '" + g.name + "': payload источника ('" +
+                                  t.dtype_str + "', " + std::to_string(raw.size()) +
+                                  " Б) не согласован с формой группы (" +
+                                  std::to_string(n) + " × " +
+                                  std::to_string(t.itemsize) + " Б)");
         payload = n * 2;
         if (payload > dst_bytes)
             throw LoaderError(LoaderError::Code::SchemaMismatch,
