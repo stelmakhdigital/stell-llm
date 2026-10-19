@@ -909,4 +909,113 @@ T_CASE(manager_vram_slots_bitwise_direct_loader) {
                 checks, n_groups);
 }
 
+// --- [R2] round 5: per-group layout (слоты групп переменной ёмкости) -------
+
+T_CASE(manager_per_group_variable_slot_sizes) {
+    // Реальный stell-tier layout v1: у групп РАЗНЫЕ slot_bytes (3× разницы в
+    // фикстуре). Менеджер обязан:
+    //   - принимать план (vram_slot_size = 0 → авто = max slot группы);
+    //   - читать/копировать ровно slot_bytes ГРУППЫ (никакого мусорного
+    //     хвоста max-слота: memcpy фазы C — gb байтов, read_ram_slot/
+    //     read_vram_slot — gb байтов) — побитовая сверка с payload writer'а;
+    //   - честно учитывать байты RAM-тира и io_bytes по группам;
+    //   - вести per-group счётчики prefetch (hit-rate по группам, bench).
+    struct Spec { std::uint32_t gid; const char* name; Role role; std::size_t slot; };
+    const Spec specs[] = {
+        {0, "embed",     Role::Attn,   8192},
+        {1, "l0.attn",   Role::Attn,   4096},
+        {2, "l0.router", Role::Expert, 8192},
+        {3, "l0.kv",     Role::Kv,     12288},
+        {4, "l1.attn",   Role::Attn,   4096},
+        {5, "l1.router", Role::Expert, 4096},
+    };
+    const std::size_t n = sizeof(specs) / sizeof(specs[0]);
+    std::vector<TensorGroup> plan;
+    std::uint64_t plan_bytes = 0;
+    for (const auto& s : specs) {
+        plan.push_back(make_group(s.gid, s.name, s.role, DType::F16, s.slot,
+                                  {std::int64_t(s.slot / 2), 2}));
+        plan_bytes += s.slot;
+    }
+    const std::string path = "/tmp/stell_tier_test_mgr_pergroup.stelltier";
+    {   // writer с per-group payload (детерминированный паттерн, как в R7-тесте)
+        TierLayoutHeader h;
+        h.dtype_profile = 1;
+        h.n_groups = n;
+        TierLayoutWriter w(path, h);
+        for (const auto& s : specs) {
+            std::vector<std::uint8_t> payload(s.slot);
+            for (std::size_t k = 0; k < s.slot; ++k)
+                payload[k] = std::uint8_t((s.gid * 131 + k * 7 + 5) & 0xFF);
+            w.add_group(plan[s.gid], 1, payload.data(), payload.size());
+        }
+        w.finalize();
+    }
+
+    TierConfig cfg;
+    cfg.vram_slots = 2;                          // < плана — churn
+    cfg.vram_slot_size = 0;                      // авто: max slot плана (12288)
+    cfg.ram_capacity = (std::size_t)plan_bytes;  // план целиком (Σ gb)
+    cfg.nvme_layout = path;
+    cfg.lookahead = 0;
+    TierManager mgr(cfg);
+    mgr.set_plan(plan);
+
+    // Полный цикл: холодный pin каждой группы → побитовая сверка RAM- и
+    // VRAM-копий с payload writer'а (ровно gb байтов группы).
+    std::vector<std::uint8_t> buf(12288), expected(12288);
+    for (const auto& s : specs) {
+        auto a = mgr.pin(GroupKey{GroupId{s.gid}, s.role});
+        a->wait();
+        mgr.read_ram_slot(GroupId{s.gid}, buf.data(), buf.size());
+        for (std::size_t k = 0; k < s.slot; ++k)
+            expected[k] = std::uint8_t((s.gid * 131 + k * 7 + 5) & 0xFF);
+        T_REQUIRE(std::memcmp(buf.data(), expected.data(), s.slot) == 0,
+                  "RAM-копия группы побитово == payload (ровно gb байтов)");
+        mgr.read_vram_slot(GroupId{s.gid}, buf.data(), buf.size());
+        T_REQUIRE(std::memcmp(buf.data(), expected.data(), s.slot) == 0,
+                  "VRAM-слот группы побитово == payload (ровно gb байтов)");
+        mgr.unpin(GroupKey{GroupId{s.gid}, s.role});
+    }
+
+    // Учёт per-group: холодная загрузка каждой группы — 2 переноса (NVMe→RAM
+    // + RAM→VRAM) по gb байтов: io_bytes == 2×Σ gb; io_ops == 2×n.
+    const TierStats st = mgr.stats();
+    T_REQUIRE(st.io_bytes == 2 * plan_bytes,
+              "io_bytes == 2×Σ slot_bytes групп (пер-group учёт, не max-слоты)");
+    T_REQUIRE(st.io_ops == 2 * n, "io_ops == 2 переноса на группу");
+    T_REQUIRE(st.tier_bytes[1] == plan_bytes,
+              "RAM-тир занят ровно Σ slot_bytes групп (per-group учёт)");
+    T_REQUIRE(st.tier_bytes[1] <= cfg.ram_capacity, "RAM-тир в лимите");
+    T_REQUIRE(st.tier_bytes[2] == plan_bytes, "NVMe-тир = сумме слотов layout");
+
+    // Per-group счётчики prefetch: холодный pin → pf_misses=1, pf_hits=0;
+    // prefetch + материализация + pin → pf_hits=1.
+    {
+        const auto stats0 = mgr.group_prefetch_stats();
+        T_REQUIRE(stats0.size() == n, "снапшот покрывает все группы плана");
+        T_REQUIRE(stats0[0].gid == GroupId{0} && stats0[0].misses == 1 &&
+                  stats0[0].hits == 0,
+                  "холодный pin → per-group misses=1, hits=0");
+        mgr.prefetch({GroupKey{GroupId{0}, Role::Attn}});
+        wait_resident(mgr, GroupId{0}); // детерминизм: материализация до pin
+        auto a = mgr.pin(GroupKey{GroupId{0}, Role::Attn});
+        a->wait();
+        mgr.unpin(GroupKey{GroupId{0}, Role::Attn});
+        const auto stats1 = mgr.group_prefetch_stats();
+        T_REQUIRE(stats1[0].hits == 1 && stats1[0].misses == 1,
+                  "pin после префетча → per-group hits=1 (hit-rate по группам)");
+    }
+
+    // read_ram_slot с dst меньше slot_bytes ГРУППЫ → PlanMismatch (per-group
+    // граница); dst ≥ gb — работает (проверено выше буфером 12288).
+    bool thrown = false;
+    try {
+        mgr.read_ram_slot(GroupId{3}, buf.data(), 4096); // gb(gid3)=12288 > 4096
+    } catch (const TierError& e) {
+        thrown = e.code() == TierError::Code::PlanMismatch;
+    }
+    T_REQUIRE(thrown, "read_ram_slot: dst < slot_bytes группы → PlanMismatch");
+}
+
 T_MAIN

@@ -195,6 +195,14 @@ const TensorGroup* TierManager::plan(GroupId id) const {
     return nullptr;
 }
 
+// [R2] round 5: размер слота конкретной группы (под mu_). Per-group layout:
+// у групп РАЗНЫЕ slot_bytes (реальный stell-tier v1 — «по 1 тензору на
+// группу», ёмкости от КиБ до десятков МиБ); uniform — все == slot_size_.
+std::size_t TierManager::group_slot_bytes_locked(GroupId id) const {
+    const TensorGroup* g = plan(id);
+    return g ? g->slot_bytes : 0;
+}
+
 bool TierManager::resident_in_vram(GroupId id) const {
     std::lock_guard<std::mutex> lk(mu_);
     const GroupState* st = find(id);
@@ -202,21 +210,43 @@ bool TierManager::resident_in_vram(GroupId id) const {
 }
 
 // Расширение R8 (см. tier_manager.hpp): чтение слота группы из RAM-тира.
+// [R2] round 5: копируются ровно slot_bytes ГРУППЫ (per-group layout — у
+// групп разные размеры; uniform — группа == slot_size_ плана, прежнее
+// поведение). Буфер RAM-тира группы выделяется на slot_bytes группы —
+// хвост слота max-размера за границей данных группы не читается
+// (O_DIRECT читает ровно slot_bytes группы в выровненный буфер).
 void TierManager::read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) const {
     std::lock_guard<std::mutex> lk(mu_);
     const GroupState* st = find(id);
     if (!st)
         throw TierError(TierError::Code::PlanMismatch,
                         "read_ram_slot: unknown GroupId");
-    if (dst_bytes < slot_size_)
+    const std::size_t gb = group_slot_bytes_locked(id);
+    if (gb == 0 || dst_bytes < gb)
         throw TierError(TierError::Code::PlanMismatch,
-                        "read_ram_slot: dst_bytes < slot_bytes плана");
+                        "read_ram_slot: dst_bytes < slot_bytes группы");
     const auto it = ram_.find(id.value);
     if (it == ram_.end() || it->second == nullptr)
         throw TierError(TierError::Code::IoFailure,
                         "read_ram_slot: RAM-копии нет (pin→wait до чтения; "
                         "либо RAM-копия вытеснена при VRAM-resident)");
-    std::memcpy(dst, it->second, slot_size_);
+    std::memcpy(dst, it->second, gb);
+}
+
+// [R2] round 5: снапшот per-group счётчиков prefetch (см. tier_manager.hpp).
+std::vector<TierManager::GroupPrefetchStat>
+TierManager::group_prefetch_stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<GroupPrefetchStat> out;
+    out.reserve(states_.size());
+    for (const auto& kv : states_)
+        out.push_back(GroupPrefetchStat{GroupId{kv.first},
+                                        kv.second.pf_hits, kv.second.pf_misses});
+    std::sort(out.begin(), out.end(),
+              [](const GroupPrefetchStat& a, const GroupPrefetchStat& b) {
+                  return a.gid.value < b.gid.value;
+              });
+    return out;
 }
 
 // [R5] round 4: чтение содержимого VRAM-слота группы (побитовая сверка с
@@ -226,15 +256,17 @@ void TierManager::read_ram_slot(GroupId id, void* dst, std::size_t dst_bytes) co
 // device-слота.
 void TierManager::read_vram_slot(GroupId id, void* dst, std::size_t dst_bytes) const {
     std::int32_t slot = -1;
+    std::size_t gb = 0; // slot_bytes группы ([R2] round 5: per-group размеры)
     {
         std::lock_guard<std::mutex> lk(mu_);
         const GroupState* st = find(id);
         if (!st)
             throw TierError(TierError::Code::PlanMismatch,
                             "read_vram_slot: unknown GroupId");
-        if (dst_bytes < slot_size_)
+        gb = group_slot_bytes_locked(id);
+        if (gb == 0 || dst_bytes < gb)
             throw TierError(TierError::Code::PlanMismatch,
-                            "read_vram_slot: dst_bytes < slot_bytes плана");
+                            "read_vram_slot: dst_bytes < slot_bytes группы");
         if (!st->in_vram || st->slot < 0)
             throw TierError(TierError::Code::IoFailure,
                             "read_vram_slot: группа не resident в VRAM (pin→wait до чтения)");
@@ -242,13 +274,13 @@ void TierManager::read_vram_slot(GroupId id, void* dst, std::size_t dst_bytes) c
 #if !defined(STELL_CUDA)
         // CPU-эмуляция: слот в host-памяти (тот же кодовый путь, что и VRAM
         // в CPU-конфигурации) — копия под mu_ (защита от гонки с eviction).
-        std::memcpy(dst, vram_slots_[(std::size_t)slot], slot_size_);
+        std::memcpy(dst, vram_slots_[(std::size_t)slot], gb);
 #endif
     }
 #if defined(STELL_CUDA)
     // D2H вне mu_ (синхронный cudaMemcpy — не горячий путь).
     const cudaError_t ce = cudaMemcpy(dst, vram_slots_[(std::size_t)slot],
-                                      slot_size_, cudaMemcpyDeviceToHost);
+                                      gb, cudaMemcpyDeviceToHost);
     if (ce != cudaSuccess)
         throw TierError(TierError::Code::IoFailure,
                         std::string("read_vram_slot: cudaMemcpy D2H failed: ") +
@@ -306,8 +338,7 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
 
     plan_ = groups;
     std::sort(plan_.begin(), plan_.end(),
-              [](const TensorGroup& a, const TensorGroup& b) { return a.id.value < b.id.value; });
-    // NVMe-тир: открытие layout и сверка с планом (ADR-12 §2.2/§4).
+              [](const TensorGroup& a, const TensorGroup& b) { return a.id.value < b.id.value; });    // NVMe-тир: открытие layout и сверка с планом (ADR-12 §2.2/§4).
     nvme_.reset();
     if (!cfg_.nvme_layout.empty()) {
         // R1: флаг verify_crc_ пробрасывается в NVMe-тир (payload-CRC при
@@ -335,6 +366,7 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     }
 
     slot_size_ = max_slot;
+    ram_bytes_ = 0; // [R2] round 5: счётчик фактических байтов RAM-тира (сброс ResetPlan)
     states_.clear();
     for (auto& kv : ram_) free_ram_buffer(kv.second);
     ram_.clear();
@@ -451,6 +483,7 @@ std::shared_ptr<TierAwaiter> TierManager::pin_internal(const GroupKey& key) {
         if (st->prefetch_flag) {
             hits_.fetch_add(1); // prefetch попал: группа уже в VRAM к использованию
             st->prefetch_flag = false;
+            st->pf_hits++;      // [R2] round 5: per-group разрез (bench per-group)
         }
         st->pinned++;
         a->complete(); // группа уже resident: handle готов немедленно
@@ -458,6 +491,7 @@ std::shared_ptr<TierAwaiter> TierManager::pin_internal(const GroupKey& key) {
     }
     // Промах: группа не в VRAM — загрузка; pinned++ запрещает eviction слота.
     misses_.fetch_add(1);
+    st->pf_misses++; // [R2] round 5: per-group разрез (bench per-group)
     st->pinned++;
     if (!st->loading) {
         st->loading = true;
@@ -552,7 +586,10 @@ void TierManager::evict_ram_if_needed(std::size_t need) {
     // с RAM-копией вне текущей загрузки, которую можно снять безопасно:
     //  - resident в VRAM (копия в VRAM сохранна),
     //  - не resident и не закреплена (pinned == 0).
-    std::size_t used = ram_.size() * slot_size_;
+    // [R2] round 5: учёт занятой памяти — Σ slot_bytes ГРУПП (ram_bytes_;
+    // per-group layout — группы разных размеров, учёт по slot_size_ завышал
+    // бы занятую память в Σ(slot_size_)/Σ(slot_bytes групп) раз).
+    std::size_t used = ram_bytes_;
     if (used + need <= cfg_.ram_capacity) return;
     std::vector<std::pair<GroupId, std::uint64_t>> cand;
     for (const auto& kv : states_) {
@@ -569,17 +606,25 @@ void TierManager::evict_ram_if_needed(std::size_t need) {
         free_ram_buffer(it->second);
         ram_.erase(it);
         st.in_ram = false;
-        used -= slot_size_;
+        ram_bytes_ -= group_slot_bytes_locked(c.first);
+        used = ram_bytes_;
         if (used + need <= cfg_.ram_capacity) break;
     }
 }
 
 void TierManager::update_ram_tier(GroupId id, std::size_t need) {
+    // [R2] round 5: буфер RAM-тира группы — размера slot_bytes ГРУППЫ (не
+    // slot_size_ плана): per-group layout — ёмкости групп от КиБ до десятков
+    // МиБ; буферы max-размера под каждую группу раздували бы RAM-тир в
+    // Σ(slot_size_)/Σ(slot_bytes групп) раз и не давали плану влезть в
+    // ram_capacity. need == slot_bytes группы (проверка консервативна:
+    // уже-выделенный буфер корректного размера не перевызделяется).
     evict_ram_if_needed(need);
     std::uint8_t*& buf = ram_[id.value];
-    if (!buf)
-        buf = alloc_ram_buffer(slot_size_); // pinned при STELL_CUDA (cudaHostAlloc)
-    (void)need; // слот RAM-тира = размер VRAM-слота
+    if (!buf) {
+        buf = alloc_ram_buffer(need); // pinned при STELL_CUDA (cudaHostAlloc)
+        ram_bytes_ += need;
+    }
 }
 
 std::int32_t TierManager::acquire_slot(GroupId) {
@@ -629,6 +674,7 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
         std::vector<std::shared_ptr<TierAwaiter>> waiters;
         bool need_read = false;
         std::uint8_t* ram_buf = nullptr;
+        std::size_t gb = 0;       // [R2] round 5: slot_bytes ГРУППЫ (per-group layout)
         std::exception_ptr err;   // ошибка фаз A/B этой группы
     };
     std::vector<Entry> ents;
@@ -644,8 +690,13 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
         e.waiters = st->waiters;
         st->waiters.clear();
         e.need_read = !st->in_ram;
+        // Размер данных группы: per-group layout — slot_bytes КОНКРЕТНОЙ
+        // группы ([R2] round 5); unknown (план изменился) — консервативно
+        // max-слот (чтение всё равно упадёт честной ошибкой ниже).
+        e.gb = group_slot_bytes_locked(job.id);
+        if (e.gb == 0) e.gb = slot_size_;
         try {
-            if (e.need_read) update_ram_tier(job.id, slot_size_);
+            if (e.need_read) update_ram_tier(job.id, e.gb);
             auto it = ram_.find(job.id.value);
             e.ram_buf = it->second;
             if (!e.ram_buf)
@@ -692,7 +743,7 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
                         TierError::Code::IoFailure, out[j].err));
                 } else {
                     io_ops_.fetch_add(1);
-                    io_bytes_.fetch_add(slot_size_);
+                    io_bytes_.fetch_add(e.gb); // [R2]: байты ГРУППЫ (не max-слота)
                 }
             }
         }
@@ -750,7 +801,7 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
         {
             cudaStream_t s = static_cast<cudaStream_t>(dma_stream_);
             cudaError_t ce = cudaMemcpyAsync(vram_slots_[(size_t)slot], e.ram_buf,
-                                             slot_size_, cudaMemcpyHostToDevice, s);
+                                             e.gb, cudaMemcpyHostToDevice, s);
             if (ce != cudaSuccess) {
                 slot_err = std::make_exception_ptr(TierError(
                     TierError::Code::IoFailure,
@@ -765,7 +816,11 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
             }
         }
 #else
-        std::memcpy(vram_slots_[(size_t)slot], e.ram_buf, slot_size_);
+        // [R2] round 5: копируются slot_bytes ГРУППЫ — хвост max-слота за
+        // границей данных группы не читается и не пишется (O_DIRECT читает
+        // ровно slot_bytes группы; read_ram_slot/read_vram_slot копируют
+        // столько же — никакого «мусорного хвоста» в контракте).
+        std::memcpy(vram_slots_[(size_t)slot], e.ram_buf, e.gb);
 #endif
         if (slot_err) {
             std::vector<std::shared_ptr<TierAwaiter>> more;
@@ -792,7 +847,7 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
             st->in_ram = true;
             st->loading = false;
             io_ops_.fetch_add(1);
-            io_bytes_.fetch_add(slot_size_);
+            io_bytes_.fetch_add(e.gb); // [R2]: байты ГРУППЫ (не max-слота)
             auto ws = st->waiters;
             st->waiters.clear();
             all_waiters = e.waiters;
@@ -910,10 +965,14 @@ TierStats TierManager::stats() const {
     }
 
     std::lock_guard<std::mutex> lk(mu_);
+    // [R2] round 5: per-group учёт занятых байтов — Σ slot_bytes ГРУПП
+    // (per-group layout — группы разных размеров; uniform — прежняя
+    // арифметика resident × slot_size_, эквивалентна).
     std::uint64_t vram_bytes = 0;
     for (const auto& kv : states_)
-        if (kv.second.in_vram) vram_bytes += slot_size_;
-    std::uint64_t ram_bytes = ram_.size() * slot_size_;
+        if (kv.second.in_vram)
+            vram_bytes += group_slot_bytes_locked(GroupId{kv.first});
+    std::uint64_t ram_bytes = ram_bytes_;
     ts.tier_bytes[0] = vram_bytes;
     ts.tier_bytes[1] = ram_bytes;
     ts.tier_bytes[2] = nvme_ ? [&] {

@@ -127,6 +127,12 @@ struct GroupState {
     std::uint64_t use_count   = 0;
     std::uint64_t router_count = 0;
     std::uint64_t last_use    = 0;       // tick последнего обращения
+    // [R2] round 5: per-group счётчики prefetch (hit-rate по группам — bench
+    // per-group layout; агрегаты hits_/misses_ не дают разрез по группам).
+    // Инкремент — в pin_internal под mu_ (та же точка, что агрегаты);
+    // снапшот — group_prefetch_stats().
+    std::uint64_t pf_hits     = 0;
+    std::uint64_t pf_misses   = 0;
     std::vector<std::shared_ptr<TierAwaiter>> waiters; // ждущие pin-запросы
 };
 
@@ -148,8 +154,24 @@ public:
     void report_router_counts(const std::unordered_map<std::uint32_t, std::uint64_t>& counts);
     void record_layer_pause(double ms);
 
+    // [R2] round 5: снапшот per-group счётчиков prefetch (hits/misses на
+    // каждую группу плана; отсортирован по gid). Назначение — hit-rate ПО
+    // ГРУППАМ в bench per-group layout (пауза слоя = Σ пауз групп слоя;
+    // hit-rate по группам/ролям — агрегат hits_ не даёт этот разрез).
+    // Расширение на конкретной реализации — ITierManager (ADR-08 §2) НЕ
+    // расширяется; тот же прецедент, что crc_checks/read_ram_slot. Под mu_
+    // (снапшот — не горячий путь, для bench/дашборда/тестов).
+    struct GroupPrefetchStat {
+        GroupId      gid;
+        std::uint64_t hits;
+        std::uint64_t misses;
+    };
+    std::vector<GroupPrefetchStat> group_prefetch_stats() const;
+
     // Чтение содержимого слота группы из RAM-тира (расширение R8, раунд 2
-    // продолжение): копирует ровно slot_bytes байтов слота группы в dst.
+    // продолжение): копирует ровно slot_bytes ГРУППЫ байтов в dst ([R2] round 5:
+    // per-group layout — у групп РАЗНЫЕ размеры слотов; uniform — размер группы
+    // == slot_size плана, поведение прежнее).
     // Назначение — интеграционный тест «stell-tier layout (writer models) →
     // читатель tiers → слоты RAM/NVMe tiers → логиты, побитово == прямой
     // загрузке»: engine/core читает канонические байты слота (CRC слота
@@ -157,7 +179,7 @@ public:
     // Расширение на конкретной реализации — интерфейс ITierManager (ADR-08 §2)
     // НЕ расширяется; тот же прецедент, что set_layer_map (см. «Уточнение»
     // ADR-08). Ошибки:
-    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes;
+    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes группы;
     //   - IoFailure: RAM-копии нет — группа ещё не загружалась (pin → wait
     //     обязателен ДО чтения) либо RAM-копия вытеснена при VRAM-resident
     //     (evict_ram_if_needed снимает RAM-копию resident-группы — VRAM-копия
@@ -171,14 +193,15 @@ public:
     bool resident_in_vram(GroupId id) const;
 
     // [R5] round 4: чтение содержимого VRAM-СЛОТА группы (после pin→wait)
-    // в dst (dst_bytes ≥ slot_bytes). Назначение — побитовая сверка VRAM-
-    // слотов с эталоном прямого лоадера (TierLayoutReader): инвариант
-    // «одна группа = один слот» (класс aliasing-багов ba42267 не ловился
-    // тестами логитов). Расширение на конкретной реализации — интерфейс
+    // в dst (dst_bytes ≥ slot_bytes ГРУППЫ — [R2] round 5: per-group layout,
+    // у групп разные размеры слотов; uniform — прежнее поведение). Назначение
+    // — побитовая сверка VRAM-слотов с эталоном прямого лоадера
+    // (TierLayoutReader): инвариант «одна группа = один слот» (класс
+    // aliasing-багов ba42267 не ловился тестами логитов). Расширение на конкретной реализации — интерфейс
     // ITierManager (ADR-08 §2) НЕ расширяется; тот же прецедент, что
     // read_ram_slot/set_layer_map. Не горячий путь: копия под mu_
     // (защита от гонки с eviction); для верификации/тестов. Ошибки:
-    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes;
+    //   - PlanMismatch: группа вне плана; dst_bytes < slot_bytes группы;
     //   - IoFailure: группа не resident в VRAM (pin→wait обязателен до
     //     чтения). При STELL_CUDA — cudaMemcpy D2H из device-слота.
     void read_vram_slot(GroupId id, void* dst, std::size_t dst_bytes) const;
@@ -224,6 +247,9 @@ private:
     GroupState* find(GroupId id);                 // под mu_
     const GroupState* find(GroupId id) const;
     const TensorGroup* plan(GroupId id) const;    // под mu_
+    // [R2] round 5: размер слота КОНКРЕТНОЙ группы (per-group layout — у
+    // групп разные slot_bytes; uniform — == slot_size_). Под mu_; unknown → 0.
+    std::size_t group_slot_bytes_locked(GroupId id) const;
 
     void enqueue_load(GroupId id, const std::shared_ptr<TierAwaiter>& a);
     void worker_loop();
@@ -251,6 +277,12 @@ private:
     std::vector<std::int32_t> free_slots_;
     std::uint64_t tick_ = 0;
     GroupId last_accessed_{0};
+
+    // [R2] round 5: фактические байты RAM-тира (Σ slot_bytes ГРУПП буферов;
+    // per-group layout — группы разных размеров, учёт по slot_size_ завышал
+    // бы занятую память в Σmax раз). Под mu_; alloc/evict — единственные
+    // точки изменения. tier_bytes[1] = это значение (stats()).
+    std::size_t ram_bytes_ = 0;
 
     // NVMe-тир.
     std::unique_ptr<TierNvmeFile> nvme_;

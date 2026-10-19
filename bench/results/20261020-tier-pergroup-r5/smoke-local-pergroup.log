@@ -1,0 +1,37 @@
+# ЛОКАЛЬНЫЙ СМОУК (НЕ серверный замер): синтетический per-group layout
+# (8 групп, переменные слоты 4/8/12 КиБ, 3 слоя), локальный диск (ext4, RAM-disk-пометка ниже — носитель /tmp tmpfs).
+# Числа НЕ сравниваются с целями §5 — только плумбинг.
+
+носитель: /home/arkalaust/tiers_bench_smoke (ext4) — должен быть реальным NVMe
+co-tenancy: 0, NVIDIA GeForce RTX 5070 Ti, 1429 MiB, 14567 MiB
+=== [R2] round 5: PER-GROUP bench на реальном layout ===
+layout: /tmp/stell_tier_test_pergroup.stelltier (56K)
+ВНИМАНИЕ: layout на tmpfs (RAM-disk) — прогон помечается:
+  НОСИТЕЛЬ RAM-DISK — НЕ NVMe-замер (сравнение с NVMe-ячейками недопустимо)
+носитель: носитель RAM-disk (tmpfs) — НЕ NVMe-замер
+co-tenancy: 0, NVIDIA GeForce RTX 5070 Ti, 1429 MiB, 14567 MiB
+пометка: co-tenancy (NVMe/GPU общие; strata НЕ трогать)
+НЕ ВЕРДИКТ ПО ЦЕЛИ §4 (p95 ≤ 5 мс) — вердикт только по чистому окну
+сравнение замеров ТОЛЬКО внутри категории I/O (io_mode в логе ячейки);
+  cross-категорийное (O_DIRECT vs buffered) — в вердикты не идёт
+  ([Q8] round 5: cold = O_DIRECT штатно; warm = buffered + fadvise best-effort)
+--- ячейка pergroup: I/O=odirect k=4 (passes=3) ---
+pergroup layout: /tmp/stell_tier_test_pergroup.stelltier (8 групп, слоёв 3, max slot 12288 B, план 53248 B; vram_slots=3, ram_capacity=53248 B)
+bench io mode: odirect_requested=1 odirect_active=true k_in_flight=4 io_delay_ms=0
+pergroup hit-rate: overall=1.0000 expert=1.0000 (6/6) attn=1.0000 (12/12) kv=1.0000 (6/6)
+  bench-side pause p50=0.001 ms p95=0.001 ms p99=0.001 ms (Σ пауз групп слоя)
+bench_pause: backend=io_uring path=/tmp/stell_tier_test_pergroup.stelltier mode=pergroup groups=8 slot=12288(max) layers=3 passes=3 mode=prefetch
+    лог ячейки: /home/arkalaust/tiers_bench_smoke/pergroup_ioodirect_k4.log
+    io_mode: odirect — cold по протоколу [Q8]; buffered — тёплая категория
+      (fadvise best-effort, помечена); сравнение — только внутри категории
+--- ячейка pergroup: I/O=buffered k=4 (passes=3) ---
+pergroup layout: /tmp/stell_tier_test_pergroup.stelltier (8 групп, слоёв 3, max slot 12288 B, план 53248 B; vram_slots=3, ram_capacity=53248 B)
+bench io mode: odirect_requested=0 odirect_active=false k_in_flight=4 io_delay_ms=0
+pergroup hit-rate: overall=1.0000 expert=1.0000 (6/6) attn=1.0000 (12/12) kv=1.0000 (6/6)
+  bench-side pause p50=0.000 ms p95=0.001 ms p99=0.001 ms (Σ пауз групп слоя)
+bench_pause: backend=io_uring path=/tmp/stell_tier_test_pergroup.stelltier mode=pergroup groups=8 slot=12288(max) layers=3 passes=3 mode=prefetch
+    лог ячейки: /home/arkalaust/tiers_bench_smoke/pergroup_iobuffered_k4.log
+    io_mode: odirect — cold по протоколу [Q8]; buffered — тёплая категория
+      (fadvise best-effort, помечена); сравнение — только внутри категории
+=== конец per-group [R2] round 5 — логи → bench/results/20261020-tier-pergroup-r5/ ===
+    с co-tenancy-пометкой и пометкой «НЕ вердикт §4»
