@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -40,6 +41,22 @@ void free_ram_buffer(std::uint8_t* p) { if (p) cudaFreeHost(p); }
 std::uint8_t* alloc_ram_buffer(std::size_t n) { return new std::uint8_t[n]; }
 void free_ram_buffer(std::uint8_t* p) { delete[] p; }
 #endif
+
+// R1 (ADR-12 §2.3, round 3): env-флаг поверх конфига — итог = config || env.
+bool env_verify_crc() {
+    const char* v = std::getenv("STELL_TIER_VERIFY_CRC");
+    return v && std::strcmp(v, "1") == 0; // явное включение только "1"
+}
+
+// R7: чтение size-t параметра окружения; нечисловое/пустое → базовое значение.
+std::size_t env_size_or(const char* name, std::size_t dflt) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return dflt;
+    char* end = nullptr;
+    const unsigned long long x = std::strtoull(v, &end, 10);
+    if (end == v) return dflt;
+    return static_cast<std::size_t>(x);
+}
 } // namespace
 
 // --- TierAwaiter -------------------------------------------------------------
@@ -106,7 +123,8 @@ std::unique_ptr<Awaiter> TierAwaiter::all(
 
 // --- TierManager -------------------------------------------------------------
 TierManager::TierManager(TierConfig cfg)
-    : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead) {
+    : cfg_(cfg), policy_(cfg.policy), predictor_(cfg.history_cap), lookahead_(cfg.lookahead),
+      verify_crc_(cfg.verify_crc || env_verify_crc()) { // R1: config || env
     if (cfg_.vram_slots == 0 || cfg_.ram_capacity == 0)
         throw TierError(TierError::Code::PlanMismatch, "tiers: vram_slots/ram_capacity must be > 0");
 #if defined(STELL_CUDA)
@@ -234,7 +252,9 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     // NVMe-тир: открытие layout и сверка с планом (ADR-12 §2.2/§4).
     nvme_.reset();
     if (!cfg_.nvme_layout.empty()) {
-        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout);
+        // R1: флаг verify_crc_ пробрасывается в NVMe-тир (payload-CRC при
+        // pin/read — только при явном флаге; ADR-12 §2.3, round 3).
+        auto file = std::make_unique<TierNvmeFile>(cfg_.nvme_layout, verify_crc_);
         for (const auto& g : plan_) {
             const auto* e = file->find(g.id.value);
             if (!e)
@@ -321,6 +341,11 @@ void TierManager::internal_prefetch(GroupId id) {
     GroupState* st = find(id);
     if (!st) return;
     st->prefetch_flag = true; // идемпотентно: повторный prefetch не удваивает работу
+    // Bugfix (раунд 3): префетченная группа — «недавно использованная» для
+    // LRU/LCU (иначе last_use = 0 → она первая жертва следующей eviction:
+    // prefetch(l+1) второй загрузкой вытеснял первую, свежезагруженную,
+    // → гарантированные промахи prefetch при churn, срез 3 MoE > VRAM).
+    st->last_use = ++tick_;
     if (!st->in_vram && !st->loading) {
         st->loading = true;
         std::lock_guard<std::mutex> qk(qmu_);
@@ -505,10 +530,18 @@ std::int32_t TierManager::acquire_slot(GroupId) {
         throw TierError(TierError::Code::SlotExhausted,
                         "vram: no free slots and nothing evictable (all pinned)");
     const GroupId victim = choose_victim(cand, policy_);
-    release_slot(states_[victim.value].slot);
+    // Bugfix (раунд 3): слот жертвы нужно ЗАБРАТЬ себе — release_slot клалит
+    // его в free_slots_, но возвращаемый слот обязан быть извлечён (pop_back).
+    // Раньше free_slots_.back() возвращался без pop → слот оставался в списке
+    // свободных → следующий acquire_slot выдавал ТОТ ЖЕ слот другой группе →
+    // двукратная броня одного слота (aliasing данных VRAM, resident > slots;
+    // проявлялось при любом churn — сценарий MoE > VRAM, срез 3).
+    const std::int32_t victim_slot = states_[victim.value].slot;
+    release_slot(victim_slot);
     states_[victim.value].in_vram = false;
     states_[victim.value].slot = -1;
-    return free_slots_.back();
+    free_slots_.pop_back(); // забираем слот жертвы под загружаемую группу
+    return victim_slot;
 }
 
 void TierManager::release_slot(std::int32_t slot) {
@@ -627,6 +660,70 @@ void TierManager::process_job(const Job& job) {
         waiters.insert(waiters.end(), ws.begin(), ws.end());
     }
     for (auto& a : waiters) a->complete();
+}
+
+// --- расширения R1/R7 (раунд 3) ----------------------------------------------
+
+// R1: публичный verify-проход слотов NVMe-тира (ADR-12 §2.3, round 3).
+std::size_t TierManager::verify_slots() {
+    TierNvmeFile* f = nvme_.get();
+    if (!f)
+        throw TierError(TierError::Code::PlanMismatch,
+                        "verify_slots: NVMe-тир не настроен (set_plan с nvme_layout)");
+    std::size_t n = 0;
+    // Дисциплина «холодной» операции (как set_plan, ADR-08 §4): вызывающий
+    // не должен иметь параллельных pin/prefetch — состояние verified_ NVMe-
+    // файла не синхронизировано с горячим путём.
+    for (const auto& e : f->index()) {
+        f->verify_group(e.group_id);
+        ++n;
+    }
+    return n;
+}
+
+// R1: метрика пересчётов payload-CRC (0 при verify=off и без verify-прохода).
+std::uint64_t TierManager::crc_checks() const {
+    const TierNvmeFile* f = nvme_.get();
+    return f ? f->crc_checks() : 0;
+}
+
+// --- R7: конфигурируемые границы тиров ---------------------------------------
+TierConfig tier_config_from_env(TierConfig base) {
+    base.vram_slots     = env_size_or("STELL_TIER_VRAM_SLOTS", base.vram_slots);
+    base.vram_slot_size = env_size_or("STELL_TIER_VRAM_SLOT_BYTES", base.vram_slot_size);
+    base.lookahead      = env_size_or("STELL_TIER_LOOKAHEAD", base.lookahead);
+    base.history_cap    = env_size_or("STELL_TIER_HISTORY_CAP", base.history_cap);
+    if (const std::size_t mb = env_size_or("STELL_TIER_RAM_MB", 0))
+        base.ram_capacity = mb << 20;
+    if (const char* v = std::getenv("STELL_TIER_VERIFY_CRC"))
+        base.verify_crc = std::strcmp(v, "1") == 0; // "1" → on, что-либо другое → off
+    if (const char* v = std::getenv("STELL_TIER_POLICY")) {
+        if (std::strcmp(v, "lcu") == 0)      base.policy = EvictionPolicy::Lcu;
+        else if (std::strcmp(v, "lru") == 0) base.policy = EvictionPolicy::Lru;
+        // неизвестное значение → базовая политика (консервативно, без throw —
+        // env — средство настройки, а не контракт; фиксация в докстринге).
+    }
+    if (const char* v = std::getenv("STELL_TIER_NVME_LAYOUT"))
+        base.nvme_layout = v;
+    return base;
+}
+
+TierConfig tier_config_co_tenancy(std::size_t vram_budget_bytes,
+                                  std::size_t plan_bytes,
+                                  std::size_t slot_bytes) {
+    if (slot_bytes == 0 || slot_bytes % kTierSlotAlign != 0)
+        throw TierError(TierError::Code::PlanMismatch,
+                        "co-tenancy: slot_bytes must be a positive multiple of 4096 (ADR-12 §2.4)");
+    TierConfig cfg; // дефолты: Lru, lookahead 2
+    cfg.vram_slot_size = slot_bytes;
+    // VRAM-тир МАЛ: слоты по бюджету; минимум 1 слот; больше плана не выделяем
+    // (при co-tenancy VRAM-тир меньше плана — вытеснение/churn штатны).
+    cfg.vram_slots = std::max<std::size_t>(
+        1, std::min(vram_budget_bytes / slot_bytes, plan_bytes / slot_bytes));
+    // RAM-тир ОСНОВНОЙ: вмещает план целиком (pinned; host RAM сервера —
+    // сотни ГБ, допущение зафиксировано в докстринге tier_manager.hpp).
+    cfg.ram_capacity = plan_bytes;
+    return cfg;
 }
 
 // --- stats -------------------------------------------------------------------

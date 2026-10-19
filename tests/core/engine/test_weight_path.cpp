@@ -130,7 +130,10 @@ void run() {
 
     // --- TierManager: слоты VRAM/RAM над NVMe-тиром (физический tmp-файл) ---
     stell::tiers::TierConfig tc{};
-    tc.vram_slots = 16;                // ≥ числа групп слоя (pin всех групп слоя)
+    // Bugfix раунда 3 (корректный учёт VRAM-слотов): слотов ≥ всех групп
+    // плана (21) — см. ту же пометку в test_tier_integration.cpp: прежде
+    // 16 слотов проходили только из-за aliasing-бага acquire_slot.
+    tc.vram_slots = 32;                // ≥ всех групп плана (интеграция, не churn)
     tc.ram_capacity = 2048;            // тесный RAM-тир → потоки NVMe→RAM→VRAM
     tc.nvme_layout = kTierPath;
     tc.lookahead = 2;
