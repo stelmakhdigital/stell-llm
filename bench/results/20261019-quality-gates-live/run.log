@@ -1,2 +1,2 @@
-quality-gates LIVE: модели=['mini_dense', 'mini_moe'], источник логитов=['источник логитов=golden-ref:generate_golden.interpret (mini_dense, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)', 'источник логитов=golden-ref:generate_golden.interpret (mini_moe, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)']
+quality-gates LIVE: модели=['mini_dense', 'mini_moe'], источник логитов=['источник логитов=abi:stell_logits']
 HumanEval — честный pending (проверка корректности требует исполнения сгенерированного кода; песочницы в раунде нет)

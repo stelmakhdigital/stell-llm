@@ -10,7 +10,7 @@
       "items": 127,
       "notes": [
         "модель=mini_dense",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_dense, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "токенов=128 (первые 128 фиксированного текста, проекция байта → токен b % vocab — vocab mini-фикстуры=16; это механический базовый референс, а не языковая PPL)",
         "mean_nll=2.911957"
       ]
@@ -24,7 +24,7 @@
       "items": 32,
       "notes": [
         "модель=mini_dense",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_dense, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "верно=2/32",
         "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
         "механический базовый референс пайплайна: mini-фикстуры не являются языковыми моделями — значение фиксируется как точка регрессии, а не оценка качества LLM"
@@ -39,7 +39,7 @@
       "items": 32,
       "notes": [
         "модель=mini_dense",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_dense, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "генерация через логиты возможна (жадное декодирование), но проверка корректности HumanEval = ИСПОЛНЕНИЕ сгенерированного кода против unit-тестов — исполнения кода в runner нет (песочница/изоляция не входят в раунд); честный pending"
       ]
     },
@@ -52,7 +52,7 @@
       "items": 127,
       "notes": [
         "модель=mini_moe",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_moe, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "токенов=128 (первые 128 фиксированного текста, проекция байта → токен b % vocab — vocab mini-фикстуры=16; это механический базовый референс, а не языковая PPL)",
         "mean_nll=3.404053"
       ]
@@ -66,7 +66,7 @@
       "items": 32,
       "notes": [
         "модель=mini_moe",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_moe, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "верно=0/32",
         "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
         "механический базовый референс пайплайна: mini-фикстуры не являются языковыми моделями — значение фиксируется как точка регрессии, а не оценка качества LLM"
@@ -81,7 +81,7 @@
       "items": 32,
       "notes": [
         "модель=mini_moe",
-        "источник логитов=golden-ref:generate_golden.interpret (mini_moe, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
+        "источник логитов=abi:stell_logits",
         "генерация через логиты возможна (жадное декодирование), но проверка корректности HumanEval = ИСПОЛНЕНИЕ сгенерированного кода против unit-тестов — исполнения кода в runner нет (песочница/изоляция не входят в раунд); честный pending"
       ]
     }
@@ -92,8 +92,7 @@
     "mini_moe"
   ],
   "logits_source": [
-    "источник логитов=golden-ref:generate_golden.interpret (mini_dense, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)",
-    "источник логитов=golden-ref:generate_golden.interpret (mini_moe, fallback до merge core [R1]; референс сверен с HF ~1.5e-7)"
+    "источник логитов=abi:stell_logits"
   ],
   "protocol": {
     "ppl_max_tokens": 128,
