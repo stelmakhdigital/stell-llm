@@ -327,6 +327,76 @@ std::vector<SynthTensor> moe_shared_gate_hf_tensors() {
     return ts;
 }
 
+// [R6-добор] Qwen3Moe-класс (зонд реального Qwen/Qwen3-30B-A3B):
+// роутер — mlp.gate.weight (НЕ mlp.router.weight), эксперты — поэертельные
+// mlp.experts.{e}.{gate,up,down}_proj.weight, dense-слоёв НЕТ, shared-expert
+// НЕТ, lm_head есть (tie_word_embeddings=false). d_model=8, n_heads=2,
+// d_head=4, n_kv_heads=1, vocab=16, layers=2, n_experts=4, topk=2, d_ff=8.
+std::vector<SynthTensor> qwen3_moe_hf_tensors() {
+    auto ts = moe_hf_tensors();
+    for (auto& t : ts)
+        if (t.name.find(".mlp.router.weight") != std::string::npos) {
+            const std::size_t pos = t.name.find(".mlp.router.weight");
+            t.name = t.name.substr(0, pos) + ".mlp.gate.weight";
+        }
+    // lm_head — как в реальном чекпоинте (tie_word_embeddings=false).
+    ts.push_back(tensor("lm_head.weight", "F16", {16, 8}, f16_det(16 * 8, 1000)));
+    return ts;
+}
+
+// [R6-добор] Та же фикстура + qk-norm тензоры (форма [d_head]=[4], каждый
+// слой — как в реальном чекпоинте) — архитектурная особенность вне покрытых
+// op'ов → честный SchemaMismatch.
+std::vector<SynthTensor> qwen3_moe_qknorm_hf_tensors() {
+    auto ts = qwen3_moe_hf_tensors();
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string p = "model.layers." + std::to_string(layer) + ".";
+        ts.push_back(tensor(p + "self_attn.q_norm.weight", "F16", {4},
+                            f16_det(4, layer * 5 + 71)));
+        ts.push_back(tensor(p + "self_attn.k_norm.weight", "F16", {4},
+                            f16_det(4, layer * 5 + 73)));
+    }
+    return ts;
+}
+
+// [R6-добор] config Qwen3Moe-класса: ключи — по факту зонда реального
+// config.json (moe_intermediate_size, num_experts_per_tok, norm_topk_prob,
+// head_dim; intermediate_size — dense-fallback, в однородном MoE не читается;
+// decoder_sparse_step=1 + mlp_only_layers=[] — все слои MoE). Параметры —
+// для error-кейсов (norm_topk=false; moe_ff != факту шардов).
+void write_config_qwen3(const std::string& dir, bool norm_topk = true,
+                        int moe_ff = 8) {
+    std::filesystem::create_directories(dir);
+    std::string cfg = std::string(
+        "{\n"
+        "  \"architectures\": [\"Qwen3MoeForCausalLM\"],\n"
+        "  \"hidden_size\": 8,\n"
+        "  \"num_hidden_layers\": 2,\n"
+        "  \"num_attention_heads\": 2,\n"
+        "  \"num_key_value_heads\": 1,\n"
+        "  \"head_dim\": 4,\n"
+        "  \"vocab_size\": 16,\n"
+        "  \"rms_norm_eps\": 1e-06,\n"
+        "  \"rope_theta\": 10000.0,\n"
+        "  \"intermediate_size\": 16,\n"
+        "  \"moe_intermediate_size\": ") +
+        std::to_string(moe_ff) +
+        std::string(",\n"
+        "  \"num_experts\": 4,\n"
+        "  \"num_experts_per_tok\": 2,\n"
+        "  \"norm_topk_prob\": ") +
+        (norm_topk ? "true" : "false") +
+        std::string(",\n"
+        "  \"decoder_sparse_step\": 1,\n"
+        "  \"mlp_only_layers\": [],\n"
+        "  \"tie_word_embeddings\": false\n"
+        "}\n");
+    std::FILE* f = std::fopen((dir + "/config.json").c_str(), "wb");
+    if (!f) throw std::runtime_error("config.json");
+    std::fwrite(cfg.data(), 1, cfg.size(), f);
+    std::fclose(f);
+}
+
 // Шарды: тензоры делятся на два файла (канонический порядок HF — сортировка
 // имён внутри merge_safetensors_shards; разбиение здесь — по списку).
 void write_shards(const std::string& dir, const std::vector<SynthTensor>& ts) {
@@ -1146,6 +1216,124 @@ void body() {
         }
     }
 
+    // =========================================================================
+    // 8c. [R6-добор] Qwen3MoeForCausalLM (зонд реального чекпоинта
+    //     Qwen/Qwen3-30B-A3B-Instruct-2507): роутер mlp.gate.weight,
+    //     поэертельные эксперты, однородный MoE БЕЗ shared-expert (легитимно),
+    //     lm_head; config-маппинг moe_intermediate_size/num_experts_per_tok/
+    //     norm_topk_prob; qk-norm — честный SchemaMismatch; roundtrip побитово.
+    // =========================================================================
+    const std::string q3_dir = out_dir("/tmp/stell_hf_qwen3moe");
+    {
+        const auto ts = qwen3_moe_hf_tensors();
+        write_config_qwen3(q3_dir);
+        write_shards(q3_dir, ts);
+        const std::string json = hf_to_description(q3_dir, "NVFP4");
+        const JsonValue root = json_parse(json);
+        CHECK(root.get_string("class") == "moe");
+        CHECK(root.get_string("name") == "stell_hf_qwen3moe");
+        CHECK(root.get_string("dtype_weights") == "NVFP4");
+        const JsonValue& moe = root.get_object("moe");
+        CHECK(moe.get_uint("n_experts") == 4);
+        CHECK(moe.get_uint("n_experts_active") == 2);
+        CHECK(moe.get_uint("expert_d_ff") == 8);
+        // ops однородного MoE: rmsnorm + attention + moe_gather_scatter (БЕЗ ffn).
+        const std::vector<JsonValue>& ops = root.get_array("ops").array_v;
+        CHECK(ops.size() == 3);
+        CHECK(ops[2].get_string("op") == "moe_gather_scatter");
+        CHECK(json.find("\"ffn\"") == std::string::npos);
+
+        const ModelDescription d = parse_model_description(json, "hf-qwen3moe");
+        // Группы: embed + norm_final + head + 2 kv + 2 нормы + 4 attn-матрицы +
+        // router + 4×3 эксперта = 24 (ffn.shared НЕТ — однородный MoE).
+        CHECK(d.groups.size() == 43);
+        const int router0 = find_group(d, "l000.mlp.router");
+        CHECK((router0 >= 0) &&
+              d.group_source_patterns[router0] ==
+                  "model.layers.0.mlp.gate.weight");  // зонд: роутер mlp.gate
+        CHECK(d.groups[router0].dtype == stell::tiers::DType::F32);
+        const int gate00 = find_group(d, "l000.e000.gate");
+        CHECK((gate00 >= 0) &&
+              d.group_source_patterns[gate00] ==
+                  "model.layers.0.mlp.experts.0.gate_proj.weight");
+        CHECK(d.groups[gate00].dtype == stell::tiers::DType::NVFP4);
+        const int down11 = find_group(d, "l001.e003.down");
+        CHECK((down11 >= 0) &&
+              d.group_source_patterns[down11] ==
+                  "model.layers.1.mlp.experts.3.down_proj.weight");
+        const int head = find_group(d, "head");
+        CHECK((head >= 0) &&
+              d.group_source_patterns[head] == "lm_head.weight");
+        for (std::size_t i = 0; i < d.groups.size(); ++i)
+            CHECK_MSG(d.group_source_patterns[i].find(".mlp.shared_expert") ==
+                          std::string::npos,
+                      "однородный MoE без shared-expert: группа ffn.shared не создана");
+
+        const std::string single =
+            write_single("/tmp/stell_hf_qwen3moe_single.safetensors", ts);
+        roundtrip_logits(d, q3_dir, single, "/tmp/stell_hf_qwen3moe_out",
+                         se::PlainWeightsNVFP4W4A16);
+        std::printf("moe (Qwen3MoeForCausalLM, NVFP4): roundtrip логитов OK (побитно)\n");
+    }
+    // (а) qk-norm тензоры (как в реальном чекпоинте) → честный SchemaMismatch
+    //     с точной причиной (не покрыт op'ами схемы).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_qknorm");
+        write_config_qwen3(dir);
+        write_shards(dir, qwen3_moe_qknorm_hf_tensors());
+        try {
+            hf_to_description(dir, "F16");
+            CHECK_MSG(false && "expected LoaderError", "qk-norm → SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "qk-norm: код ошибки != SchemaMismatch");
+            const std::string msg = e.what();
+            CHECK_MSG(msg.find("self_attn.q_norm.weight") != std::string::npos ||
+                          msg.find("self_attn.k_norm.weight") != std::string::npos,
+                      "qk-norm: сообщение называет тензор");
+            CHECK_MSG(msg.find("op attention") != std::string::npos,
+                      "qk-norm: сообщение называет причину (op attention)");
+        }
+    }
+    // (б) norm_topk_prob=false → честный SchemaMismatch (router-семантика
+    //     без нормализации topk не покрыта).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_notopk");
+        write_config_qwen3(dir, /*norm_topk=*/false);
+        write_shards(dir, qwen3_moe_hf_tensors());
+        try {
+            hf_to_description(dir, "F16");
+            CHECK_MSG(false && "expected LoaderError",
+                      "norm_topk_prob=false → SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "norm_topk_prob=false: код != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("norm_topk_prob") !=
+                          std::string::npos,
+                      "norm_topk_prob=false: сообщение называет ключ");
+        }
+    }
+    // (в) moe_intermediate_size != факту шардов → честный SchemaMismatch
+    //     (перекрёстная сверка config ↔ тензоры).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_moef");
+        write_config_qwen3(dir, /*norm_topk=*/true, /*moe_ff=*/16);
+        write_shards(dir, qwen3_moe_hf_tensors());
+        try {
+            hf_to_description(dir, "F16");
+            CHECK_MSG(false && "expected LoaderError",
+                      "moe_intermediate_size != d_ff → SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "moe_intermediate_size: код != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("moe_intermediate_size") !=
+                          std::string::npos,
+                      "moe_intermediate_size: сообщение называет ключ");
+        }
+    }
+
+    // =========================================================================
+    // 9. Error-кейсы.
     // =========================================================================
     // 9. Error-кейсы.
     // =========================================================================

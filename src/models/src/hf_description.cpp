@@ -60,6 +60,24 @@
 //     (роутер), block_sparse_moe.w1/w3 ([n_experts, d_ff, d_model] — gate/up)
 //     и w2 ([n_experts, d_model, d_ff] — down); срезы экспертов —
 //     source_slice = "{expert}" (канон R9/ADR-09 round 2).
+//   - [R6-добор] round 6: Qwen3MoeForCausalLM — MoE-класс per-expert
+//     (Qwen2Moe-семейство): роутер — mlp.gate.weight (зонд реального
+//     чекпоинта Qwen/Qwen3-30B-A3B-Instruct-2507: 128 экспертов, topk 8,
+//     norm_topk_prob=true, mlp_intermediate_size=768, ВСЕ слои MoE —
+//     dense-слоёв НЕТ, shared-expert тензоров НЕТ — однородный MoE).
+//     Классификация слоёв — по факту шардов (per-layer инфраструктура
+//     round 5 [R3] переиспользуется); d_ff routed-экспертов — из тензора
+//     первого MoE-слоя, при наличии config-ключа moe_intermediate_size —
+//     перекрёстная сверка (несогласованность — честный SchemaMismatch);
+//     norm_topk_prob=false — честный SchemaMismatch (схема фиксирует
+//     router "softmax-topk" с нормализацией вероятностей topk).
+//     ОСОБЕННОСТЬ ВНЕ покрытых op'ов: per-head RMSNorm q/k — тензоры
+//     self_attn.{q,k}_norm.weight (форма [d_head], каждый слой, зонд
+//     подтверждён) — op attention исполняет проекции q/k БЕЗ qk-нормализации,
+//     op rmsnorm нормирует только hidden → честный SchemaMismatch с точной
+//     причиной (НЕ фальшивая поддержка: неизвестные группы ops_runner
+//     не потребляет — план исполнялся бы с неверными логитами; расширение
+//     схемы + семантика — поток core, стыковая точка).
 //
 // Dtype групп (канон ADR-09 block32, [R4] «смешанный план»): dtype_weights —
 // аргумент profile ("F16" по умолчанию; "NVFP4"/"W4A16" — квантование
@@ -281,7 +299,8 @@ std::string hf_to_description(const std::string& hf_dir,
     const bool dense = (arch == "LlamaForCausalLM" || arch == "Qwen2ForCausalLM");
     const bool moe_per_expert = (arch == "Qwen2MoeForCausalLM" ||
                                  arch == "Qwen1.5MoeForCausalLM" ||
-                                 arch == "OlmoeForCausalLM");
+                                 arch == "OlmoeForCausalLM" ||
+                                 arch == "Qwen3MoeForCausalLM");
     const bool moe_stacked = (arch == "MixtralForCausalLM");
     if (!dense && !moe_per_expert && !moe_stacked)
         throw LoaderError(LoaderError::Code::SchemaMismatch,
@@ -289,7 +308,48 @@ std::string hf_to_description(const std::string& hf_dir,
                               "' не поддержана (subset: LlamaForCausalLM, "
                               "Qwen2ForCausalLM, Qwen2MoeForCausalLM, "
                               "Qwen1.5MoeForCausalLM, OlmoeForCausalLM, "
-                              "MixtralForCausalLM)");
+                              "MixtralForCausalLM, Qwen3MoeForCausalLM)");
+
+    // [R6-добор] per-head RMSNorm q/k (Qwen3-класс: тензоры
+    // self_attn.{q,k}_norm.weight, форма [d_head], каждый слой — зонд реального
+    // Qwen3-30B-A3B). Архитектурная особенность ВНЕ покрытых op'ов: op
+    // attention исполняет проекции q/k без qk-нормализации, op rmsnorm
+    // нормирует только hidden. Честный SchemaMismatch с точной причиной —
+    // НЕ фальшивая поддержка (группы без семантики в ops_runner не
+    // потребляются — план исполнялся бы с неверными логитами; расширение
+    // схемы + семантика — поток core, стыковая точка). Проверка — для ВСЕХ
+    // архитектур (ни одна поддержанная не несёт qk-norm; фикстура — по
+    // факту шардов, не по имени архитектуры).
+    for (std::int64_t i = 0; i < static_cast<std::int64_t>(n_layers); ++i) {
+        const std::string li = "model.layers." + std::to_string(i) + ".";
+        for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+            if (find_tensor(li + nm))
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: слой " + std::to_string(i) + ": тензор '" +
+                                      li + nm + "' (per-head RMSNorm q/k, Qwen3-класс) — "
+                                      "архитектурная особенность вне покрытых op'ов схемы: "
+                                      "op attention исполняет проекции q/k БЕЗ qk-нормализации, "
+                                      "op rmsnorm нормирует только hidden — честный отказ "
+                                      "(описание с этими группами исполнялось бы с неверными "
+                                      "логитами; расширение схемы + семантика — ops_runner, "
+                                      "поток core)");
+        }
+    }
+
+    // [R6-добор] Честная router-семантика MoE: схема фиксирует
+    // "router":"softmax-topk" с нормализацией вероятностей topk
+    // (Qwen2Moe/Qwen3Moe/Mixtral — norm_topk_prob=true). Явный false в
+    // config — непокрытая конфигурация (семантика маршрутизации другая);
+    // отсутствие ключа — прежнее поведение (старые фикстуры/чекпоинты).
+    if (moe_per_expert || moe_stacked) {
+        if (const JsonValue* v = cfg.find("norm_topk_prob");
+            v && v->type == JsonValue::Type::Bool && !v->bool_v)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "hf: config.json: norm_topk_prob=false — router без "
+                              "нормализации вероятностей topk не покрыт (схема "
+                              "фиксирует router 'softmax-topk' с нормализацией: "
+                              "Qwen2Moe/Qwen3Moe/Mixtral); непокрытая конфигурация");
+    }
 
     const std::int64_t dm = static_cast<std::int64_t>(d_model);
     const std::int64_t dqq = static_cast<std::int64_t>(n_heads * d_head);
@@ -487,6 +547,17 @@ std::string hf_to_description(const std::string& hf_dir,
         if (dff <= 0)
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "hf: expert_d_ff обязана быть > 0");
+        // [R6-добор] Qwen3Moe: config-ключ moe_intermediate_size (если есть)
+        // обязана согласоваться с фактом шардов (d_ff — из тензора первого
+        // MoE-слоя); несогласованность — честный SchemaMismatch (НЕ догадка).
+        if (const JsonValue* v = cfg.find("moe_intermediate_size");
+            v && v->type == JsonValue::Type::Int &&
+            static_cast<std::int64_t>(v->int_v) != dff)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "hf: config.json: moe_intermediate_size=" +
+                                  std::to_string(v->int_v) +
+                                  " != факту шардов (d_ff routed-экспертов = " +
+                                  fmt_int(dff) + ") — непокрытая конфигурация");
         for (std::int64_t i = 0; i < L; ++i) {
             if (!moe_layer[static_cast<std::size_t>(i)]) continue;
             check_shape("model.layers." + std::to_string(i) + ".mlp.experts.0.gate" +
