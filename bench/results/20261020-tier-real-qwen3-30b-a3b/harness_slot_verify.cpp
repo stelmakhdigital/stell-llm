@@ -86,10 +86,12 @@ int main(int argc, char** argv) {
             subset_bytes += e.slot_bytes;
         }
     }
+    std::uint64_t plan_bytes = 0;
+    for (const auto& e : rdr.index()) plan_bytes += e.slot_bytes;
     std::printf("layout: %u групп, план %llu байт; контрольных групп %zu "
                 "(%llu байт)\n",
                 (unsigned)rdr.header().n_groups,
-                (unsigned long long)rdr.header().data_offset, subset.size(),
+                (unsigned long long)plan_bytes, subset.size(),
                 (unsigned long long)subset_bytes);
 
     // --- база: независимое чтение слотов (raw-читатель, payload-CRC) --------
