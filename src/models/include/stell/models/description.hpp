@@ -41,6 +41,14 @@ struct MoeSpec {
     std::uint32_t n_experts_active = 0;
     std::uint32_t expert_d_ff = 0;
     std::string router;
+    // [R2] round 7 (ADR-09 round 7): перенос нормализации вероятностей topk
+    // роутера. true (дефолт; поле в JSON отсутствует) — семантика round 1,
+    // канонизированная golden'ом ("softmax-topk" с перенормировкой);
+    // false — topk-веса используются без перенормировки (config-семантика
+    // norm_topk_prob=false, Qwen3Moe-класс). Флаг читается ops_runner
+    // (мост model_spec_bridge, поток core); старые описания без поля —
+    // прежнее поведение (побитовые golden не меняются).
+    bool router_renorm = true;
 };
 
 struct OpSpec {
