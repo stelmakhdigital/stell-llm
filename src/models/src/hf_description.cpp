@@ -522,7 +522,7 @@ std::string hf_to_description(const std::string& hf_dir,
             {".self_attn.q_proj.weight", "l{layer}.attn.wq", false, dqq, dm},
             {".self_attn.k_proj.weight", "l{layer}.attn.wk", false, dkv, dm},
             {".self_attn.v_proj.weight", "l{layer}.attn.wv", false, dkv, dm},
-            {".self_attn.o_proj.weight", "l{layer}.attn.wo", false, dm, dm},
+            {".self_attn.o_proj.weight", "l{layer}.attn.wo", false, dm, dqq},
             {".mlp.gate_proj.weight",    "l{layer}.ffn.gate", false, dff, dm},
             {".mlp.up_proj.weight",      "l{layer}.ffn.up", false, dff, dm},
             {".mlp.down_proj.weight",    "l{layer}.ffn.down", false, dm, dff},
@@ -743,7 +743,7 @@ std::string hf_to_description(const std::string& hf_dir,
             {".self_attn.q_proj.weight", "l{layer}.attn.wq", dqq, dm},
             {".self_attn.k_proj.weight", "l{layer}.attn.wk", dkv, dm},
             {".self_attn.v_proj.weight", "l{layer}.attn.wv", dkv, dm},
-            {".self_attn.o_proj.weight", "l{layer}.attn.wo", dm, dm},
+            {".self_attn.o_proj.weight", "l{layer}.attn.wo", dm, dqq},
         };
         for (const auto& m : mats) {
             const TensorInfo& t = require_tensor(l0 + m.suffix, "hf");
@@ -976,7 +976,7 @@ std::string hf_to_description(const std::string& hf_dir,
             {".self_attn.q_proj.weight", "l{layer}.attn.wq", dqq, dm},
             {".self_attn.k_proj.weight", "l{layer}.attn.wk", dkv, dm},
             {".self_attn.v_proj.weight", "l{layer}.attn.wv", dkv, dm},
-            {".self_attn.o_proj.weight", "l{layer}.attn.wo", dm, dm},
+            {".self_attn.o_proj.weight", "l{layer}.attn.wo", dm, dqq},
         };
         for (const auto& m : mats) {
             const TensorInfo& t = require_tensor(l0 + m.suffix, "hf");

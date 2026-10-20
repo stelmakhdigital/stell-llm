@@ -484,14 +484,11 @@ void OpsInterpreter::op_attention(std::size_t layer, std::vector<float>& hidden,
                                          spec_.n_heads, spec_.n_kv_heads, T, spec_.d_head,
                                          attn_out.data());
 
-    // Головы → плоский вектор [d_model] (fixture: n_heads*d_head == d_model),
-    // проекция wo, residual.
-    std::vector<float> joined(d_model, 0.0f);
-    for (std::uint32_t h = 0; h < spec_.n_heads; ++h)
-        for (std::uint32_t d = 0; d < spec_.d_head; ++d)
-            joined[static_cast<std::size_t>(h) * spec_.d_head + d] =
-                attn_out[static_cast<std::size_t>(h) * spec_.d_head + d];
-    std::vector<float> proj = matvec(*wo, joined);
+    // Проекция wo: [d_model, n_heads*d_head] (реальные чекпоинты Qwen3-класса:
+    // head_dim фиксирован, n_heads*d_head != d_model; для прежних arch
+    // n_heads*d_head == d_model — attn_out и есть "joined" головы в плоском
+    // виде, прежняя копия была тождественной: арифметика побитово та же).
+    std::vector<float> proj = matvec(*wo, attn_out);
     for (std::size_t i = 0; i < d_model; ++i) hidden[i] += proj[i];
 
     // Запись k/v токена в token-major кеш (позиция — st.pos, общий счёт
