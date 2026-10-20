@@ -1,0 +1,16 @@
+{
+  "wrapper": "src/bench/stell_bench/run_real_gates.sh",
+  "model_dir": "/home/arkalaust/models/tiny-qwen2moe",
+  "engine_lib": null,
+  "git_commit": "ce87622",
+  "hostname": "arkalaust-AI",
+  "date_utc": "2026-10-20T06:29:40+00:00",
+  "co_tenancy": true,
+  "timeout_s": 4800,
+  "exit_code": 0,
+  "killed_by_timeout": false,
+  "wall_seconds": 129.019,
+  "wall_phase": null,
+  "wall_before_seconds": null,
+  "results_dir": "bench/results/20261020-quality-gates-real-r7-v3-nvfp4"
+}

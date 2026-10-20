@@ -1,0 +1,188 @@
+{
+  "artifact": "20261020-tier-real-qwen3-30b-a3b",
+  "task": "[R3] round 8 — конвейер на реальных весах Qwen3-30B-A3B: описание -> streaming layout -> per-group bench матрица {O_DIRECT, buffered} x {k=1, k=4} + побитовая сверка слотов при eviction-чередовании",
+  "verdict_s4": "НЕ ВЕРДИКТ ПО ЦЕЛИ §4 (p95 ≤ 5 мс) — co-tenancy, CPU-контур; точка регрессии и прецедент round 5/6. Вердикт возможен только в чистом окне по критерию server-env §4 (а)-(г)",
+  "verdict_s4_criteria": {
+    "a_модель_больше_VRAM": true,
+    "a_hit_rate_меньше_1_в_харнессе": "prefetch-режим: 1.0000 (СТРУКТУРНАЯ: bench материализует слой до пауз, детерминизм round 5); cold-режим: 0.0000; работа тира подтверждается eviction-churn: 16.0 ГиБ NVMe-чтений за проход при vram_resident 316 МиБ",
+    "b_окно": "co-tenancy (см. co_tenancy_profile)",
+    "c_per_group_семантика": true,
+    "d_матрица_io_x_k": true
+  },
+  "pending": {
+    "полный_проход_сверки_слотов": "выполнено контрольное подмножество 43 групп (1.21 ГиБ) из 18867 — полный проход всех 16 ГиБ групп при eviction-чередовании слишком долог для окна; помечено честно",
+    "VRAM-бюджет_6ГБ": "профиль bench (vram_slots=393, «VRAM вмещает слой») даёт фактические resident-байты ~316 МиБ — НИЖЕ бюджета co-tenancy ~6 ГБ; слоты < 393 невозможны (pin всего слоя), профиль {vram_slots=9 x 594МиБ} — TierError SlotExhausted (логи failed_9slots_*)"
+  },
+  "provenance": {
+    "hostname": "arkalaust-AI",
+    "date_utc": "2026-10-20T05:50-06:15+00:00",
+    "git_commit": "ce87622",
+    "co_tenancy": true,
+    "co_tenancy_profile": "nvidia-smi на момент замера — файл nvidia-smi-at-measurement.txt и строка co-tenancy: в каждом логе ячейки; V100.0 свободно 6553 МиБ, V100.1 479, V100.2 647, V100.3 3487, RTX 2060 свободна (не использовалась; bench — CPU/NVMe)",
+    "io_mode": [
+      "odirect (cold, штатный по протоколу server-env round 5)",
+      "buffered (тёплая, fadvise DONTNEED best-effort)"
+    ],
+    "сравнение_ячеек": "только внутри одной категории I/O (odirect_k1 vs odirect_k4; buffered_k1 vs buffered_k4); cross-категорийное сравнение в вердикты не идёт",
+    "model": "Qwen/Qwen3-30B-A3B-Instruct-2507, ~/models/qwen3-30b-a3b (вне git, 57 ГиБ du, 16 шардов BF16, 128 экспертов, ВСЕ слои MoE, qk-norm каждый слой, norm_topk_prob=true)",
+    "dtype_orig": "bf16 (18867 групп, 0 сатураций F32/BF16->F16)",
+    "quant_profile": "NVFP4 (выбор честно по ресурсам: F16-layout ~57 ГиБ НЕ помещается в 37 ГиБ свободных на NVMe; NVFP4 ~16 ГиБ)",
+    "description": "description.json в этом каталоге (шаблон, 16 групп-шаблонов, 18867 групп после размножения; qk_eps=1e-06, rope_theta=10000000, router_renorm не пишется — дефолт true, GQA n_kv_heads=4/d_kv=128, dqq=4096 != d_model=2048)"
+  },
+  "pipeline": {
+    "ctest_baseline": "54/54 (build/cpu, Release, системный gcc 13.3)",
+    "convert_streaming": {
+      "wall_s": 653.48,
+      "peak_rss_kib": 1237164,
+      "layout_bytes": 17153396736,
+      "groups": 18867,
+      "saturations": 0
+    },
+    "fixes": [
+      "ffa9254 — k_norm-группа [head_dim] (GQA): прежняя форма [n_kv*d_head] была верна только при n_kv_heads=1; реальный чекпоинт — k_norm.weight [128] != [512]",
+      "f032199 — o_proj {d_model, n_heads*d_head}: dqq=4096 != d_model=2048 (head_dim фиксирован); интерпретатор: joined-копия устранена (побитово та же арифметика)",
+      "ce38b48 — tiers: ленивые CPU VRAM-слоты по фактической ёмкости resident-групп (продолжение прецедента [R2] round 5 для RAM-тира); сплошная арена 233 ГиБ не выделяема"
+    ],
+    "harness_slot_verify": {
+      "файл": "harness_slot_verify.cpp (в каталоге)",
+      "метод": "база — независимый читатель TierLayoutReader (payload-CRC при первом чтении); TierManager 6 VRAM-слотов + RAM 1 ГиБ; 4 проходки с ротацией порядка (eviction-чередование); read_vram_slot vs база — memcmp",
+      "подмножество": "43 группы (глобальные + attn.wq/wo/q_norm/k_norm + e000/e127 {gate,up,down} слоев 0,1,23,47), 1300402176 байт — полный проход 16 ГиБ слишком долог для окна (честная пометка)",
+      "итог": "сверок=172, несовпадений=0 → ПОБИТОВАЯ СВЕРКА OK (лог slot_verify.log, wall 17с)"
+    }
+  },
+  "matrix_pergroup": {
+    "layout": "~/tiers_bench/qwen3-30b-a3b.stelltier (ext4 корневой NVMe; НЕ tmpfs)",
+    "profile": "vram_slots=393 (дефолт bench: вмещает слой; меньше невозможно — pin всего слоя 393 групп), ram=план (17 ГиБ), max slot 622329856 B (embed F16 [151936,2048])",
+    "vram_resident_bytes": 331431936,
+    "cells": [
+      {
+        "io": "odirect",
+        "k": 1,
+        "mode": "prefetch",
+        "passes": 3,
+        "p50_ms": 0.066,
+        "p95_ms": 0.072,
+        "p99_ms": 0.074,
+        "hit_rate": {
+          "overall": 1.0,
+          "expert": 1.0,
+          "attn": 1.0,
+          "kv": 0.0
+        },
+        "io_ops": 75468,
+        "io_bytes_gib": 63.9,
+        "throughput_gib_s": 1.18,
+        "total_ms": 53930,
+        "log": "logs/pergroup_odirect_k1_prefetch.log",
+        "odirect_active": true
+      },
+      {
+        "io": "odirect",
+        "k": 4,
+        "mode": "prefetch",
+        "passes": 3,
+        "p50_ms": 0.061,
+        "p95_ms": 0.072,
+        "p99_ms": 0.074,
+        "hit_rate": {
+          "overall": 1.0,
+          "expert": 1.0,
+          "attn": 1.0,
+          "kv": 0.0
+        },
+        "io_ops": 75468,
+        "io_bytes_gib": 63.9,
+        "throughput_gib_s": 1.4,
+        "total_ms": 45599,
+        "log": "logs/pergroup_odirect_k4_prefetch.log",
+        "odirect_active": true
+      },
+      {
+        "io": "buffered",
+        "k": 1,
+        "mode": "prefetch",
+        "passes": 3,
+        "p50_ms": 0.065,
+        "p95_ms": 0.072,
+        "p99_ms": 0.073,
+        "hit_rate": {
+          "overall": 1.0,
+          "expert": 1.0,
+          "attn": 1.0,
+          "kv": 0.0
+        },
+        "io_ops": 75468,
+        "io_bytes_gib": 63.9,
+        "throughput_gib_s": 1.34,
+        "total_ms": 47744,
+        "log": "logs/pergroup_buffered_k1_prefetch.log",
+        "odirect_active": false
+      },
+      {
+        "io": "buffered",
+        "k": 4,
+        "mode": "prefetch",
+        "passes": 3,
+        "p50_ms": 0.065,
+        "p95_ms": 0.071,
+        "p99_ms": 0.074,
+        "hit_rate": {
+          "overall": 1.0,
+          "expert": 1.0,
+          "attn": 1.0,
+          "kv": 0.0
+        },
+        "io_ops": 75468,
+        "io_bytes_gib": 63.9,
+        "throughput_gib_s": 1.36,
+        "total_ms": 46896,
+        "log": "logs/pergroup_buffered_k4_prefetch.log",
+        "odirect_active": false
+      },
+      {
+        "io": "odirect",
+        "k": 4,
+        "mode": "cold",
+        "passes": 1,
+        "p50_ms": 381.168,
+        "p95_ms": 439.659,
+        "p99_ms": 571.834,
+        "hit_rate": {
+          "overall": 0.0,
+          "expert": 0.0,
+          "attn": 0.0,
+          "kv": 0.0
+        },
+        "io_ops": 37734,
+        "io_bytes_gib": 31.95,
+        "throughput_gib_s": 1.41,
+        "total_ms": 22636,
+        "log": "logs/pergroup_odirect_k4_cold.log",
+        "odirect_active": true
+      },
+      {
+        "io": "buffered",
+        "k": 4,
+        "mode": "cold",
+        "passes": 1,
+        "p50_ms": 441.505,
+        "p95_ms": 463.597,
+        "p99_ms": 622.074,
+        "hit_rate": {
+          "overall": 0.0,
+          "expert": 0.0,
+          "attn": 0.0,
+          "kv": 0.0
+        },
+        "io_ops": 37734,
+        "io_bytes_gib": 31.95,
+        "throughput_gib_s": 1.26,
+        "total_ms": 25425,
+        "log": "logs/pergroup_buffered_k4_cold.log",
+        "odirect_active": false
+      }
+    ],
+    "io_bytes_note": "счётчик io_bytes/throughput bench учитывает каждую группу дважды (фаза B NVMe->RAM + завершение размещения) — фактический объём NVMe-чтений за проход = план/2 от напечатанного (16 ГиБ prefetch-проход, 16 ГиБ cold-проход); квирка статс-счётчика зафиксирована честно"
+  },
+  "hit_rate_harness_caveat": "hit-rate prefetch в этом bench-харнессе — СТРУКТУРНАЯ: паузы слоя считаются после материализации слоя (mgr.prefetch + wait_resident всех групп слоя до pin) — детерминизм round 5. Цель §4 «prefetch hit-rate ≥ 60%» — про hit-rate предсказателя router-lookahead в engine (tests/tiers/test_predictor), не про pin-time hit-rate этого bench. Модель >> VRAM подтверждается независимо: eviction-churn 16 ГиБ NVMe I/O за проход при resident 316 МиБ; cold-ячейки показывают честный hit-rate 0.0 и p95 440-464 мс"
+}
