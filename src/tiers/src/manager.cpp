@@ -172,6 +172,11 @@ TierManager::~TierManager() {
     // Устройство освобождаем только после join воркеров (DMA мог быть в полёте).
     for (auto& kv : ram_) free_ram_buffer(kv.second);
     ram_.clear();
+#if !defined(STELL_CUDA)
+    // [R3] round 8: ленивые CPU VRAM-слоты — освободить буферы resident-групп.
+    for (std::uint8_t* p : vram_slots_) delete[] p;
+    vram_slots_.clear();
+#endif
 #if defined(STELL_CUDA)
     if (dev_storage_) { cudaFree(dev_storage_); dev_storage_ = nullptr; }
     if (dma_stream_) {
@@ -394,11 +399,15 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
     for (std::size_t i = 0; i < cfg_.vram_slots; ++i)
         vram_slots_[i] = dev_storage_ + i * slot_size_;
 #else
-    // CPU-эмуляция VRAM-тира: host-память.
-    vram_storage_.assign(cfg_.vram_slots * slot_size_, 0);
+    // CPU-эмуляция VRAM-тира ([R3] round 8): ЛЕНИВЫЕ буферы слотов размера
+    // slot_bytes resident-группы (аллокация при размещении — process_batch
+    // фаза C; освобождение — release_slot/деструктор/ResetPlan). Сплошная
+    // арена vram_slots × max_slot_bytes на реальных MoE не выделяема
+    // (qwen3-30b-a3b: ≈ 233 ГБ) и противоречила учёту tier_bytes
+    // (Σ slot_bytes resident, [R2] round 5). Учёт ёмкости политики (число
+    // слотов) не меняется; slot_size_ — верхняя граница ёмкости группы.
+    for (std::uint8_t* p : vram_slots_) delete[] p; // перевыпуск set_plan
     vram_slots_.assign(cfg_.vram_slots, nullptr);
-    for (std::size_t i = 0; i < cfg_.vram_slots; ++i)
-        vram_slots_[i] = vram_storage_.data() + i * slot_size_;
 #endif
     free_slots_.clear();
     for (std::int32_t i = static_cast<std::int32_t>(cfg_.vram_slots) - 1; i >= 0; --i)
@@ -661,6 +670,15 @@ std::int32_t TierManager::acquire_slot(GroupId) {
 }
 
 void TierManager::release_slot(std::int32_t slot) {
+#if !defined(STELL_CUDA)
+    // [R3] round 8: ленивый CPU-слот — буфер освобождается при eviction
+    // (nullptr = свободный слот; повторный release безопасен — двойной
+    // free исключён проверкой на nullptr).
+    if (vram_slots_[(std::size_t)slot]) {
+        delete[] vram_slots_[(std::size_t)slot];
+        vram_slots_[(std::size_t)slot] = nullptr;
+    }
+#endif
     free_slots_.push_back(slot);
 }
 
@@ -774,6 +792,14 @@ void TierManager::process_batch(const std::vector<Job>& batch) {
             std::lock_guard<std::mutex> lk(mu_);
             try {
                 slot = acquire_slot(e.gid); // TierError(SlotExhausted) при отсутствии жертв
+#if !defined(STELL_CUDA)
+                // [R3] round 8: ленивый CPU-слот — буфер размера slot_bytes
+                // КОНКРЕТНОЙ группы (свободный слот всегда nullptr: буфер
+                // освобождён при eviction); копией e.gb ниже заполняется
+                // целиком — нулевой инициализации не требуется.
+                if (!vram_slots_[(std::size_t)slot])
+                    vram_slots_[(std::size_t)slot] = new std::uint8_t[e.gb];
+#endif
             } catch (...) {
                 slot_err = std::current_exception();
             }

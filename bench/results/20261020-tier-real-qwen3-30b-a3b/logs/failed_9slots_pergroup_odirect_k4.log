@@ -1,0 +1,3 @@
+terminate called after throwing an instance of 'stell::tiers::TierError'
+  what():  vram: no free slots and nothing evictable (all pinned)
+timeout: the monitored command dumped core

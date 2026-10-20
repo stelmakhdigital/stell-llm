@@ -359,6 +359,55 @@ std::vector<SynthTensor> qwen3_moe_qknorm_hf_tensors() {
     return ts;
 }
 
+// [R3] round 8: GQA-вариант qk-norm фикстуры, ДВА разрыва прежних
+// предположений, замаскированных фикстурами с n_kv_heads=1 и
+// n_heads*d_head == d_model (реальный Qwen3-30B-A3B: GQA n_kv_heads=4,
+// head_dim=128, n_heads=32, hidden=2048 → 4096 != 2048):
+//   1) k_norm.weight — [head_dim]=[4] (НЕ [n_kv*d_head]=[8]): HF Qwen3 —
+//      per-head RMSNorm, вес [head_dim] транслируется по KV-головам;
+//   2) n_heads=4 × head_dim=4 → q-габарит dqq=16 != d_model=8: q_proj
+//      {16,8}, o_proj {8,16} (НЕ квадратные {8,8}).
+std::vector<SynthTensor> qwen3_moe_qknorm_gqa_hf_tensors() {
+    std::vector<SynthTensor> out;
+    auto push_f16 = [&](const std::string& name, std::vector<std::int64_t> sh, int seed) {
+        std::size_t n = 1;
+        for (auto d : sh) n *= static_cast<std::size_t>(d);
+        out.push_back(tensor(name, "F16", std::move(sh), f16_det(n, seed)));
+    };
+    auto push_f32 = [&](const std::string& name, std::vector<std::int64_t> sh, float seed) {
+        std::size_t n = 1;
+        for (auto d : sh) n *= static_cast<std::size_t>(d);
+        out.push_back(tensor(name, "F32", std::move(sh), f32_det(n, seed)));
+    };
+    push_f16("model.embed_tokens.weight", {16, 8}, 5);
+    push_f32("model.norm.weight", {8}, 0.5f);
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string p = "model.layers." + std::to_string(layer) + ".";
+        push_f32(p + "input_layernorm.weight", {8}, 0.25f + layer);
+        push_f32(p + "post_attention_layernorm.weight", {8}, 0.75f + layer);
+        // dqq = n_heads(4)*head_dim(4) = 16 != d_model(8) — как в реальном
+        // Qwen3-30B-A3B (4096 != 2048): q_proj {16,8}, o_proj {8,16}.
+        push_f16(p + "self_attn.q_proj.weight", {16, 8}, layer * 13 + 3);
+        // GQA: n_kv_heads=2 × head_dim=4 → k/v проекции {8, 8} (НЕ {4, 8}).
+        push_f16(p + "self_attn.k_proj.weight", {8, 8}, layer * 21 + 5);
+        push_f16(p + "self_attn.v_proj.weight", {8, 8}, layer * 29 + 9);
+        push_f16(p + "self_attn.o_proj.weight", {8, 16}, layer * 31 + 17);
+        // per-head RMSNorm q/k — вес [head_dim]=[4] по головам (включая
+        // KV-головы) — как в реальном чекпоинте Qwen3-30B-A3B.
+        push_f16(p + "self_attn.q_norm.weight", {4}, layer * 5 + 71);
+        push_f16(p + "self_attn.k_norm.weight", {4}, layer * 5 + 73);
+        push_f32(p + "mlp.router.weight", {4, 8}, 0.125f + layer);
+        for (int e = 0; e < 4; ++e) {
+            const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+            push_f16(ep + "gate_proj.weight", {8, 8}, layer * 53 + e * 7 + 19);
+            push_f16(ep + "up_proj.weight", {8, 8}, layer * 41 + e * 11 + 23);
+            push_f16(ep + "down_proj.weight", {8, 8}, layer * 67 + e * 13 + 27);
+        }
+    }
+    push_f16("lm_head.weight", {16, 8}, 1000);   // tie_word_embeddings=false
+    return out;
+}
+
 // [R1] round 7: частичный набор — только q_norm (k_norm нет) → честный
 // SchemaMismatch (односторонне нормализованный attention не имеет покрытой
 // семантики).
@@ -378,15 +427,16 @@ std::vector<SynthTensor> qwen3_moe_qknorm_partial_hf_tensors() {
 // для error-кейсов (norm_topk=false; moe_ff != факту шардов; без
 // rms_norm_eps при qk-нормах).
 void write_config_qwen3(const std::string& dir, bool norm_topk = true,
-                        int moe_ff = 8, bool rms_eps = true) {
+                        int moe_ff = 8, bool rms_eps = true, int n_kv = 1,
+                        int n_heads = 2) {
     std::filesystem::create_directories(dir);
     std::string cfg = std::string(
         "{\n"
         "  \"architectures\": [\"Qwen3MoeForCausalLM\"],\n"
         "  \"hidden_size\": 8,\n"
         "  \"num_hidden_layers\": 2,\n"
-        "  \"num_attention_heads\": 2,\n"
-        "  \"num_key_value_heads\": 1,\n"
+        "  \"num_attention_heads\": " + std::to_string(n_heads) + ",\n"
+        "  \"num_key_value_heads\": " + std::to_string(n_kv) + ",\n"
         "  \"head_dim\": 4,\n"
         "  \"vocab_size\": 16,\n"
         "  \"rope_theta\": 10000.0,\n"
@@ -1330,6 +1380,40 @@ void body() {
         roundtrip_logits(d, dir, single, "/tmp/stell_hf_qwen3moe_qknorm_out",
                          se::PlainWeightsSafetensors);
         std::printf("moe (Qwen3Moe, qk-norm): группы attn.{q,k}_norm + qk_eps; roundtrip OK (побитно)\n");
+    }
+    // (а-1) [R3] round 8: GQA (n_kv_heads=2 > 1; dqq=16 != d_model=8) +
+    //     qk-norm — описание генерируется: k_norm-группа [head_dim]=[4]
+    //     (НЕ [n_kv*d_head]=[8]), wo-группа [d_model, dqq]={8,16} (НЕ {8,8});
+    //     roundtrip логитов побитово (GQA-путь интерпретатора: k-norm по
+    //     per-head срезам, n_kv_heads>1 и dqq != d_model в attention/wo).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_qkgqa");
+        write_config_qwen3(dir, /*norm_topk=*/true, /*moe_ff=*/8,
+                           /*rms_eps=*/true, /*n_kv=*/2, /*n_heads=*/4);
+        const auto ts = qwen3_moe_qknorm_gqa_hf_tensors();
+        write_shards(dir, ts);
+        const std::string json = hf_to_description(dir, "F16");
+        const JsonValue root = json_parse(json);
+        const JsonValue* kvj = root.find("kv");
+        CHECK(kvj != nullptr);
+        CHECK(kvj->get_uint("n_kv_heads") == 2);
+        CHECK(kvj->get_uint("d_kv") == 4);   // per-head kv dim == head_dim
+        const ModelDescription d = parse_model_description(json, "hf-qwen3moe-qkgqa");
+        CHECK(d.groups.size() == 47);   // 43 + 2 слоя × (q_norm + k_norm)
+        const int kn0 = find_group(d, "l000.attn.k_norm");
+        CHECK((kn0 >= 0) &&
+              d.group_source_patterns[kn0] ==
+                  "model.layers.0.self_attn.k_norm.weight");
+        CHECK((d.groups[kn0].shape == std::vector<std::int64_t>{4}));
+        // [R3] round 8: wo — [d_model, n_heads*d_head] = {8, 16} (НЕ {8, 8}).
+        const int wo0 = find_group(d, "l000.attn.wo");
+        CHECK((wo0 >= 0) &&
+              (d.groups[wo0].shape == std::vector<std::int64_t>{8, 16}));
+        const std::string single =
+            write_single("/tmp/stell_hf_qwen3moe_qkgqa_single.safetensors", ts);
+        roundtrip_logits(d, dir, single, "/tmp/stell_hf_qwen3moe_qkgqa_out",
+                         se::PlainWeightsSafetensors);
+        std::printf("moe (Qwen3Moe, qk-norm GQA): k_norm [head_dim]; roundtrip OK (побитно)\n");
     }
     // (а-2) [R1] round 7: частичный набор (только q_norm, k_norm нет) →
     //     честный SchemaMismatch.
