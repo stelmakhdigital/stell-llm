@@ -70,8 +70,11 @@
 //     первого MoE-слоя, при наличии config-ключа moe_intermediate_size —
 //     перекрёстная сверка (несогласованность — честный SchemaMismatch).
 //   - [R1] round 7 (ADR-09 round 7): per-head RMSNorm q/k — тензоры
-//     self_attn.{q,k}_norm.weight (форма [d_head]/[d_kv], Qwen3-класс,
-//     каждый слой по зонду) → группы "l{layer}.attn.q_norm"/"l{layer}.
+//     self_attn.{q,k}_norm.weight (форма [head_dim] обе, Qwen3-класс:
+//     вес [head_dim] транслируется по головам, включая KV-головы GQA;
+//     [R3] round 8: прежняя форма k_norm [n_kv_heads*d_head] была верна
+//     только при n_kv_heads=1 — фикстуры этого не различали; каждый слой
+//     по зонду) → группы "l{layer}.attn.q_norm"/"l{layer}.
 //     attn.k_norm" (роль attn, dtype тензора источника по канону норм:
 //     F32/F16, BF16 → F16 clamp-сатурация, [R5] round 5). Группа —
 //     шаблон с cardinality {layer} при наличии qk-норм ВЕЗДЕ, literal
@@ -325,8 +328,9 @@ std::string hf_to_description(const std::string& hf_dir,
                               "MixtralForCausalLM, Qwen3MoeForCausalLM)");
 
     // [R1] round 7 (ADR-09 round 7): per-head RMSNorm q/k — тензоры
-    // self_attn.{q,k}_norm.weight (Qwen3-класс, форма [d_head]/[d_kv] —
-    // зонд реального Qwen3-30B-A3B). Вместо отказа round 6 — генерация
+    // self_attn.{q,k}_norm.weight (Qwen3-класс, форма [head_dim] обе —
+    // зонд реального Qwen3-30B-A3B; GQA: вес [head_dim] по KV-головам).
+    // Вместо отказа round 6 — генерация
     // групп "l{layer}.attn.{q,k}_norm" (роль attn, dtype тензора источника
     // по канону норм) + параметр op attention "qk_eps" из config.json
     // rms_norm_eps. Политика честного fail-fast сохраняется:
@@ -423,8 +427,12 @@ std::string hf_to_description(const std::string& hf_dir,
                                 "", /*kv_block=*/true));
 
     // --- [R1] round 7: группы per-head RMSNorm q/k ----------------------------
-    // Форма — вектор веса на голову: q_norm [d_head], k_norm [d_kv]
-    // (== [d_head] в поддержанных arch). Роль attn, dtype тензора
+    // Форма — вектор веса на голову: q_norm [d_head], k_norm [d_head]
+    // (HF Qwen3: RMSNorm по последней размерности каждой головы, вес
+    // [head_dim] транслируется по головам; при n_kv_heads=1 d_kv == d_head —
+    // прежние фикстуры не отличали формы; реальный GQA-чекпоинт
+    // Qwen3-30B-A3B: n_kv_heads=4, head_dim=128, k_norm.weight [128] !=
+    // [d_kv=512] — форма по planner [Q1]: [head_dim]). Роль attn, dtype тензора
     // источника (канон норм: F32/F16, BF16 → F16 clamp-сатурация и
     // счётчик — source_group_dtype, [R5] round 5). Ровно все слои →
     // шаблон с cardinality {layer: L} (компактно, как у attn-норм);
@@ -444,13 +452,13 @@ std::string hf_to_description(const std::string& hf_dir,
             // Формы слоя 0 — привязка шаблона к факту шардов (остальные
             // слои проверит энергичная валидация §6).
             check_shape("model.layers.0.self_attn.q_norm.weight", {dh});
-            check_shape("model.layers.0.self_attn.k_norm.weight", {dkv});
+            check_shape("model.layers.0.self_attn.k_norm.weight", {dh});
             groups.push_back(make_group("l{layer}.attn.q_norm", "attn", {dh},
                                         source_group_dtype(
                                             "model.layers.0.self_attn.q_norm.weight"),
                                         lp + ".self_attn.q_norm.weight",
                                         {{card_key, L}}));
-            groups.push_back(make_group("l{layer}.attn.k_norm", "attn", {dkv},
+            groups.push_back(make_group("l{layer}.attn.k_norm", "attn", {dh},
                                         source_group_dtype(
                                             "model.layers.0.self_attn.k_norm.weight"),
                                         lp + ".self_attn.k_norm.weight",
@@ -465,13 +473,13 @@ std::string hf_to_description(const std::string& hf_dir,
                 if (!layer_qk[static_cast<std::size_t>(i)]) continue;
                 const std::string src = "model.layers." + std::to_string(i);
                 check_shape(src + ".self_attn.q_norm.weight", {dh});
-                check_shape(src + ".self_attn.k_norm.weight", {dkv});
+                check_shape(src + ".self_attn.k_norm.weight", {dh});
                 groups.push_back(make_group("l" + pad3(i) + ".attn.q_norm", "attn",
                                             {dh},
                                             source_group_dtype(src + ".self_attn.q_norm.weight"),
                                             src + ".self_attn.q_norm.weight"));
                 groups.push_back(make_group("l" + pad3(i) + ".attn.k_norm", "attn",
-                                            {dkv},
+                                            {dh},
                                             source_group_dtype(src + ".self_attn.k_norm.weight"),
                                             src + ".self_attn.k_norm.weight"));
             }
