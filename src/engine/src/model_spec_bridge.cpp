@@ -84,6 +84,7 @@ stell::models::ModelDescription compat_description(const PlainSpec& spec) {
         m.n_experts_active = spec.n_experts_active;
         m.expert_d_ff = spec.expert_d_ff;
         m.router = spec.router;
+        m.router_renorm = spec.router_renorm;   // [R2] round 7: мост несёт флаг
         d.moe = m;
     }
     for (const PlainGroup& g : spec.groups) {
@@ -124,6 +125,7 @@ PlainSpec plain_spec_from_description(const stell::models::ModelDescription& des
         spec.n_experts_active = desc.moe->n_experts_active;
         spec.expert_d_ff = desc.moe->expert_d_ff;
         spec.router = desc.moe->router;
+        spec.router_renorm = desc.moe->router_renorm;   // [R2] round 7 (ADR-09)
     }
     for (const stell::models::OpSpec& op : desc.ops) {
         PlainOp po{};

@@ -61,6 +61,7 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
     // частичный набор MoE-групп, мёртвые op'ы графа, рассинхрон class/moe.
     bool any_moe_layer = false, any_dense_layer = false;
     bool ops_has_ffn = false, ops_has_moe = false;
+    bool any_qk_norm = false;   // [R1] round 7: есть пары attn.q_norm/attn.k_norm
     for (const PlainOp& op : spec_.ops) {
         ops_has_ffn = ops_has_ffn || op.op == "ffn";
         ops_has_moe = ops_has_moe || op.op == "moe_gather_scatter";
@@ -83,6 +84,37 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
         const bool sh_g = group(p + "ffn.shared.gate") != nullptr;
         const bool sh_u = group(p + "ffn.shared.up") != nullptr;
         const bool sh_d = group(p + "ffn.shared.down") != nullptr;
+        // [R1] round 7 (ADR-09 «Уточнение round 7», planner [Q1]): per-head
+        // RMSNorm q/k — группы attn.q_norm / attn.k_norm (вектор веса [d_head]
+        // / [d_kv], нормы не квантуются — dtype исходного тензора). Отсутствие
+        // ОБОИХ групп — прежнее поведение (golden dense/mixtral побитово);
+        // частичный набор — честный SchemaMismatch (fail-fast §3:
+        // односторонне нормализованный attention не имеет покрытой семантики).
+        const PlainGroup* gqn = group(p + "attn.q_norm");
+        const PlainGroup* gkn = group(p + "attn.k_norm");
+        if ((gqn == nullptr) != (gkn == nullptr)) {
+            throw std::invalid_argument(
+                "SchemaMismatch: слой " + std::to_string(l) +
+                " — частичный набор qk-norm групп (" +
+                (gqn ? "attn.q_norm без attn.k_norm" : "attn.k_norm без attn.q_norm") +
+                ") — per-head RMSNorm применяется к ОБЕИМ проекциям "
+                "(ADR-09 round 7: fail-fast не ослабляется)");
+        }
+        if (gqn) {
+            any_qk_norm = true;
+            const std::int64_t dh = static_cast<std::int64_t>(spec_.d_head);
+            const std::int64_t dkv = static_cast<std::int64_t>(spec_.d_kv);
+            const bool shape_ok =
+                gqn->shape.size() == 1 && gqn->shape[0] == dh &&
+                gkn->shape.size() == 1 && gkn->shape[0] == dkv;
+            if (!shape_ok) {
+                throw std::invalid_argument(
+                    "SchemaMismatch: слой " + std::to_string(l) +
+                    " — группы attn.q_norm/attn.k_norm не 1-D вектор веса "
+                    "нужного размера ([d_head]/[d_kv], per-head RMSNorm, "
+                    "ADR-09 round 7)");
+            }
+        }
         // [R1] round 6 (ADR-09 «Уточнение round 6», planner [Q5]): скалярный
         // сигмоид-гейт — группа ffn.shared.gate_scalar (d_model→1, тензор
         // mlp.shared_expert_gate Qwen2Moe-класса). Имя ОТЛИЧАЕТСЯ от
@@ -183,6 +215,38 @@ OpsInterpreter::OpsInterpreter(PlainSpec spec, ExecutionPlan plan, LoadedWeights
         throw std::invalid_argument(
             "SchemaMismatch: есть dense-слои (без mlp.router), но в ops нет ffn — "
             "FFN плотных слоёв не исполняется ни одним op'ом");
+    }
+
+    // [R1] round 7: eps per-head RMSNorm q/k — параметр qk_eps op attention
+    // (из config, не дефолт-догадка). Кросс-проверка в обе стороны:
+    // группы без параметра — отказ; параметр без групп — мёртвый параметр,
+    // тоже отказ (тихое игнорирование запрещено).
+    bool has_qk_eps = false;
+    for (const PlainOp& op : spec_.ops) {
+        if (op.op != "attention") continue;
+        for (const PlainOpParam& prm : op.params)
+            if (prm.key == "qk_eps") has_qk_eps = true;
+    }
+    if (any_qk_norm && !has_qk_eps) {
+        throw std::invalid_argument(
+            "SchemaMismatch: есть группы attn.q_norm/attn.k_norm, но у op "
+            "attention нет параметра qk_eps — eps per-head RMSNorm обязан "
+            "приходить из описания (не дефолт-догадка, ADR-09 round 7)");
+    }
+    if (!any_qk_norm && has_qk_eps) {
+        throw std::invalid_argument(
+            "SchemaMismatch: op attention содержит qk_eps, но групп "
+            "attn.q_norm/attn.k_norm нет ни в одном слое — мёртвый параметр "
+            "запрещён (ADR-09 round 7: fail-fast §3)");
+    }
+    // [R2] round 7: router_renorm=false без роутера — поле ни на одном слое
+    // не исполняется (смешанный план допустим: флаг влияет только на MoE-слои;
+    // на dense-слоях он не имеет эффекта и не мешает).
+    if (!spec_.router_renorm && !any_moe_layer) {
+        throw std::invalid_argument(
+            "SchemaMismatch: router_renorm=false, но ни один слой не имеет "
+            "mlp.router — перенормировку не отключать нечему (ADR-09 round 7: "
+            "мёртвый параметр запрещён, fail-fast §3)");
     }
 
     // Материализация весов: dequant → F32 матрицы (ядра kernels CPU-референс).
@@ -299,6 +363,19 @@ float OpsInterpreter::op_eps() const {
     return eps;
 }
 
+// [R1] round 7 (ADR-09 «Уточнение round 7», planner [Q1]): eps per-head
+// RMSNorm q/k — параметр qk_eps op attention; валидация присутствия при
+// наличии qk-групп — в конструкторе (SchemaMismatch), здесь — достоверное
+// чтение без fallback-догадок.
+float OpsInterpreter::op_qk_eps() const {
+    for (const PlainOp& op : spec_.ops) {
+        if (op.op != "attention") continue;
+        for (const PlainOpParam& p : op.params)
+            if (p.key == "qk_eps") return static_cast<float>(p.fval);
+    }
+    return 0.0f;   // недостижимо: конструктор требует qk_eps при qk-группах
+}
+
 void OpsInterpreter::op_rmsnorm(std::size_t layer, std::vector<float>& hidden) {
     const PlainGroup* ng = group(layer_prefix(layer) + "attn.norm");
     if (!ng) throw std::invalid_argument("ops runner: нет группы нормы слоя " +
@@ -337,6 +414,44 @@ void OpsInterpreter::op_attention(std::size_t layer, std::vector<float>& hidden,
     std::vector<float> q = matvec(*wq, norm_in_);
     std::vector<float> k = matvec(*wk, norm_in_);
     std::vector<float> v = matvec(*wv, norm_in_);
+
+    // [R1] round 7 (ADR-09 «Уточнение round 7», planner [Q1]): per-head
+    // RMSNorm q/k — ПОСЛЕ линейных проекций и ДО QK/PV и записи k в KV-кеш.
+    // Каждая голова нормализуется НЕЗАВИСИМО одним вектором веса: slice =
+    // x[h*dim .. h*dim+dim), inv = 1/sqrt(mean(slice^2)+eps) — арифметика
+    // побитово как в op_rmsnorm (сумма квадратов через double, та же формула
+    // inv), нормализация голов не смешивает элементы между головами. Группы
+    // отсутствуют → прежнее поведение (golden dense/mixtral побитово);
+    // частичный набор и форма отсечены валидацией конструктора.
+    if (const PlainGroup* gqn = group(layer_prefix(layer) + "attn.q_norm")) {
+        const PlainGroup* gkn = group(layer_prefix(layer) + "attn.k_norm");
+        const Mat* qn = mat(gqn->id);
+        if (!gkn || !qn || !mat(gkn->id))
+            throw std::invalid_argument(
+                "ops runner: слой " + std::to_string(layer) +
+                " — qk-norm группы без весов (страховочный fail-fast, "
+                "ADR-09 round 7)");
+        const Mat* kn = mat(gkn->id);
+        const float eps = op_qk_eps();
+        const auto head_norm = [](std::vector<float>& x, std::uint32_t n_heads,
+                                  std::uint32_t dim, const Mat& w, float e) {
+            for (std::uint32_t h = 0; h < n_heads; ++h) {
+                double ms = 0.0;
+                for (std::uint32_t d = 0; d < dim; ++d) {
+                    const float xv = x[static_cast<std::size_t>(h) * dim + d];
+                    ms += double(xv) * double(xv);
+                }
+                const float inv =
+                    1.0f / std::sqrt(static_cast<float>(ms / dim) + e);
+                for (std::uint32_t d = 0; d < dim; ++d) {
+                    const std::size_t i = static_cast<std::size_t>(h) * dim + d;
+                    x[i] = w.w[d] * x[i] * inv;
+                }
+            }
+        };
+        head_norm(q, spec_.n_heads, spec_.d_head, *qn, eps);
+        head_norm(k, spec_.n_kv_heads, spec_.d_kv, *kn, eps);
+    }
 
     // KV-кеш: token-major [pos][dkv] (FP32 CPU-контур; квант KV E4M3 —
     // ADR-04, задача SM70-контура). Позиция нового токена = st.pos.
@@ -435,9 +550,10 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
         throw std::invalid_argument("ops runner: нет весов роутера");
     // Round 2 (вклейка golden D): router — матрица [n_experts, d_model];
     // scores[e] = router_e · hidden (matmul со скрытым состоянием), softmax
-    // по всем экспертам, top-k с перенормировкой probs = p_sel / Σ p_sel
-    // (семантика Mixtral, сверено с HF-кроссчеком D, rel ≤ 1.5e-07);
-    // ничья при argsort → меньший индекс (stable sort).
+    // по всем экспертам, top-k (stable sort, ничья → меньший индекс);
+    // перенормировка probs = p_sel / Σ p_sel — при router_renorm=true
+    // (семантика Mixtral, сверено с HF-кроссчеком D, rel ≤ 1.5e-07); при
+    // router_renorm=false веса без перенормировки ([R2] round 7, ниже).
     const std::uint32_t d_model = spec_.d_model;
     if (router->cols != d_model)
         throw std::invalid_argument("ops runner: роутер не [n_experts, d_model]");
@@ -463,11 +579,19 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
         return scores[a] > scores[b];
     });
     order.resize(k_top);
+    // Перенормировка topk-весов: softmax по всем экспертам уже сделан; при
+    // router_renorm=false ([R2] round 7, ADR-09 «Уточнение round 7», planner
+    // [Q2], семантика norm_topk_prob=false Qwen3Moe-класса) веса выбранных k
+    // используются БЕЗ деления на сумму; true (дефолт) — канон Mixtral
+    // (probs = p_sel / Σ p_sel, golden побитово).
     float pk_sum = 0.0f;
-    for (std::uint32_t j = 0; j < k_top; ++j) pk_sum += scores[order[j]];
+    if (spec_.router_renorm)
+        for (std::uint32_t j = 0; j < k_top; ++j) pk_sum += scores[order[j]];
     std::vector<float> probs(k_top, 0.0f);
     for (std::uint32_t j = 0; j < k_top; ++j)
-        probs[j] = pk_sum > 0.0f ? scores[order[j]] / pk_sum : 0.0f;
+        probs[j] = spec_.router_renorm
+                       ? (pk_sum > 0.0f ? scores[order[j]] / pk_sum : 0.0f)
+                       : scores[order[j]];
 
     // --- MoE gather/scatter через kernels CPU-референс (ADR-09 §1) -----------
     // x — [1][d_model]; expert_ids — [1][k_top]; gathered — [k_top][d_model].

@@ -282,6 +282,17 @@ target_compile_definitions(test_engine_ops_gate PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/ops_gate COMMAND test_engine_ops_gate)
 
+# --- round 7: [R1]/[R2] per-head RMSNorm q/k (qk_eps) + router_renorm ---------
+
+add_executable(test_engine_ops_qk_norm
+    ../../tests/core/engine/test_ops_qk_norm.cpp
+)
+target_link_libraries(test_engine_ops_qk_norm stell_engine)
+target_include_directories(test_engine_ops_qk_norm PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ops_qk_norm PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ops_qk_norm COMMAND test_engine_ops_qk_norm)
+
 # --- round 5: [R6] source_slice через мост (fused qkv, одно открытие) ---------
 
 add_executable(test_engine_weights_slice

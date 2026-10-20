@@ -111,6 +111,7 @@ private:
 
     // --- каталог операций (ADR-09 §1) ----------------------------------------
     float op_eps() const;                              // eps из params rmsnorm
+    float op_qk_eps() const;                           // [R1] round 7: eps из params attention (qk_eps)
     void layer_body(std::size_t layer, std::vector<float>& hidden, SlotState& st);
     void op_rmsnorm(std::size_t layer, std::vector<float>& hidden);
     void op_attention(std::size_t layer, std::vector<float>& hidden, SlotState& st);
