@@ -105,6 +105,15 @@ struct PlainSpec {
     std::uint32_t expert_d_ff      = 0;
     std::string router = "softmax-topk";
 
+    // [R2] round 7 (ADR-09 «Уточнение round 7», planner [Q2]): перенормировка
+    // topk-весов роутера (семантика Mixtral, дефолт true = прежнее поведение;
+    // побитовые golden не меняются). false = softmax-веса выбранных k
+    // используются БЕЗ деления на сумму (norm_topk_prob=false, Qwen3Moe-класс).
+    // Переносится из MoeSpec мостом (model_spec_bridge.cpp); отсутствие
+    // mlp.router во всех слоях при false — честный SchemaMismatch (конструктор
+    // OpsInterpreter, fail-fast §3).
+    bool router_renorm = true;
+
     std::string kv_dtype = "F16";
     std::string kv_quant;                 // пусто = null (ADR-04)
 
