@@ -302,14 +302,15 @@ int main(int argc, char** argv) {
             "  bench-side wall p50=%.3f ms p95=%.3f ms p99=%.3f ms (fan-in, справочно)\n",
             pct(layer_ms, 0.50), pct(layer_ms, 0.95), pct(layer_ms, 0.99),
             pct(wall_ms, 0.50), pct(wall_ms, 0.95), pct(wall_ms, 0.99));
-        std::printf(
-            "bench_pause: backend=%s path=%s mode=pergroup groups=%zu slot=%zu(max) layers=%u passes=%d mode=%s\n"
+        std::printf("bench_pause: backend=%s path=%s mode=pergroup groups=%zu slot=%zu(max) layers=%u passes=%d mode=%s\n"
             "  pause p50=%.3f ms p95=%.3f ms p99=%.3f ms (цель PLAN.md §4: p95 ≤ 5 мс)\n"
+            "  vram_resident_bytes=%llu (фактические байты resident-групп, [R3] round 8)\n"
             "  io_bytes=%llu (%.2f GiB) io_ops=%llu throughput=%.2f GiB/s total=%.0f ms\n"
             "  payload-CRC пересчётов=%llu (verify-политика конфига/env, ADR-12 §2.3)\n",
             nvme_io_backend().c_str(), path.c_str(), plan.size(), max_slot,
             (unsigned)n_layers, passes, mode.c_str(),
             st.layer_pause.p50_ms, st.layer_pause.p95_ms, st.layer_pause.p99_ms,
+            (unsigned long long)st.tier_bytes[0],
             (unsigned long long)st.io_bytes, io_gb, (unsigned long long)st.io_ops,
             io_gb / (total_ms / 1000.0), total_ms,
             (unsigned long long)mgr.crc_checks());

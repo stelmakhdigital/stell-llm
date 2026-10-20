@@ -270,9 +270,15 @@ private:
                                                            // при STELL_CUDA,
                                                            // alloc_ram_buffer)
 
-    // VRAM-тир: N слотов фиксированного размера (CPU-эмуляция / device ptr).
-    std::vector<std::uint8_t> vram_storage_;
-    std::vector<std::uint8_t*> vram_slots_;
+    // VRAM-тир: N слотов. CPU-эмуляция ([R3] round 8): буферы слотов —
+    // ЛЕНИВЫЕ, размера slot_bytes КОНКРЕТНОЙ resident-группы (аллокация при
+    // размещении, освобождение при eviction; nullptr = свободный слот).
+    // Прежняя сплошная арена vram_slots × max_slot_bytes на реальных MoE
+    // (qwen3-30b-a3b: 393 группы/слой × embed F16 594 МиБ ≈ 233 ГБ) не
+    // выделяема и не соответствует учёту tier_bytes (Σ slot_bytes resident —
+    // [R2] round 5); продолжение того же прецедента для VRAM-тира. Учёт
+    // ёмкости ПОЛИТИКИ (слоты) не меняется; STELL_CUDA — device-арена прежняя.
+    std::vector<std::uint8_t*> vram_slots_;   // CPU: буфер слота / nullptr; CUDA: device ptr
     std::size_t slot_size_ = 0;
     std::vector<std::int32_t> free_slots_;
     std::uint64_t tick_ = 0;
