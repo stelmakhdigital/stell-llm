@@ -1,0 +1,124 @@
+{
+  "pending": false,
+  "gates": [
+    {
+      "gate": "quality-gate",
+      "dataset": "ppl_fixed_text[mini_dense]",
+      "pending": false,
+      "value": 18.3928,
+      "unit": "ppl",
+      "items": 127,
+      "notes": [
+        "модель=mini_dense",
+        "источник логитов=abi:stell_logits",
+        "токенов=128 (первые 128 фиксированного текста, проекция байта → токен b % vocab, vocab=16; механический базовый референс, а не языковая PPL)",
+        "mean_nll=2.911957"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "gsm8k_32[mini_dense]",
+      "pending": false,
+      "value": 0.0625,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=mini_dense",
+        "источник логитов=abi:stell_logits",
+        "верно=2/32",
+        "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "humaneval_32[mini_dense]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=mini_dense",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "ppl_fixed_text[mini_moe]",
+      "pending": false,
+      "value": 30.0858,
+      "unit": "ppl",
+      "items": 127,
+      "notes": [
+        "модель=mini_moe",
+        "источник логитов=abi:stell_logits",
+        "токенов=128 (первые 128 фиксированного текста, проекция байта → токен b % vocab, vocab=16; механический базовый референс, а не языковая PPL)",
+        "mean_nll=3.404053"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "gsm8k_32[mini_moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=mini_moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "жадное декодирование (argmax, ≤16 шагов); проверка корректности — последнее число в декодированном тексте (без исполнения; вычислимо честно)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    },
+    {
+      "gate": "quality-gate",
+      "dataset": "humaneval_32[mini_moe]",
+      "pending": false,
+      "value": 0.0,
+      "unit": "score",
+      "items": 32,
+      "notes": [
+        "модель=mini_moe",
+        "источник логитов=abi:stell_logits",
+        "верно=0/32",
+        "исходы песочницы: error=32",
+        "конвейер [R4]: жадное декодирование (argmax, ≤32 токенов) → извлечение кода (первый markdown-fence, иначе весь ответ) → исполнение в песочнице против test-кейса (process-sandbox: RLIMIT_CPU=5с/RLIMIT_AS/RLIMIT_NOFILE, wall 10с, temp-dir, пустой env; НЕ security-граница — честная пометка)",
+        "механический базовый референс пайплайна: проекция байта → токен — mini-фикстуры/каталоги без tokenizer.json — не языковые модели; значение — точка регрессии, а не оценка качества LLM"
+      ]
+    }
+  ],
+  "mode": "live",
+  "models": [
+    "mini_dense",
+    "mini_moe"
+  ],
+  "logits_source": [
+    "источник логитов=abi:stell_logits"
+  ],
+  "protocol": {
+    "ppl_max_tokens": 128,
+    "gsm8k_prompt_tokens": 64,
+    "gsm8k_max_steps": 16,
+    "humaneval_prompt_tokens": 64,
+    "humaneval_max_steps": 32,
+    "humaneval_sandbox": {
+      "class": "process-sandbox (НЕ security-граница)",
+      "rlimit_cpu_s": 5,
+      "wall_timeout_s": 10,
+      "rlimit_as_bytes": 536870912,
+      "rlimit_nofile": 64,
+      "env": "пустой",
+      "cwd": "изолированный temp-dir"
+    },
+    "projection": "byte % vocab, detok: id<10 → цифра (без tokenizer.json)"
+  },
+  "env": {
+    "co_tenancy": false,
+    "gpu": "none (CPU-local)"
+  }
+}
