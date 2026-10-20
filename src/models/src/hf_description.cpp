@@ -50,7 +50,7 @@
 //     совместимость: группы описаний без гейта побитово прежние);
 //     частичный набор (gate есть, shared-FFN нет) — честный
 //     SchemaMismatch. Семантика умножения — ops_runner (поток core).
-//     [R2] round 6 (planner [Q6], ADR-03 round 5/6): провенанс dtype_orig
+//   [R2] round 6 (planner [Q6], ADR-03 round 5/6): провенанс dtype_orig
 //     — top-level поле описания: исходный dtype весов до конверсии;
 //     однородный источник → "f32"/"bf16"/"f16", смешанный источник — поле
 //     не пишется (скаляр неоднозначен; полный состав — в Stats конвертера
@@ -68,16 +68,30 @@
 //     Классификация слоёв — по факту шардов (per-layer инфраструктура
 //     round 5 [R3] переиспользуется); d_ff routed-экспертов — из тензора
 //     первого MoE-слоя, при наличии config-ключа moe_intermediate_size —
-//     перекрёстная сверка (несогласованность — честный SchemaMismatch);
-//     norm_topk_prob=false — честный SchemaMismatch (схема фиксирует
-//     router "softmax-topk" с нормализацией вероятностей topk).
-//     ОСОБЕННОСТЬ ВНЕ покрытых op'ов: per-head RMSNorm q/k — тензоры
-//     self_attn.{q,k}_norm.weight (форма [d_head], каждый слой, зонд
-//     подтверждён) — op attention исполняет проекции q/k БЕЗ qk-нормализации,
-//     op rmsnorm нормирует только hidden → честный SchemaMismatch с точной
-//     причиной (НЕ фальшивая поддержка: неизвестные группы ops_runner
-//     не потребляет — план исполнялся бы с неверными логитами; расширение
-//     схемы + семантика — поток core, стыковая точка).
+//     перекрёстная сверка (несогласованность — честный SchemaMismatch).
+//   - [R1] round 7 (ADR-09 round 7): per-head RMSNorm q/k — тензоры
+//     self_attn.{q,k}_norm.weight (форма [d_head]/[d_kv], Qwen3-класс,
+//     каждый слой по зонду) → группы "l{layer}.attn.q_norm"/"l{layer}.
+//     attn.k_norm" (роль attn, dtype тензора источника по канону норм:
+//     F32/F16, BF16 → F16 clamp-сатурация, [R5] round 5). Группа —
+//     шаблон с cardinality {layer} при наличии qk-норм ВЕЗДЕ, literal
+//     per-layer — при смешанном наборе (слой без ОБЕИХ групп — прежнее
+//     поведение; частичный набор в слое (q есть, k нет или наоборот) —
+//     честный SchemaMismatch). eps — из config.json rms_norm_eps →
+//     параметр op attention "qk_eps" (пишется ТОЛЬКО при наличии qk-групп;
+//     qk-тензоры без rms_norm_eps в config — честный SchemaMismatch,
+//     не дефолт-догадка). Семантика исполнения — ops_runner (поток core,
+//     имя-стыковая точка: группы l{layer}.attn.{q,k}_norm + параметр
+//     qk_eps у op attention).
+//   - [R2] round 7 (ADR-09 round 7): router_renorm — top-level поле
+//     описания: config norm_topk_prob=false → "router_renorm": false
+//     (topk-веса роутера без перенормировки, Qwen3Moe-класс); при true
+//     или отсутствии ключа поле НЕ пишется (дефолт true — семантика
+//     round 1, канонизированная golden'ом; старые описания и побитовые
+//     golden не меняются). Контракт: MoeSpec::router_renorm (дефолт true),
+//     парсинг — parse_model_description (top-level; class=dense +
+//     router_renorm=false → DescriptionError). Исполнение — ops_runner
+//     (поток core).
 //
 // Dtype групп (канон ADR-09 block32, [R4] «смешанный план»): dtype_weights —
 // аргумент profile ("F16" по умолчанию; "NVFP4"/"W4A16" — квантование
@@ -310,45 +324,67 @@ std::string hf_to_description(const std::string& hf_dir,
                               "Qwen1.5MoeForCausalLM, OlmoeForCausalLM, "
                               "MixtralForCausalLM, Qwen3MoeForCausalLM)");
 
-    // [R6-добор] per-head RMSNorm q/k (Qwen3-класс: тензоры
-    // self_attn.{q,k}_norm.weight, форма [d_head], каждый слой — зонд реального
-    // Qwen3-30B-A3B). Архитектурная особенность ВНЕ покрытых op'ов: op
-    // attention исполняет проекции q/k без qk-нормализации, op rmsnorm
-    // нормирует только hidden. Честный SchemaMismatch с точной причиной —
-    // НЕ фальшивая поддержка (группы без семантики в ops_runner не
-    // потребляются — план исполнялся бы с неверными логитами; расширение
-    // схемы + семантика — поток core, стыковая точка). Проверка — для ВСЕХ
-    // архитектур (ни одна поддержанная не несёт qk-norm; фикстура — по
-    // факту шардов, не по имени архитектуры).
+    // [R1] round 7 (ADR-09 round 7): per-head RMSNorm q/k — тензоры
+    // self_attn.{q,k}_norm.weight (Qwen3-класс, форма [d_head]/[d_kv] —
+    // зонд реального Qwen3-30B-A3B). Вместо отказа round 6 — генерация
+    // групп "l{layer}.attn.{q,k}_norm" (роль attn, dtype тензора источника
+    // по канону норм) + параметр op attention "qk_eps" из config.json
+    // rms_norm_eps. Политика честного fail-fast сохраняется:
+    //  - частичный набор в слое (q есть, k нет или наоборот) —
+    //    SchemaMismatch (односторонне нормализованный attention не имеет
+    //    покрытой семантики, ADR-09 round 7);
+    //  - qk-тензоры есть, rms_norm_eps в config отсутствует —
+    //    SchemaMismatch (eps не дефолт-догадка);
+    //  - слой без ОБЕИХ групп — прежнее поведение (групп нет; Llama/
+    //    Mixtral и побитовые golden не меняются).
+    std::vector<char> layer_qk(static_cast<std::size_t>(n_layers), 0);
+    bool has_qk_norm = false;
     for (std::int64_t i = 0; i < static_cast<std::int64_t>(n_layers); ++i) {
         const std::string li = "model.layers." + std::to_string(i) + ".";
-        for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
-            if (find_tensor(li + nm))
-                throw LoaderError(LoaderError::Code::SchemaMismatch,
-                                  "hf: слой " + std::to_string(i) + ": тензор '" +
-                                      li + nm + "' (per-head RMSNorm q/k, Qwen3-класс) — "
-                                      "архитектурная особенность вне покрытых op'ов схемы: "
-                                      "op attention исполняет проекции q/k БЕЗ qk-нормализации, "
-                                      "op rmsnorm нормирует только hidden — честный отказ "
-                                      "(описание с этими группами исполнялось бы с неверными "
-                                      "логитами; расширение схемы + семантика — ops_runner, "
-                                      "поток core)");
+        const bool q = find_tensor(li + "self_attn.q_norm.weight") != nullptr;
+        const bool k = find_tensor(li + "self_attn.k_norm.weight") != nullptr;
+        if (q != k)
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "hf: слой " + std::to_string(i) + ": частичный "
+                              "набор per-head RMSNorm q/k (self_attn.q_norm=" +
+                              std::string(q ? "есть" : "нет") + ", self_attn.k_norm=" +
+                              std::string(k ? "есть" : "нет") + ") — односторонне "
+                              "нормализованный attention не имеет покрытой семантики "
+                              "(честный SchemaMismatch, ADR-09 round 7)");
+        if (q) {
+            layer_qk[static_cast<std::size_t>(i)] = 1;
+            has_qk_norm = true;
         }
     }
+    // eps для qk-норм: только из config.json (не дефолт-догадка, ADR-09
+    double qk_eps = 0.0;
+    if (has_qk_norm) {
+        const JsonValue* ev = cfg.find("rms_norm_eps");
+        if (!ev || (ev->type != JsonValue::Type::Int &&
+                    ev->type != JsonValue::Type::Double))
+            throw LoaderError(LoaderError::Code::SchemaMismatch,
+                              "hf: тензоры self_attn.{q,k}_norm.weight есть, а "
+                              "rms_norm_eps в config.json отсутствует — eps per-head "
+                              "RMSNorm не переносится по умолчанию (честный "
+                              "SchemaMismatch, ADR-09 round 7)");
+        qk_eps = ev->type == JsonValue::Type::Int
+                     ? static_cast<double>(ev->int_v)
+                     : ev->double_v;
+    }
 
-    // [R6-добор] Честная router-семантика MoE: схема фиксирует
-    // "router":"softmax-topk" с нормализацией вероятностей topk
-    // (Qwen2Moe/Qwen3Moe/Mixtral — norm_topk_prob=true). Явный false в
-    // config — непокрытая конфигурация (семантика маршрутизации другая);
-    // отсутствие ключа — прежнее поведение (старые фикстуры/чекпоинты).
+    // [R2] round 7 (ADR-09 round 7): router_renorm — перенос семантики
+    // config norm_topk_prob в описание. Отказ round 6 снят: явный false →
+    // top-level поле описания "router_renorm": false (topk-веса роутера
+    // без перенормировки, Qwen3Moe-класс; исполнение — ops_runner, поток
+    // core). true/отсутствие ключа — поле НЕ пишется (дефолт true —
+    // семантика round 1, канонизированная golden'ом; старые описания и
+    // побитовые golden не меняются). Ключ читается только для MoE-классов
+    // (у dense роутера нет).
+    bool router_renorm = true;
     if (moe_per_expert || moe_stacked) {
         if (const JsonValue* v = cfg.find("norm_topk_prob");
-            v && v->type == JsonValue::Type::Bool && !v->bool_v)
-            throw LoaderError(LoaderError::Code::SchemaMismatch,
-                              "hf: config.json: norm_topk_prob=false — router без "
-                              "нормализации вероятностей topk не покрыт (схема "
-                              "фиксирует router 'softmax-topk' с нормализацией: "
-                              "Qwen2Moe/Qwen3Moe/Mixtral); непокрытая конфигурация");
+            v && v->type == JsonValue::Type::Bool)
+            router_renorm = v->bool_v;
     }
 
     const std::int64_t dm = static_cast<std::int64_t>(d_model);
@@ -386,8 +422,72 @@ std::string hf_to_description(const std::string& hf_dir,
                                 "layers.{layer}.kv_cache", {{card_key, L}},
                                 "", /*kv_block=*/true));
 
+    // --- [R1] round 7: группы per-head RMSNorm q/k ----------------------------
+    // Форма — вектор веса на голову: q_norm [d_head], k_norm [d_kv]
+    // (== [d_head] в поддержанных arch). Роль attn, dtype тензора
+    // источника (канон норм: F32/F16, BF16 → F16 clamp-сатурация и
+    // счётчик — source_group_dtype, [R5] round 5). Ровно все слои →
+    // шаблон с cardinality {layer: L} (компактно, как у attn-норм);
+    // смешанный набор (часть слоёв с qk-нормами, часть без — слой без
+    // ОБЕИХ групп легитимен, ADR-09 round 7) → literal per-layer группы
+    // (pad3-конвенция, как в per-layer плане [R3] round 5). Формы
+    // сверяются с фактом шардов (check_shape; энергичная валидация §6
+    // дополнительно разрешает ВСЕ группы).
+    if (has_qk_norm) {
+        const bool uniform_qk = [&] {
+            for (std::int64_t i = 0; i < L; ++i)
+                if (!layer_qk[static_cast<std::size_t>(i)]) return false;
+            return true;
+        }();
+        const std::int64_t dh = static_cast<std::int64_t>(d_head);
+        if (uniform_qk) {
+            // Формы слоя 0 — привязка шаблона к факту шардов (остальные
+            // слои проверит энергичная валидация §6).
+            check_shape("model.layers.0.self_attn.q_norm.weight", {dh});
+            check_shape("model.layers.0.self_attn.k_norm.weight", {dkv});
+            groups.push_back(make_group("l{layer}.attn.q_norm", "attn", {dh},
+                                        source_group_dtype(
+                                            "model.layers.0.self_attn.q_norm.weight"),
+                                        lp + ".self_attn.q_norm.weight",
+                                        {{card_key, L}}));
+            groups.push_back(make_group("l{layer}.attn.k_norm", "attn", {dkv},
+                                        source_group_dtype(
+                                            "model.layers.0.self_attn.k_norm.weight"),
+                                        lp + ".self_attn.k_norm.weight",
+                                        {{card_key, L}}));
+        } else {
+            auto pad3 = [](std::int64_t v) {
+                char b[8];
+                std::snprintf(b, sizeof b, "%03d", static_cast<int>(v));
+                return std::string(b);
+            };
+            for (std::int64_t i = 0; i < L; ++i) {
+                if (!layer_qk[static_cast<std::size_t>(i)]) continue;
+                const std::string src = "model.layers." + std::to_string(i);
+                check_shape(src + ".self_attn.q_norm.weight", {dh});
+                check_shape(src + ".self_attn.k_norm.weight", {dkv});
+                groups.push_back(make_group("l" + pad3(i) + ".attn.q_norm", "attn",
+                                            {dh},
+                                            source_group_dtype(src + ".self_attn.q_norm.weight"),
+                                            src + ".self_attn.q_norm.weight"));
+                groups.push_back(make_group("l" + pad3(i) + ".attn.k_norm", "attn",
+                                            {dkv},
+                                            source_group_dtype(src + ".self_attn.k_norm.weight"),
+                                            src + ".self_attn.k_norm.weight"));
+            }
+        }
+    }
+
     std::string moe_json;
     std::string ffn_op_json;
+    // [R1] round 7: параметр op attention "qk_eps" — пишется только при
+    // наличии qk-групп (eps — из config rms_norm_eps, см. проверку выше);
+    // [R2] round 7: top-level "router_renorm": false — только при
+    // norm_topk_prob=false в config (дефолт true — поле не пишется).
+    std::string qk_eps_json;
+    if (has_qk_norm) qk_eps_json = ",\"qk_eps\":" + fmt_f64(qk_eps);
+    std::string router_renorm_json;
+    if (!router_renorm) router_renorm_json = ",\"router_renorm\":false";
 
     if (dense) {
         // --- 4a. Dense (llama/qwen2-нейминг) -----------------------------------
@@ -547,17 +647,55 @@ std::string hf_to_description(const std::string& hf_dir,
         if (dff <= 0)
             throw LoaderError(LoaderError::Code::SchemaMismatch,
                               "hf: expert_d_ff обязана быть > 0");
-        // [R6-добор] Qwen3Moe: config-ключ moe_intermediate_size (если есть)
-        // обязана согласоваться с фактом шардов (d_ff — из тензора первого
-        // MoE-слоя); несогласованность — честный SchemaMismatch (НЕ догадка).
-        if (const JsonValue* v = cfg.find("moe_intermediate_size");
-            v && v->type == JsonValue::Type::Int &&
-            static_cast<std::int64_t>(v->int_v) != dff)
-            throw LoaderError(LoaderError::Code::SchemaMismatch,
-                              "hf: config.json: moe_intermediate_size=" +
-                                  std::to_string(v->int_v) +
-                                  " != факту шардов (d_ff routed-экспертов = " +
-                                  fmt_int(dff) + ") — непокрытая конфигурация");
+        // [R2] round 7 (перекрёстная сверка config ↔ тензоры): moe_intermediate_size
+        // из config сверяется против ФАКТИЧЕСКОЙ формы экспертных тензоров
+        // первого MoE-слоя — e{expert}.gate/up/down ВСЕХ экспертов (gate/up:
+        // [d_ff, d_model], down: [d_model, d_ff]); несогласованность config ↔
+        // тензоры (или экспертов между собой) — честный SchemaMismatch (НЕ догадка).
+        {
+            const std::string base = "model.layers." + std::to_string(first_moe) +
+                                     ".mlp.experts.";
+            const std::string sfx[3] = {layer_expert_suffix(first_moe, 0),
+                                        layer_expert_suffix(first_moe, 1),
+                                        layer_expert_suffix(first_moe, 2)};
+            for (std::int64_t e = 0; e < static_cast<std::int64_t>(n_experts); ++e) {
+                const std::string ep = base + std::to_string(e);
+                if (const TensorInfo* t = find_tensor(ep + ".gate" + sfx[0]);
+                    t && (t->shape.size() != 2 || t->shape[0] != dff || t->shape[1] != dm))
+                    throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                      "hf: тензор '" + ep + ".gate" + sfx[0] +
+                                          "': форма " + fmt_shape(t->shape) +
+                                          " != фактической [d_ff, d_model] первого MoE-слоя "
+                                          "(d_ff = " + fmt_int(dff) + ") — эксперты "
+                                          "неоднородны (честный SchemaMismatch)");
+                if (const TensorInfo* t = find_tensor(ep + ".up" + sfx[1]);
+                    t && (t->shape.size() != 2 || t->shape[0] != dff || t->shape[1] != dm))
+                    throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                      "hf: тензор '" + ep + ".up" + sfx[1] +
+                                          "': форма " + fmt_shape(t->shape) +
+                                          " != фактической [d_ff, d_model] первого MoE-слоя "
+                                          "(d_ff = " + fmt_int(dff) + ") — эксперты "
+                                          "неоднородны (честный SchemaMismatch)");
+                if (const TensorInfo* t = find_tensor(ep + ".down" + sfx[2]);
+                    t && (t->shape.size() != 2 || t->shape[1] != dff || t->shape[0] != dm))
+                    throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                      "hf: тензор '" + ep + ".down" + sfx[2] +
+                                          "': форма " + fmt_shape(t->shape) +
+                                          " != фактической [d_model, d_ff] первого MoE-слоя "
+                                          "(d_ff = " + fmt_int(dff) + ") — эксперты "
+                                          "неоднородны (честный SchemaMismatch)");
+            }
+            if (const JsonValue* v = cfg.find("moe_intermediate_size");
+                v && v->type == JsonValue::Type::Int &&
+                static_cast<std::int64_t>(v->int_v) != dff)
+                throw LoaderError(LoaderError::Code::SchemaMismatch,
+                                  "hf: config.json: moe_intermediate_size=" +
+                                      std::to_string(v->int_v) +
+                                      " != фактической форме экспертных тензоров первого "
+                                      "MoE-слоя (e{expert}.gate/up/down, d_ff = " +
+                                      fmt_int(dff) + ") — config не соответствует "
+                                      "шардам (честный SchemaMismatch)");
+        }
         for (std::int64_t i = 0; i < L; ++i) {
             if (!moe_layer[static_cast<std::size_t>(i)]) continue;
             check_shape("model.layers." + std::to_string(i) + ".mlp.experts.0.gate" +
@@ -874,6 +1012,10 @@ std::string hf_to_description(const std::string& hf_dir,
     json_escape(json, name);
     json += "\",\"class\":\"" + std::string(moe_stacked || moe_per_expert ? "moe" : "dense") +
             "\",\"dtype_weights\":\"" + dtype_weights + "\"";
+    // [R2] round 7: top-level "router_renorm": false — только при явном
+    // norm_topk_prob=false в config (дефолт true — поле НЕ пишется: старые
+    // описания и побитовые golden не меняются).
+    json += router_renorm_json;
     json += ",\"vocab_size\":" + fmt_int(static_cast<std::int64_t>(vocab_size));
     json += ",\"d_model\":" + fmt_int(dm);
     json += ",\"n_layers\":" + fmt_int(L);
@@ -891,6 +1033,10 @@ std::string hf_to_description(const std::string& hf_dir,
     const double rope_theta = cfg_f64("rope_theta", false, 0.0);
     if (rope_theta > 0.0)  // rope-параметр ([R4]: из config.json)
         json += ",\"rope_theta\":" + fmt_f64(rope_theta);
+    // [R1] round 7: eps per-head RMSNorm q/k — параметр "qk_eps" op'а
+    // attention; пишется ТОЛЬКО при наличии qk-групп (см. выше; без групп
+    // параметр не пишется — прежние описания побитово).
+    json += qk_eps_json;
     json += "}}";
     if (!ffn_op_json.empty()) json += ffn_op_json;
     if (moe_stacked || moe_per_expert)

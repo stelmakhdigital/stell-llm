@@ -344,9 +344,9 @@ std::vector<SynthTensor> qwen3_moe_hf_tensors() {
     return ts;
 }
 
-// [R6-добор] Та же фикстура + qk-norm тензоры (форма [d_head]=[4], каждый
-// слой — как в реальном чекпоинте) — архитектурная особенность вне покрытых
-// op'ов → честный SchemaMismatch.
+// [R1] round 7: та же фикстура + qk-norm тензоры (форма [d_head]=[4], каждый
+// слой — как в реальном чекпоинте) — per-head RMSNorm q/k генерируется в
+// группы l{layer}.attn.{q,k}_norm (ADR-09 round 7; отказ round 6 снят).
 std::vector<SynthTensor> qwen3_moe_qknorm_hf_tensors() {
     auto ts = qwen3_moe_hf_tensors();
     for (int layer = 0; layer < 2; ++layer) {
@@ -359,13 +359,26 @@ std::vector<SynthTensor> qwen3_moe_qknorm_hf_tensors() {
     return ts;
 }
 
+// [R1] round 7: частичный набор — только q_norm (k_norm нет) → честный
+// SchemaMismatch (односторонне нормализованный attention не имеет покрытой
+// семантики).
+std::vector<SynthTensor> qwen3_moe_qknorm_partial_hf_tensors() {
+    auto ts = qwen3_moe_hf_tensors();
+    for (int layer = 0; layer < 2; ++layer)
+        ts.push_back(tensor("model.layers." + std::to_string(layer) +
+                            ".self_attn.q_norm.weight", "F16", {4},
+                            f16_det(4, layer * 5 + 71)));
+    return ts;
+}
+
 // [R6-добор] config Qwen3Moe-класса: ключи — по факту зонда реального
 // config.json (moe_intermediate_size, num_experts_per_tok, norm_topk_prob,
 // head_dim; intermediate_size — dense-fallback, в однородном MoE не читается;
 // decoder_sparse_step=1 + mlp_only_layers=[] — все слои MoE). Параметры —
-// для error-кейсов (norm_topk=false; moe_ff != факту шардов).
+// для error-кейсов (norm_topk=false; moe_ff != факту шардов; без
+// rms_norm_eps при qk-нормах).
 void write_config_qwen3(const std::string& dir, bool norm_topk = true,
-                        int moe_ff = 8) {
+                        int moe_ff = 8, bool rms_eps = true) {
     std::filesystem::create_directories(dir);
     std::string cfg = std::string(
         "{\n"
@@ -376,7 +389,6 @@ void write_config_qwen3(const std::string& dir, bool norm_topk = true,
         "  \"num_key_value_heads\": 1,\n"
         "  \"head_dim\": 4,\n"
         "  \"vocab_size\": 16,\n"
-        "  \"rms_norm_eps\": 1e-06,\n"
         "  \"rope_theta\": 10000.0,\n"
         "  \"intermediate_size\": 16,\n"
         "  \"moe_intermediate_size\": ") +
@@ -391,6 +403,10 @@ void write_config_qwen3(const std::string& dir, bool norm_topk = true,
         "  \"mlp_only_layers\": [],\n"
         "  \"tie_word_embeddings\": false\n"
         "}\n");
+    if (rms_eps) {
+        const std::size_t pos = cfg.find("\"rope_theta\"");
+        cfg.insert(pos, std::string("  \"rms_norm_eps\": 1e-06,\n"));
+    }
     std::FILE* f = std::fopen((dir + "/config.json").c_str(), "wb");
     if (!f) throw std::runtime_error("config.json");
     std::fwrite(cfg.data(), 1, cfg.size(), f);
@@ -1221,7 +1237,7 @@ void body() {
     //     Qwen/Qwen3-30B-A3B-Instruct-2507): роутер mlp.gate.weight,
     //     поэертельные эксперты, однородный MoE БЕЗ shared-expert (легитимно),
     //     lm_head; config-маппинг moe_intermediate_size/num_experts_per_tok/
-    //     norm_topk_prob; qk-norm — честный SchemaMismatch; roundtrip побитово.
+    //     norm_topk_prob; qk-norm — группы attn.{q,k}_norm (round 7); roundtrip побитово.
     // =========================================================================
     const std::string q3_dir = out_dir("/tmp/stell_hf_qwen3moe");
     {
@@ -1275,43 +1291,140 @@ void body() {
                          se::PlainWeightsNVFP4W4A16);
         std::printf("moe (Qwen3MoeForCausalLM, NVFP4): roundtrip логитов OK (побитно)\n");
     }
-    // (а) qk-norm тензоры (как в реальном чекпоинте) → честный SchemaMismatch
-    //     с точной причиной (не покрыт op'ами схемы).
+    // (а) [R1] round 7: qk-norm тензоры (как в реальном чекпоинте) —
+    //     генерация БЕЗ SchemaMismatch: группы l{layer}.attn.{q,k}_norm
+    //     ([d_head]/[d_kv], dtype источника), параметр op attention
+    //     "qk_eps" из config rms_norm_eps; roundtrip побитово.
     {
         const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_qknorm");
         write_config_qwen3(dir);
         write_shards(dir, qwen3_moe_qknorm_hf_tensors());
-        try {
-            hf_to_description(dir, "F16");
-            CHECK_MSG(false && "expected LoaderError", "qk-norm → SchemaMismatch");
-        } catch (const LoaderError& e) {
-            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
-                      "qk-norm: код ошибки != SchemaMismatch");
-            const std::string msg = e.what();
-            CHECK_MSG(msg.find("self_attn.q_norm.weight") != std::string::npos ||
-                          msg.find("self_attn.k_norm.weight") != std::string::npos,
-                      "qk-norm: сообщение называет тензор");
-            CHECK_MSG(msg.find("op attention") != std::string::npos,
-                      "qk-norm: сообщение называет причину (op attention)");
-        }
+        const std::string json = hf_to_description(dir, "F16");
+        const JsonValue root = json_parse(json);
+        // Параметр op attention: qk_eps == rms_norm_eps из config (1e-06).
+        const std::vector<JsonValue>& ops = root.get_array("ops").array_v;
+        CHECK(ops[1].get_string("op") == "attention");
+        const JsonValue* qk_eps = ops[1].find("params")->find("qk_eps");
+        CHECK_MSG(qk_eps != nullptr, "qk_eps: параметр op attention отсутствует");
+        const double qk_eps_val = qk_eps->type == JsonValue::Type::Double
+                                      ? qk_eps->double_v
+                                      : static_cast<double>(qk_eps->int_v);
+        CHECK(std::fabs(qk_eps_val - 1e-6) < 1e-12);
+        const ModelDescription d = parse_model_description(json, "hf-qwen3moe-qk");
+        // Группы: прежние 43 + 2 слоя × (q_norm + k_norm) = 47.
+        CHECK(d.groups.size() == 47);
+        const int qn0 = find_group(d, "l000.attn.q_norm");
+        CHECK((qn0 >= 0) &&
+              d.group_source_patterns[qn0] ==
+                  "model.layers.0.self_attn.q_norm.weight");
+        CHECK((d.groups[qn0].shape == std::vector<std::int64_t>{4}));
+        CHECK(d.groups[qn0].dtype == stell::tiers::DType::F16);
+        const int kn1 = find_group(d, "l001.attn.k_norm");
+        CHECK((kn1 >= 0) &&
+              d.group_source_patterns[kn1] ==
+                  "model.layers.1.self_attn.k_norm.weight");
+        CHECK((d.groups[kn1].shape == std::vector<std::int64_t>{4}));
+        const std::string single = write_single(
+            "/tmp/stell_hf_qwen3moe_qknorm_single.safetensors",
+            qwen3_moe_qknorm_hf_tensors());
+        roundtrip_logits(d, dir, single, "/tmp/stell_hf_qwen3moe_qknorm_out",
+                         se::PlainWeightsSafetensors);
+        std::printf("moe (Qwen3Moe, qk-norm): группы attn.{q,k}_norm + qk_eps; roundtrip OK (побитно)\n");
     }
-    // (б) norm_topk_prob=false → честный SchemaMismatch (router-семантика
-    //     без нормализации topk не покрыта).
+    // (а-2) [R1] round 7: частичный набор (только q_norm, k_norm нет) →
+    //     честный SchemaMismatch.
     {
-        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_notopk");
-        write_config_qwen3(dir, /*norm_topk=*/false);
-        write_shards(dir, qwen3_moe_hf_tensors());
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_qkpartial");
+        write_config_qwen3(dir);
+        write_shards(dir, qwen3_moe_qknorm_partial_hf_tensors());
         try {
             hf_to_description(dir, "F16");
             CHECK_MSG(false && "expected LoaderError",
-                      "norm_topk_prob=false → SchemaMismatch");
+                      "частичный qk-набор → SchemaMismatch");
         } catch (const LoaderError& e) {
             CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
-                      "norm_topk_prob=false: код != SchemaMismatch");
-            CHECK_MSG(std::string(e.what()).find("norm_topk_prob") !=
-                          std::string::npos,
-                      "norm_topk_prob=false: сообщение называет ключ");
+                      "частичный qk-набор: код != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("k_norm") != std::string::npos,
+                      "частичный qk-набор: сообщение называет отсутствующий тензор");
         }
+    }
+    // (а-3) [R1] round 7: qk-тензоры есть, rms_norm_eps в config нет →
+    //     честный SchemaMismatch (eps не дефолт-догадка).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_qknoeps");
+        write_config_qwen3(dir, /*norm_topk=*/true, /*moe_ff=*/8,
+                           /*rms_eps=*/false);
+        write_shards(dir, qwen3_moe_qknorm_hf_tensors());
+        try {
+            hf_to_description(dir, "F16");
+            CHECK_MSG(false && "expected LoaderError",
+                      "qk-нормы без rms_norm_eps → SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "qk-нормы без rms_norm_eps: код != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("rms_norm_eps") !=
+                          std::string::npos,
+                      "qk-нормы без rms_norm_eps: сообщение называет ключ");
+        }
+    }
+    // (б) [R2] round 7: norm_topk_prob=false — генерация БЕЗ SchemaMismatch:
+    //     top-level "router_renorm": false; roundtrip побитово; парсер
+    //     читает MoeSpec::router_renorm == false. Плюс дефолт: без ключа
+    //     (norm_topk=true) поле НЕ пишется, MoeSpec::router_renorm == true.
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_notopk");
+        write_config_qwen3(dir, /*norm_topk=*/false);
+        const auto ts = qwen3_moe_hf_tensors();
+        write_shards(dir, ts);
+        const std::string json = hf_to_description(dir, "F16");
+        const JsonValue root = json_parse(json);
+        const JsonValue* rr = root.find("router_renorm");
+        CHECK_MSG(rr != nullptr && rr->type == JsonValue::Type::Bool && !rr->bool_v,
+                  "norm_topk_prob=false: top-level router_renorm:false отсутствует");
+        const ModelDescription d = parse_model_description(json, "hf-qwen3moe-nr");
+        CHECK_MSG(d.moe && !d.moe->router_renorm,
+                  "парсер: MoeSpec::router_renorm != false");
+        const std::string single =
+            write_single("/tmp/stell_hf_qwen3moe_notopk_single.safetensors", ts);
+        roundtrip_logits(d, dir, single, "/tmp/stell_hf_qwen3moe_notopk_out",
+                         se::PlainWeightsSafetensors);
+        std::printf("moe (Qwen3Moe, norm_topk_prob=false): router_renorm:false; roundtrip OK (побитно)\n");
+    }
+    // (б-2) [R2] round 7: дефолт — поле router_renorm НЕ пишется (побитовые
+    //     golden не меняются); парсер: отсутствие поля → true.
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_topk");
+        write_config_qwen3(dir, /*norm_topk=*/true);
+        write_shards(dir, qwen3_moe_hf_tensors());
+        const std::string json = hf_to_description(dir, "F16");
+        CHECK_MSG(json.find("router_renorm") == std::string::npos,
+                  "дефолт: поле router_renorm написано (побитовые golden меняются)");
+        const ModelDescription d = parse_model_description(json, "hf-qwen3moe-df");
+        CHECK_MSG(d.moe && d.moe->router_renorm,
+                  "парсер: отсутствие router_renorm → true");
+    }
+    // (б-4) [R2] round 7: парсер — class=dense + router_renorm=false →
+    //     DescriptionError; router_renorm не-bool → DescriptionError.
+    {
+        const char* dense_min = R"({
+  "schema": "1.0", "name": "dense-rr-false", "class": "dense",
+  "dtype_weights": "F16",
+  "vocab_size": 16, "d_model": 8, "n_layers": 1, "n_heads": 2, "d_head": 4,
+  "kv": {"dtype": "F16", "n_kv_heads": 1, "d_kv": 4, "quant": null},
+  "router_renorm": false,
+  "ops": [{"op": "rmsnorm", "io": ["hidden"], "params": {"eps": 1e-5}}],
+  "tensor_groups": [
+    {"name": "embed", "role": "attn", "shape": [16, 8], "dtype": "F16",
+     "source_pattern": "embedding.weight"}
+  ]
+})";
+        bool threw = false;
+        try {
+            parse_model_description(dense_min, "test");
+        } catch (const DescriptionError&) {
+            threw = true;
+        }
+        CHECK_MSG(threw, "dense + router_renorm=false: DescriptionError отсутствует");
     }
     // (в) moe_intermediate_size != факту шардов → честный SchemaMismatch
     //     (перекрёстная сверка config ↔ тензоры).
@@ -1329,6 +1442,32 @@ void body() {
             CHECK_MSG(std::string(e.what()).find("moe_intermediate_size") !=
                           std::string::npos,
                       "moe_intermediate_size: сообщение называет ключ");
+        }
+    }
+    // (в-2) [R2] round 7: moe_intermediate_size согласована с expert 0, но
+    //     фактическая форма ДРУГОГО эксперта отличается → честный
+    //     SchemaMismatch (сверка против e{expert}.gate/up/down ВСЕХ
+    //     экспертов первого MoE-слоя).
+    {
+        const std::string dir = out_dir("/tmp/stell_hf_qwen3moe_moef2");
+        write_config_qwen3(dir, /*norm_topk=*/true, /*moe_ff=*/8);
+        auto ts = qwen3_moe_hf_tensors();
+        // Эксперт 2 слоя 0: down [8, 16] вместо [8, 8] (d_ff другого
+        // эксперта не соответствует факту первого MoE-слоя).
+        for (auto& t : ts)
+            if (t.name == "model.layers.0.mlp.experts.2.down_proj.weight")
+                t.shape = {8, 16};
+        write_shards(dir, ts);
+        try {
+            hf_to_description(dir, "F16");
+            CHECK_MSG(false && "expected LoaderError",
+                      "эксперт 2: форма != факту первого MoE-слоя → SchemaMismatch");
+        } catch (const LoaderError& e) {
+            CHECK_MSG(e.code() == LoaderError::Code::SchemaMismatch,
+                      "неоднородный эксперт: код != SchemaMismatch");
+            CHECK_MSG(std::string(e.what()).find("experts.2.down") !=
+                          std::string::npos,
+                      "неоднородный эксперт: сообщение называет тензор");
         }
     }
 

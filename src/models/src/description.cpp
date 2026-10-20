@@ -298,6 +298,20 @@ ModelDescription parse_model_description(const std::string& json_text,
             d.moe = m;
         }
 
+        // [R2] round 7 (ADR-09 round 7): опциональное top-уровневое поле
+        // router_renorm (bool; отсутствие — дефолт true, прежние описания
+        // читаются без изменений). class=dense роутера не имеет — явный
+        // false недопустим (честный отказ, не тихое игнорирование поля).
+        if (const JsonValue* rr = root.find("router_renorm"); rr) {
+            if (rr->type != JsonValue::Type::Bool)
+                fail(source_name, "router_renorm must be a bool");
+            if (!rr->bool_v && !d.is_moe)
+                fail(source_name,
+                     "router_renorm=false при class=dense: роутера нет — "
+                     "поле неприменимо (честный отказ)");
+            if (d.is_moe) d.moe->router_renorm = rr->bool_v;
+        }
+
         for (const auto& op : root.get_array("ops").array_v) {
             if (op.type != JsonValue::Type::Object) fail(source_name, "ops entries must be objects");
             d.ops.push_back(parse_op(op, source_name, d.ops.size()));
