@@ -236,7 +236,8 @@ CPU-контракты + single-card подтверждение — постоя
 ## Дополнение round 7 ([R1]/[R2], T-20261017200354, вердикт round 6: approve)
 
 ADR-09 «Уточнение round 7» — qk-norm (`attn.q_norm`/`attn.k_norm`,
-per-head RMSNorm `[head_dim]`, eps из config) и опциональное поле
+per-head RMSNorm `[d_head]`/`[d_kv]`, eps из config `rms_norm_eps`) и
+опциональное поле
 `router_renorm` (дефолт true; false — без перенормировки topk-весов,
 config `norm_topk_prob=false`):
 

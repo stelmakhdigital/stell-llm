@@ -14,7 +14,7 @@ ADR-08…ADR-12 — только через ADR и согласование с w
 | [ADR-06](ADR-06-api-port.md) | API — один процесс на порту 8080 | Принято |
 | [ADR-07](ADR-07-build.md) | Сборка — CMake; CI на CPU-путях | Принято |
 | [ADR-08](ADR-08-engine-tiers.md) | Контракт engine ↔ tiers — тензорные группы | Принято (+уточнения round 1) |
-| [ADR-09](ADR-09-engine-models.md) | Контракт engine ↔ models — декларативные описания | Принято (+уточнения rounds 1/2/5/6) |
+| [ADR-09](ADR-09-engine-models.md) | Контракт engine ↔ models — декларативные описания | Принято (+уточнения rounds 1/2/5/6/7) |
 | [ADR-10](ADR-10-engine-parallel.md) | Контракт engine ↔ parallel — TP/EP/PP/KV-стрим | Принято (+уточнения round 1) |
 | [ADR-11](ADR-11-engine-serve.md) | Контракт engine ↔ serve — C ABI, события, метрики | Принято (+уточнения rounds 1–3/5; черновик round 6: KV-реиспользование) |
 | [ADR-12](ADR-12-tiers-models.md) | Контракт tiers ↔ models — stell-tier layout | Принято (+уточнения round 1) |

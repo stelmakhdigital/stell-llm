@@ -107,9 +107,11 @@
 ## Решения round 7 (T-20261017200354, planner [Q1]/[Q2], вердикт round 6: approve)
 
 - **qk-norm группы в описании** ([R1]): Qwen3Moe-класс содержит
-  `self_attn.{q,k}_norm` — пер-head RMSNorm, форма `[head_dim]` (вектор
-  веса на голову); конвертер генерирует группы `attn.q_norm`/`attn.k_norm`
-  с полем eps из config.json (группа без поля eps → SchemaMismatch);
+  `self_attn.{q,k}_norm` — пер-head RMSNorm, форма `[d_head]`/`[d_kv]`
+  (вектор веса на голову; роль attn, dtype тензора источника по канону
+  норм); конвертер генерирует группы `attn.q_norm`/`attn.k_norm`
+  с eps из config.json `rms_norm_eps` (qk-группы без него →
+  SchemaMismatch);
   отсутствие ОБОИХ групп — прежнее поведение; частичный набор (q_norm
   без k_norm или наоборот) → SchemaMismatch. Требование: описание
   реального Qwen3-30B-A3B генерируется без SchemaMismatch (ADR-09
@@ -117,11 +119,14 @@
 - **Опциональное поле `router_renorm`** ([R2]): дефолт true (Mixtral-семантика
   golden round 1); false = topk-веса без перенормировки (config
   `norm_topk_prob=false` — tiny-qwen2moe теперь легитимная конфигурация);
-  версионирование — по правилам ADR-09 для опциональных полей; частичная
-  настройка (renorm=false при отсутствии роутера на dense-слое) →
+  в JSON поле пишется только при false — `schema` остаётся «1.0»;
+  частичная настройка (renorm=false при class=dense / плане без
+  `mlp.router`) →
   SchemaMismatch. Перекрёстная сверка `moe_intermediate_size` — против
-  фактической формы экспертных тензоров (`e{expert}.gate/up/down`),
-  не против d_ff; несогласованность config↔тензоры → SchemaMismatch
+  фактической формы экспертных тензоров: d_ff берётся из тензора первого
+  MoE-слоя (`e{expert}.gate/up` `[d_ff, d_model]`, `down`
+  `[d_model, d_ff]`, все эксперты согласованы), config-ключ сверяется
+  против этой формы; несогласованность config↔тензоры → SchemaMismatch
   (тест на Qwen3Moe-конфиге).
 - **`ffn.shared.gate_scalar` подтверждён** ([R5]): имя — контракт
   обеих сторон (конвертер генерирует ровно `ffn.shared.gate_scalar`,
