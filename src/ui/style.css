@@ -35,3 +35,9 @@ th { color: var(--muted); font-weight: normal; }
 #log-view { max-height: 180px; overflow: auto; font: .75rem/1.4 ui-monospace, monospace;
   white-space: pre-wrap; color: var(--muted); }
 footer { padding: .8rem 1.5rem; color: var(--muted); }
+
+.note {
+  color: #b58900;
+  font-size: 0.85em;
+  margin-top: 0.4em;
+}
