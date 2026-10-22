@@ -317,7 +317,12 @@ std::string hf_to_description(const std::string& hf_dir,
     const bool moe_per_expert = (arch == "Qwen2MoeForCausalLM" ||
                                  arch == "Qwen1.5MoeForCausalLM" ||
                                  arch == "OlmoeForCausalLM" ||
-                                 arch == "Qwen3MoeForCausalLM");
+                                 arch == "Qwen3MoeForCausalLM" ||
+                                 // round 10 ([R5] ADR-13; planner T-20261022183913 R2):
+                                 // то же per-expert семейство, синтетическая
+                                 // поддержка (реальный чекпоинт — честный pending,
+                                 // см. ADR-09/отчёт round 10).
+                                 arch == "Qwen3_5MoeForConditionalGeneration");
     const bool moe_stacked = (arch == "MixtralForCausalLM");
     if (!dense && !moe_per_expert && !moe_stacked)
         throw LoaderError(LoaderError::Code::SchemaMismatch,
@@ -325,7 +330,8 @@ std::string hf_to_description(const std::string& hf_dir,
                               "' не поддержана (subset: LlamaForCausalLM, "
                               "Qwen2ForCausalLM, Qwen2MoeForCausalLM, "
                               "Qwen1.5MoeForCausalLM, OlmoeForCausalLM, "
-                              "MixtralForCausalLM, Qwen3MoeForCausalLM)");
+                              "MixtralForCausalLM, Qwen3MoeForCausalLM, "
+                              "Qwen3_5MoeForConditionalGeneration)");
 
     // [R1] round 7 (ADR-09 round 7): per-head RMSNorm q/k — тензоры
     // self_attn.{q,k}_norm.weight (Qwen3-класс, форма [head_dim] обе —
