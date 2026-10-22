@@ -86,9 +86,12 @@ std::vector<std::int32_t> SpeculativeDecoder::run(
         }
 
         // Спекулятивный раунд: драфт по ПОЛНОМУ контексту (плагин).
+        // Глубина — динамическая при adaptive_draft (ADR-13 [R2]):
+        // масштабируется скользящим accept-rate окна.
         std::vector<std::int32_t> context = prompt;
         context.insert(context.end(), out.begin(), out.end());
-        std::vector<std::int32_t> draft = drafter_(context, cfg_.n_draft);
+        std::vector<std::int32_t> draft =
+            drafter_(context, effective_n_draft());
         // Не больше, чем осталось: раунд испускает ≤ принятое+бонус.
         const std::size_t cap = remaining - 1;
         if (draft.size() > cap) draft.resize(cap);

@@ -147,6 +147,75 @@ void run() {
     for (std::size_t i = 0; i < ref2.size(); ++i)
         STELL_CHECK_MSG(got_b[i] == ref2[i], "второй слот: спекуляция != greedy");
 
+    // (г) Динамическая глубина драфта (ADR-13 [R2], DSpark): adaptive_draft —
+    //     глубина следующего раунда масштабируется скользящим accept-rate.
+    //     При высоком accept-rate глубина РАСТЁТ выше базовой; качество —
+    //     по-прежнему побитово == plain greedy.
+    SpeculativeDecoder::Config cfg3 = cfg;
+    cfg3.adaptive_draft = true;
+    cfg3.n_draft = 4;
+    cfg3.n_draft_min = 2;
+    cfg3.n_draft_max = 8;
+    // Оракул-драфтер: greedy-продолжение САМОЙ цели → каждый кандидат
+    // принимается, accept-rate окна детерминированно 1.0.
+    RealModelDrafter oracle(*target_runner, /*slot=*/85);
+    std::vector<std::size_t> requested;
+    auto wrapped = [&](const std::vector<std::int32_t>& ctx,
+                       std::size_t n) {
+        requested.push_back(n);
+        return oracle.fn()(ctx, n);
+    };
+    SpeculativeDecoder dec3(target, wrapped, cfg3, /*slot=*/83);
+    const std::vector<std::int32_t> got3 = dec3.run(prompt, n_steps);
+    STELL_CHECK(got3.size() == n_steps);
+    for (std::size_t i = 0; i < n_steps; ++i)
+        STELL_CHECK_MSG(got3[i] == ref[i],
+                        "adaptive n_draft: спекуляция != plain greedy");
+    STELL_CHECK(requested.size() > 1);
+    for (const std::size_t n : requested)
+        STELL_CHECK_MSG(n >= cfg3.n_draft_min && n <= cfg3.n_draft_max,
+                        "запрошенная глубина вне [n_draft_min, n_draft_max]");
+    // Первый раунд — пустое окно → базовая глубина; при accept-rate=1.0
+    // (оракул) глубина выросла до round(n_draft * 1.5) = 6 и держится.
+    STELL_CHECK_MSG(requested.front() == cfg3.n_draft,
+                    "первый раунд обязан использовать базовый n_draft");
+    STELL_CHECK_MSG(requested.back() == 6,
+                    "при accept-rate=1.0 глубина обязана вырасти до "
+                    "round(4 * (0.5 + 1.0)) = 6");
+    STELL_CHECK_MSG(dec3.acceptance_rate() == 1.0,
+                    "оракул-драфтер обязан давать accept-rate 1.0");
+
+    // (д) Динамическая глубина при ОТКАЗАХ: драфтер, чьи кандидаты никогда
+    //     не принимаются (accept-rate → 0) — глубина сжимается до
+    //     n_draft_min (дешёвые раунды перед отключением арбитром); качество
+    //     — по-прежнему побитово == plain greedy (коррекция бонусом).
+    std::vector<std::size_t> reject_requested;
+    auto reject_drafter = [&](const std::vector<std::int32_t>&,
+                              std::size_t n) {
+        reject_requested.push_back(n);
+        return std::vector<std::int32_t>(n, -1);   // вне словаря — отказ
+    };
+    SpeculativeDecoder::Config cfg4 = cfg;
+    cfg4.adaptive_draft = true;
+    cfg4.n_draft = 4;
+    cfg4.n_draft_min = 2;
+    cfg4.n_draft_max = 8;
+    cfg4.window = 8;
+    cfg4.warmup_rounds = 1;
+    SpeculativeDecoder dec4(target, reject_drafter, cfg4, /*slot=*/84);
+    const std::vector<std::int32_t> got4 = dec4.run(prompt, n_steps);
+    STELL_CHECK(got4.size() == n_steps);
+    for (std::size_t i = 0; i < n_steps; ++i)
+        STELL_CHECK_MSG(got4[i] == ref[i],
+                        "reject-драфтер: спекуляция != plain greedy");
+    // Первый раунд — пустое окно, базовая глубина; со второго раунда окно
+    // непустое (accept-rate 0) — глубина сжата до n_draft_min.
+    STELL_CHECK(reject_requested.size() >= 2);
+    STELL_CHECK_MSG(reject_requested[0] == cfg4.n_draft,
+                    "первый раунд обязан использовать базовый n_draft");
+    STELL_CHECK_MSG(reject_requested[1] == cfg4.n_draft_min,
+                    "при accept-rate=0 глубина обязана сжаться до n_draft_min");
+
     // Честная пометка: CPU-верификация последовательна — ускорения может не
     // быть (телектория wall_s фиксируется, арбитр решает по измерениям).
     std::printf("spec e2e: tokens==greedy (24), rounds=%llu, accept=%.3f, "

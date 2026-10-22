@@ -18,6 +18,7 @@ ADR-08…ADR-12 — только через ADR и согласование с w
 | [ADR-10](ADR-10-engine-parallel.md) | Контракт engine ↔ parallel — TP/EP/PP/KV-стрим | Принято (+уточнения round 1) |
 | [ADR-11](ADR-11-engine-serve.md) | Контракт engine ↔ serve — C ABI, события, метрики | Принято (+уточнения rounds 1–3/5; черновик round 6: KV-реиспользование) |
 | [ADR-12](ADR-12-tiers-models.md) | Контракт tiers ↔ models — stell-tier layout | Принято (+уточнения round 1) |
+| [ADR-13](ADR-13-external-practices-requirements.md) | Внешние практики — требования к спекуляции, tiering'у и планировщику | Принято (round 9; [R1]/[R2] реализованы) |
 
 Шаблон ADR: Заголовок, Статус, Контекст, Решение, Альтернативы, Последствия.
 

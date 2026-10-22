@@ -30,6 +30,8 @@
 // ============================================================================
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -50,10 +52,16 @@ public:
 
     struct Config {
         bool enabled = false;               // вкл/выкл из конфига engine
-        std::uint32_t n_draft = 4;          // драфт-токенов за раунд
+        std::uint32_t n_draft = 4;          // драфт-токенов за раунд (базовая глубина)
         double accept_target = 0.5;         // порог арбитра (accept-rate)
         std::uint32_t window = 32;          // окно калибровки (раундов)
         std::uint32_t warmup_rounds = 4;    // окно не карается до warmup
+        // Динамическая глубина драфта (ADR-13 [R2], DSpark/DeepInfer): пока
+        // окно пусто или фича выключена — базовый n_draft; далее глубина
+        // масштабируется скользящим accept-rate (см. effective_n_draft).
+        bool adaptive_draft = false;
+        std::uint32_t n_draft_min = 1;      // нижняя граница глубины
+        std::uint32_t n_draft_max = 8;      // верхняя граница глубины
     };
 
     struct Telemetry {
@@ -83,6 +91,26 @@ public:
     bool enabled() const { return cfg_.enabled; }
     const Config& config() const { return cfg_; }
     const Telemetry& telemetry() const { return tel_; }
+    // Контур был отключён АРБИТРОМ в этом окне (для снапшота
+    // features.spec_draft_reason — прецедент «configured ≠ executed»,
+    // ADR-13 [R1]): отличие от «выключен конфигом».
+    bool auto_disabled() const { return auto_disabled_; }
+    // Действующая глубина драфта СЛЕДУЮЩЕГО раунда. Политика (ADR-13 [R2],
+    // DSpark): при пустом окне — базовый n_draft; иначе
+    // n_eff = round(n_draft * (0.5 + accept_rate)), зажат в
+    // [n_draft_min, n_draft_max] — при высоком accept-rate глубина растёт,
+    // при низком — сжимается (дешёвые раунды перед отключением арбитром).
+    std::uint32_t effective_n_draft() const
+    {
+        if (!cfg_.adaptive_draft || window_proposed_ == 0) return cfg_.n_draft;
+        const double scaled = static_cast<double>(cfg_.n_draft) *
+                              (0.5 + acceptance_rate());
+        const double clamped = std::min(
+            std::max(std::round(scaled),
+                     static_cast<double>(cfg_.n_draft_min)),
+            static_cast<double>(cfg_.n_draft_max));
+        return static_cast<std::uint32_t>(clamped);
+    }
     // Скользящий accept-rate окна (0 при пустом окне — как в контроллере).
     double acceptance_rate() const
     {
