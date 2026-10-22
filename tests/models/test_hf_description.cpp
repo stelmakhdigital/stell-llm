@@ -428,11 +428,12 @@ std::vector<SynthTensor> qwen3_moe_qknorm_partial_hf_tensors() {
 // rms_norm_eps при qk-нормах).
 void write_config_qwen3(const std::string& dir, bool norm_topk = true,
                         int moe_ff = 8, bool rms_eps = true, int n_kv = 1,
-                        int n_heads = 2) {
+                        int n_heads = 2,
+                        const std::string& arch = "Qwen3MoeForCausalLM") {
     std::filesystem::create_directories(dir);
     std::string cfg = std::string(
         "{\n"
-        "  \"architectures\": [\"Qwen3MoeForCausalLM\"],\n"
+        "  \"architectures\": [\"" + arch + "\"],\n"
         "  \"hidden_size\": 8,\n"
         "  \"num_hidden_layers\": 2,\n"
         "  \"num_attention_heads\": " + std::to_string(n_heads) + ",\n"
@@ -1341,6 +1342,44 @@ void body() {
                          se::PlainWeightsNVFP4W4A16);
         std::printf("moe (Qwen3MoeForCausalLM, NVFP4): roundtrip логитов OK (побитно)\n");
     }
+    // =========================================================================
+    // 8d. [R5] round 10 (planner T-20261022183913 R2): Qwen3_5MoeForConditional
+    //     Generation — то же per-expert семейство, декларативный alias в
+    //     диспетчере архитектур. Отличие конвертера фиксируем тестом: ТОЛЬКО
+    //     имя архитектуры (структура весов/групп/ops идентична Qwen3Moe —
+    //     те же фикстурные тензоры и config, другое architectures[0]);
+    //     реестр принимает описание, конвертация — побитово тот же roundtrip.
+    //     ЧЕСТНЫЙ PENDING: проба на реальном чекпоинте (вне сети) — не выполнена,
+    //     синтетическая поддержка добавлена (см. отчёт round 10 / ADR-09).
+    // =========================================================================
+    const std::string q35_dir = out_dir("/tmp/stell_hf_qwen3_5moe");
+    {
+        const auto ts = qwen3_moe_hf_tensors();
+        write_config_qwen3(q35_dir, /*norm_topk=*/true, /*moe_ff=*/8,
+                           /*rms_eps=*/true, /*n_kv=*/1, /*n_heads=*/2,
+                           "Qwen3_5MoeForConditionalGeneration");
+        write_shards(q35_dir, ts);
+        const std::string json = hf_to_description(q35_dir, "NVFP4");
+        const JsonValue root = json_parse(json);
+        CHECK(root.get_string("class") == "moe");
+        const JsonValue& moe = root.get_object("moe");
+        CHECK(moe.get_uint("n_experts") == 4);
+        CHECK(moe.get_uint("n_experts_active") == 2);
+        // Структура == Qwen3Moe (та же фикстура): те же группы, тот же ops-хвост.
+        const ModelDescription d = parse_model_description(json, "hf-qwen3_5moe");
+        CHECK(d.groups.size() == 43);
+        const int router0 = find_group(d, "l000.mlp.router");
+        CHECK((router0 >= 0) &&
+              d.group_source_patterns[router0] ==
+                  "model.layers.0.mlp.gate.weight");
+        const std::string single =
+            write_single("/tmp/stell_hf_qwen3_5moe_single.safetensors", ts);
+        roundtrip_logits(d, q35_dir, single, "/tmp/stell_hf_qwen3_5moe_out",
+                         se::PlainWeightsNVFP4W4A16);
+        std::printf("moe (Qwen3_5MoeForConditionalGeneration, NVFP4): "
+                    "roundtrip логитов OK (побитно, alias Qwen3Moe)\n");
+    }
+
     // (а) [R1] round 7: qk-norm тензоры (как в реальном чекпоинте) —
     //     генерация БЕЗ SchemaMismatch: группы l{layer}.attn.{q,k}_norm
     //     ([d_head]/[d_kv], dtype источника), параметр op attention
