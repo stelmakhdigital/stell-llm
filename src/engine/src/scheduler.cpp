@@ -71,17 +71,33 @@ void Scheduler::finish_session(Session& s, const char* reason) {
 
 void Scheduler::step() {
     // Сбор активных сессий в батч (continuous batching: новые сессии входят
-    // в ближайший шаг — ADR-11 §2).
+    // в ближайший шаг — ADR-11 §2). [R3] ADR-13: префиллы новых сессий —
+    // под смешанным бюджетом (если задан): resident-декодеры (префилл уже
+    // сделан — completion > 0) шагают всегда; префилл, не влезший в остаток,
+    // откладывается на следующий шаг (soft target, не latency-гарантия).
     std::vector<Session*> batch;
     batch.reserve(sessions_.size());
+    std::size_t budget_left = cfg_.prefill_token_budget;
+    bool deferred_this_step = false;
     for (SessionId id : order_) {
         auto it = sessions_.find(id);
         if (it == sessions_.end()) continue;
         Session& s = it->second;
-        if (!s.finished && s.completion < static_cast<std::uint32_t>(s.req.sampling.max_tokens))
+        if (!s.finished && s.completion < static_cast<std::uint32_t>(s.req.sampling.max_tokens)) {
+            if (s.completion == 0 && cfg_.prefill_token_budget != 0) {
+                // Префилл ещё не сделан: нужен бюджет prompt_tokens.
+                const std::size_t need = s.req.prompt_tokens.size();
+                if (need > budget_left) {
+                    deferred_this_step = true;   // отложить; декодеры шагают
+                    continue;
+                }
+                budget_left -= need;
+            }
             batch.push_back(&s);
+        }
         if (batch.size() == cfg_.batch_step_max) break;
     }
+    if (deferred_this_step) ++prefill_deferred_;   // телеметрия [R3]
 
     // ADR-10 §3 + уточнение round 1: мета шага = фиксированный F32-пейлоад
     // (8 слотов = 32 байта) через allgather; ранг 0 — источник (слоты

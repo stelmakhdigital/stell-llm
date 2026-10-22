@@ -124,6 +124,71 @@ void run() {
     STELL_CHECK(sched5.submit(req) == 0);    // нет слотов
     STELL_CHECK(sched5.cancel(a));
     STELL_CHECK(sched5.submit(req) != 0);    // слот вернулся
+
+    // =========================================================================
+    // [R3] round 10 (ADR-13 [R4]): mixed-prefill budget. Входящий большой
+    // префилл не блокирует resident-декодеры: декодер делает ТЕ ЖЕ шаги в
+    // тех же раундах, что и без бюджета; префилл откладывается; телеметрия
+    // счётчика прижатых шагов: >0 при сжатии, ==0 при default (без лимита).
+    // =========================================================================
+    {
+        FixedSlotPool poolB(8, 4096);
+        FakeRunner runnerB;
+        const std::vector<std::int32_t> small_prompt = {1, 2};       // 2 токена
+        const std::vector<std::int32_t> big_prompt(100, 7);          // 100 токенов
+        const std::int32_t eos_big = 1000000;
+
+        // (1) Эталон БЕЗ бюджета (default): resident-декодер шагает.
+        Scheduler ref(runnerB, poolB);
+        SessionId ra = ref.submit([&]{ SubmitRequest r; r.prompt_tokens = small_prompt;
+            r.sampling.max_tokens = 4; r.eos_token = eos_big; return r; }());
+        ref.step();                                    // A стала resident (префилл+1 декод)
+        (void)ref.poll(ra);
+        SessionId rb = ref.submit([&]{ SubmitRequest r; r.prompt_tokens = big_prompt;
+            r.sampling.max_tokens = 2; r.eos_token = eos_big; return r; }());
+        for (int i = 0; i < 4; ++i) ref.step();
+        const std::uint32_t ref_a_completion = [&]{
+            for (const Event& e : ref.poll(ra))
+                if (e.type == Event::Type::Finish) return e.completion_tokens;
+            return 0u; }();
+        STELL_CHECK(ref_a_completion == 4);            // эталон: 4 декод-шага A
+        STELL_CHECK(ref.prefill_deferrals() == 0);     // без бюджета — 0
+
+        // (2) С бюджетом 4: B (100 токенов > бюджета) откладывается, A — шагает.
+        Scheduler::Config cfgB{};
+        cfgB.prefill_token_budget = 4;
+        Scheduler bud(runnerB, poolB, nullptr, cfgB);
+        SessionId ba = bud.submit([&]{ SubmitRequest r; r.prompt_tokens = small_prompt;
+            r.sampling.max_tokens = 4; r.eos_token = eos_big; return r; }());
+        bud.step();                                    // префилл A (2≤4) + 1 декод
+        (void)bud.poll(ba);
+        SessionId bb = bud.submit([&]{ SubmitRequest r; r.prompt_tokens = big_prompt;
+            r.sampling.max_tokens = 2; r.eos_token = eos_big; return r; }());
+        for (int i = 0; i < 4; ++i) bud.step();
+        const std::uint32_t bud_a_completion = [&]{
+            for (const Event& e : bud.poll(ba))
+                if (e.type == Event::Type::Finish) return e.completion_tokens;
+            return 0u; }();
+        STELL_CHECK_MSG(bud_a_completion == ref_a_completion,
+                        "бюджет префиллов не должен снижать число декод-шагов "
+                        "resident-сессии за те же итерации планировщика");
+        // B так и не начала декодировать (префилл отложен — больших шагов нет).
+        STELL_CHECK(bud.poll(bb).empty());
+        STELL_CHECK_MSG(bud.prefill_deferrals() == 4,
+                        "каждый из 4 шагов прижат бюджетом (B не пущена)");
+
+        // (3) Телеметрия: default (без лимита) — счётчик 0 (уже проверено на
+        //     ref); при включённом бюджете и отложенном префилле — >0 (выше).
+        //     Дополнительно: префилл, влезающий в бюджет, планируется.
+        Scheduler::Config cfgB2{};
+        cfgB2.prefill_token_budget = 8;
+        Scheduler bud2(runnerB, poolB, nullptr, cfgB2);
+        SessionId c = bud2.submit([&]{ SubmitRequest r; r.prompt_tokens = small_prompt;
+            r.sampling.max_tokens = 2; r.eos_token = eos_big; return r; }());
+        bud2.step();
+        STELL_CHECK(bud2.poll(c).size() == 1);        // префилл 2≤8 — прошёл
+        STELL_CHECK(bud2.prefill_deferrals() == 0);   // ничего не прижато
+    }
 }
 
 STELL_TEST_MAIN(run)
