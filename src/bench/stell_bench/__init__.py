@@ -11,8 +11,10 @@ bench/results/<date>-<slug>/ с логом --report.
 from .aggregate import RunMetrics, median, aggregate_runs
 from .protocol import BenchmarkProtocol, capture_env, BENCH_SESSION
 from .harness import BenchRunner, run_benchmark
+from .ppl_gate import SPEC_PPL_DELTA_FIELD, ppl_delta, ppl_from_logprobs
 from .report import write_report
 
 __all__ = ["RunMetrics", "median", "aggregate_runs", "BenchmarkProtocol",
            "capture_env", "BENCH_SESSION", "BenchRunner", "run_benchmark",
-           "write_report"]
+           "write_report", "SPEC_PPL_DELTA_FIELD", "ppl_delta",
+           "ppl_from_logprobs"]
