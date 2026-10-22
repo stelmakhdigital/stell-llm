@@ -543,6 +543,28 @@ std::unique_ptr<Awaiter> TierManager::pin_layer(std::uint32_t layer) {
     return TierAwaiter::all(std::move(parts), sink);
 }
 
+// [R1] round 10 (ADR-13 §[R3]): пиннинг произвольного подмножества групп
+// (экспертно-гранулярный tier-flow MoE-контура). Проверки — те же, что в
+// pin_layer (план активен, ключи в плане); отличие — ключи задаёт вызывающий
+// (подмножество слоя, а не весь слой), паузу меряет вызывающий.
+std::unique_ptr<Awaiter> TierManager::pin_groups(const std::vector<GroupKey>& keys) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!plan_active_.load(std::memory_order_acquire))
+            throw TierError(TierError::Code::PlanMismatch,
+                            "pin_groups: plan not set");
+        for (const GroupKey& k : keys)
+            if (!find(k.id))
+                throw TierError(TierError::Code::PlanMismatch,
+                                "pin_groups: group not in plan");
+    }
+    std::vector<std::shared_ptr<TierAwaiter>> parts;
+    parts.reserve(keys.size());
+    for (const auto& k : keys) parts.push_back(pin_internal(k));
+    // Пауза — на вызывающем (engine меряет паузу слоя как сумму групп, [R2]).
+    return TierAwaiter::all(std::move(parts), [](double) {});
+}
+
 // --- prefetch ----------------------------------------------------------------
 void TierManager::prefetch(const std::vector<GroupKey>& keys) {
     std::lock_guard<std::mutex> lk(mu_);

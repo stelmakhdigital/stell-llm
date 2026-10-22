@@ -1,0 +1,13 @@
+{
+  "bench": "tiers-hitrate-matrix",
+  "env": {"backend": "cpu", "gpu": false, "co_tenancy": true, "io_delay_ms": 2, "note": "io_delay_ms — диагностический крюк тира (детерминизм CPU-замера); абсолютные мс на GPU не переносятся", "trace_seed": 20261022, "layers": 4, "experts": 8, "tokens": 32, "passes": 3, "moe_over_vram": true},
+  "matrix": [
+    {"policy": "lru", "k": 1, "hit_rate_expert": 0.945312, "p95_groups_ms": 0.31833, "p95_layerpin_ms": 0.894853},
+    {"policy": "lru", "k": 2, "hit_rate_expert": 0.188802, "p95_groups_ms": 0.498474, "p95_layerpin_ms": 0.758213},
+    {"policy": "lru", "k": 4, "hit_rate_expert": 0.120917, "p95_groups_ms": 0.377666, "p95_layerpin_ms": 0.668173},
+    {"policy": "lcu", "k": 1, "hit_rate_expert": 0.964865, "p95_groups_ms": 0.287862, "p95_layerpin_ms": 0.794004},
+    {"policy": "lcu", "k": 2, "hit_rate_expert": 0.537037, "p95_groups_ms": 0.360687, "p95_layerpin_ms": 0.621274},
+    {"policy": "lcu", "k": 4, "hit_rate_expert": 0.692893, "p95_groups_ms": 0.322487, "p95_layerpin_ms": 0.68362}
+  ],
+  "verdict": {"cells": 6, "hit_rate_max": 0.964865, "p95_groups_le_layerpin_all": true}
+}

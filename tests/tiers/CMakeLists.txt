@@ -5,6 +5,7 @@ set(TIERS_TEST_SOURCES
   test_policy.cpp
   test_predictor.cpp
   test_manager.cpp
+  test_pin_groups.cpp
   test_stats_threads.cpp
   test_cross_arch.cpp
   test_engine_mimic.cpp
@@ -46,6 +47,24 @@ set_tests_properties(tiers/test_bench_per_group PROPERTIES TIMEOUT 120)
 add_executable(bench_tiers_pause bench_pause.cpp)
 target_include_directories(bench_tiers_pause PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/tiers/src)
 target_link_libraries(bench_tiers_pause PRIVATE stell_tiers)
+
+# [R2] round 10 (ADR-13 §[R3]): trace-driven hit-rate матрица {LRU,LCU}×{k}
+# на экспертной гранулярности; отчёт — bench/results/<date>-tiers-hitrate-matrix/.
+add_executable(bench_hitrate_matrix bench_hitrate_matrix.cpp)
+target_include_directories(bench_hitrate_matrix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/tiers/src)
+target_link_libraries(bench_hitrate_matrix PRIVATE stell_tiers)
+target_compile_definitions(bench_hitrate_matrix PRIVATE
+  STELL_REPO_ROOT="${CMAKE_SOURCE_DIR}")
+
+# [R2] round 10: тест-обёртка hit-rate матрицы (критерии spec Потока B).
+add_executable(test_hitrate_matrix test_hitrate_matrix.cpp)
+target_include_directories(test_hitrate_matrix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/tiers/src)
+target_link_libraries(test_hitrate_matrix PRIVATE stell_tiers)
+target_compile_definitions(test_hitrate_matrix PRIVATE
+  STELL_BENCH_HM_BIN="$<TARGET_FILE:bench_hitrate_matrix>"
+  STELL_REPO_ROOT="${CMAKE_SOURCE_DIR}")
+add_test(NAME tiers/test_hitrate_matrix COMMAND test_hitrate_matrix)
+set_tests_properties(tiers/test_hitrate_matrix PROPERTIES TIMEOUT 120)
 
 foreach(src IN LISTS TIERS_TEST_SOURCES)
   get_filename_component(name ${src} NAME_WE)
