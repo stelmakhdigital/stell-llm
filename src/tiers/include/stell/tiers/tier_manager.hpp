@@ -149,6 +149,19 @@ public:
     void prefetch(const std::vector<GroupKey>& keys) override;
     TierStats stats() const override;
 
+    // [R1] round 10 (ADR-13 §[R3], planner T-20261022183913 R2): пиннинг
+    // ПРОИЗВОЛЬНОГО подмножества групп (не слоя целиком) — публичный
+    // групповой API для экспертно-гранулярного tier-flow MoE-контура:
+    // engine пинует не-экспертные группы слоя + ВЫБРАННЫЕ роутером
+    // экспертные (sparse offloading), невыбранные эксперты остаются
+    // вытесняемыми. Семантика pin_layer НЕ меняется (сосуществует);
+    // каждый ключ проверяется на план (PlanMismatch), fan-in — как в
+    // pin_layer; паузу меряет ВЫЗЫВАЮЩИЙ (engine пишет её в
+    // record_layer_pause — сумма пауз групп слоя, [R2]).
+    // Расширение на конкретной реализации — ITierManager (ADR-08 §2) НЕ
+    // расширяется; прецедент set_layer_map/read_ram_slot.
+    std::unique_ptr<Awaiter> pin_groups(const std::vector<GroupKey>& keys);
+
     // --- расширения (вне контракта, см. выше) --------------------------------
     void set_layer_map(const std::vector<std::vector<GroupId>>& layers);
     void report_router_counts(const std::unordered_map<std::uint32_t, std::uint64_t>& counts);

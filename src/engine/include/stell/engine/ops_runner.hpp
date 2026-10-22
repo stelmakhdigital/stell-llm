@@ -116,7 +116,17 @@ private:
     void op_rmsnorm(std::size_t layer, std::vector<float>& hidden);
     void op_attention(std::size_t layer, std::vector<float>& hidden, SlotState& st);
     void op_ffn(std::size_t layer, std::vector<float>& hidden);
-    void op_moe(std::size_t layer, std::vector<float>& hidden);
+    void op_moe(std::size_t layer, std::vector<float>& hidden,
+                std::vector<stell::tiers::GroupKey>* pinned);
+
+    // [R1] round 10 (ADR-13 §[R3]): маршрутизация MoE — scores → softmax →
+    // top-k (stable sort, ничья → меньший индекс) → перенормировка probs.
+    // Вынесена из op_moe: вызывается ДО пина слоя (экспертно-гранулярный
+    // tier-flow: пинуются только ВЫБРАННЫЕ эксперты) и внутри op_moe
+    // (та же последовательность операций — побитовая идентичность golden).
+    std::vector<std::uint32_t> moe_route(std::size_t layer,
+                                         const std::vector<float>& hidden,
+                                         std::vector<float>* probs) const;
 
     // Dense-FFN вычисление по префиксу имени групп (<prefix>.gate/.up/.down);
     // общий путь op "ffn" и shared-expert'а ([R4]) — возврат БЕЗ residual.
@@ -124,8 +134,13 @@ private:
                                    const std::vector<float>& x,
                                    const std::string& what) const;
 
-    void pin_and_prefetch(std::size_t layer);         // ADR-08 §2/§5 (+ prefetch)
-    void unpin_layer(std::size_t layer);              // снятие пина после слоя
+    void pin_and_prefetch(std::size_t layer, bool moe_layer,
+                          std::vector<stell::tiers::GroupKey>* pinned);
+    void unpin_layer(std::size_t layer);              // снятие пина после слоя (dense)
+    // [R1] round 10 (ADR-13 §[R3]): снятие пина ровно ПИННУТОГО подмножества
+    // (MoE: не-экспертные группы слоя + выбранные эксперты; невыбранные
+    // эксперты не пиновались — unpin по ним бросил бы NotPinned).
+    void unpin_keys(const std::vector<stell::tiers::GroupKey>& keys);
     std::vector<float> forward_token(SlotState& st, std::int32_t token,
                                      bool with_logits = true);
     static void reset_slot(SlotState& st, std::size_t n_layers);

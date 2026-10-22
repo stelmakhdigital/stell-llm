@@ -321,16 +321,48 @@ void OpsInterpreter::reset_slot(SlotState& st, std::size_t n_layers) {
 }
 
 // --- tiering: pin_layer перед слоем + prefetch следующего (ADR-08 §2/§5) -----
+// [R1] round 10 (ADR-13 §[R3]): для MoE-слоя пинуется ПОДМНОЖЕСТВО групп
+// (не-экспертные attn/kv + роутер) через групповой API pin_groups; выбранные
+// роутером эксперты пинуются в op_moe (после маршрутизации); невыбранные
+// эксперты остаются вытесняемыми (sparse offloading). Dense-контур — прежний
+// pin_layer слоя целиком (поведение не изменено).
 
-void OpsInterpreter::pin_and_prefetch(std::size_t layer) {
+void OpsInterpreter::pin_and_prefetch(std::size_t layer, bool moe_layer,
+                                      std::vector<stell::tiers::GroupKey>* pinned) {
     if (!tiers_) return;
     const auto& map = plan_.layer_map();
     if (layer >= map.size()) return;
     try {
         const auto t0 = std::chrono::steady_clock::now();
-        std::unique_ptr<stell::tiers::Awaiter> a =
-            plan_.pin_layer(*tiers_, static_cast<std::uint32_t>(layer));
-        if (a) a->wait();
+        if (moe_layer) {
+            // Экспертно-гранулярный tier-flow ([R1] ADR-13): подмножество
+            // слоя БЕЗ пооертельных экспертных групп (они — после маршрута
+            // в op_moe; роутер нужен всегда — пинуем вместе с attn/kv).
+            std::vector<stell::tiers::GroupKey> keys;
+            for (const auto& gid : map[layer])
+                for (const PlannedGroup& g : plan_.groups)
+                    if (g.key.id == gid) {
+                        const bool router =
+                            g.name.find("mlp.router") != std::string::npos;
+                        // shared-эксперт используется КАЖДЫЙ токен (glm-класс) —
+                        // пинуется всегда, как роутер (ADR-09 [R4]).
+                        const bool shared =
+                            g.name.find("shared") != std::string::npos;
+                        if (g.key.role != stell::tiers::Role::Expert ||
+                            router || shared)
+                            keys.push_back(g.key);
+                        break;
+                    }
+            std::unique_ptr<stell::tiers::Awaiter> a =
+                static_cast<stell::tiers::TierManager*>(tiers_)->pin_groups(keys);
+            if (a) a->wait();
+            if (pinned) pinned->insert(pinned->end(), keys.begin(), keys.end());
+        } else {
+            // Dense-слой: прежний pin_layer слоя целиком (семантика round 1).
+            std::unique_ptr<stell::tiers::Awaiter> a =
+                plan_.pin_layer(*tiers_, static_cast<std::uint32_t>(layer));
+            if (a) a->wait();
+        }
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0).count();
         tiers_->record_layer_pause(ms);          // паузы между слоями — tiers (ADR-08 §5)
@@ -341,7 +373,9 @@ void OpsInterpreter::pin_and_prefetch(std::size_t layer) {
         throw;
     }
     // Router-lookahead prefetch (ADR-08 §2: асинхронный, не блокирует,
-    // идемпотентен; PLAN.md §4 поток B). Заранее — следующий слой.
+    // идемпотентен; PLAN.md §4 поток B). Заранее — следующий слой ЦЕЛИКОМ
+    // (prefetch — вероятностный прогрев кеша, НЕ пин: выбранные эксперты
+    // следующего слоя неизвестны до его маршрутизации — честно).
     if (layer + 1 < map.size()) {
         std::vector<stell::tiers::GroupKey> keys;
         for (const auto& gid : map[layer + 1])
@@ -350,6 +384,12 @@ void OpsInterpreter::pin_and_prefetch(std::size_t layer) {
         tiers_->prefetch(keys);
         ++layer_prefetches_;
     }
+}
+
+// [R1] round 10: снятие пина ровно пиннутого подмножества (MoE-контур).
+void OpsInterpreter::unpin_keys(const std::vector<stell::tiers::GroupKey>& keys) {
+    if (!tiers_) return;
+    for (const auto& k : keys) tiers_->unpin(k);
 }
 
 // --- каталог операций --------------------------------------------------------
@@ -539,7 +579,14 @@ void OpsInterpreter::op_ffn(std::size_t layer, std::vector<float>& hidden) {
     for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] += y[i];
 }
 
-void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
+// [R1] round 10 (ADR-13 §[R3]): маршрутизация MoE — scores → softmax →
+// top-k (stable sort, ничья → меньший индекс) → перенормировка probs.
+// Код перенесён из op_moe БЕЗ изменений (побитовая идентичность golden D):
+// вызывается из layer_body ДО пина слоя (какие эксперты пиновать) и из
+// op_moe (те же order/probs для gather/scatter).
+std::vector<std::uint32_t> OpsInterpreter::moe_route(
+    std::size_t layer, const std::vector<float>& hidden,
+    std::vector<float>* probs) const {
     const PlainGroup* grouter = group(layer_prefix(layer) + "mlp.router");
     if (!grouter) throw std::invalid_argument("ops runner: нет роутера слоя");
     const Mat* router = mat(grouter->id);
@@ -584,14 +631,71 @@ void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden) {
     float pk_sum = 0.0f;
     if (spec_.router_renorm)
         for (std::uint32_t j = 0; j < k_top; ++j) pk_sum += scores[order[j]];
-    std::vector<float> probs(k_top, 0.0f);
-    for (std::uint32_t j = 0; j < k_top; ++j)
-        probs[j] = spec_.router_renorm
-                       ? (pk_sum > 0.0f ? scores[order[j]] / pk_sum : 0.0f)
-                       : scores[order[j]];
+    if (probs) {
+        probs->assign(k_top, 0.0f);
+        for (std::uint32_t j = 0; j < k_top; ++j)
+            (*probs)[j] = spec_.router_renorm
+                              ? (pk_sum > 0.0f ? scores[order[j]] / pk_sum : 0.0f)
+                              : scores[order[j]];
+    }
+    return order;
+}
+
+void OpsInterpreter::op_moe(std::size_t layer, std::vector<float>& hidden,
+                            std::vector<stell::tiers::GroupKey>* pinned) {
+    // Маршрутизация (вынесена в moe_route [R1] round 10: та же
+    // последовательность операций — побитовая идентичность golden).
+    std::vector<float> probs;
+    const std::vector<std::uint32_t> order = moe_route(layer, hidden, &probs);
+    const std::uint32_t k_top = static_cast<std::uint32_t>(order.size());
+
+    // [R1] round 10 (ADR-13 §[R3]): экспертно-гранулярный пиннинг — ПОСЛЕ
+    // маршрутизации, до FFN выбранных экспертов. Пинуются только группы
+    // ВЫБРАННЫХ экспертов (sparse offloading): невыбранные остаются
+    // вытесняемыми — политики {LRU,LCU}×{k} перестают быть вырожденными.
+    // Пауза пина экспертов — в паузу слоя (сумма пауз групп, [R2]).
+    if (tiers_ && pinned && !order.empty()) {
+        std::vector<stell::tiers::GroupKey> keys;
+        for (std::uint32_t e : order) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "l%03zu.e%03u.up", layer, e);
+            if (const PlainGroup* g = group(buf))
+                keys.push_back({stell::tiers::GroupId{g->id},
+                                static_cast<stell::tiers::Role>(g->role)});
+            std::snprintf(buf, sizeof buf, "l%03zu.e%03u.down", layer, e);
+            if (const PlainGroup* g = group(buf))
+                keys.push_back({stell::tiers::GroupId{g->id},
+                                static_cast<stell::tiers::Role>(g->role)});
+            std::snprintf(buf, sizeof buf, "l%03zu.e%03u.gate_up", layer, e);
+            if (const PlainGroup* g = group(buf)) {
+                keys.push_back({stell::tiers::GroupId{g->id},
+                                static_cast<stell::tiers::Role>(g->role)});
+            } else {
+                std::snprintf(buf, sizeof buf, "l%03zu.e%03u.gate", layer, e);
+                if (const PlainGroup* g = group(buf))
+                    keys.push_back({stell::tiers::GroupId{g->id},
+                                    static_cast<stell::tiers::Role>(g->role)});
+            }
+        }
+        if (!keys.empty()) {
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                std::unique_ptr<stell::tiers::Awaiter> a =
+                    static_cast<stell::tiers::TierManager*>(tiers_)->pin_groups(keys);
+                if (a) a->wait();
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                tiers_->record_layer_pause(ms);   // сумма пауз групп слоя ([R2])
+                pinned->insert(pinned->end(), keys.begin(), keys.end());
+            } catch (const stell::tiers::TierError&) {
+                throw;   // политика CPU-контура: abort (ADR-08 §3)
+            }
+        }
+    }
 
     // --- MoE gather/scatter через kernels CPU-референс (ADR-09 §1) -----------
     // x — [1][d_model]; expert_ids — [1][k_top]; gathered — [k_top][d_model].
+    const std::uint32_t d_model = spec_.d_model;
     std::vector<float> x(hidden.begin(), hidden.end());
     std::vector<std::int32_t> expert_ids(static_cast<std::size_t>(k_top));
     std::vector<float> gathered(static_cast<std::size_t>(k_top) * d_model, 0.0f);
@@ -725,21 +829,29 @@ void OpsInterpreter::unpin_layer(std::size_t layer) {
 
 void OpsInterpreter::layer_body(std::size_t layer, std::vector<float>& hidden,
                                 SlotState& st) {
-    pin_and_prefetch(layer);                       // tiering: pin перед слоем
     // Per-layer маршрутизация (ADR-09 «Уточнение round 5», [R3]): слой БЕЗ
     // группы mlp.router — dense ffn путь; С ней — MoE-контур. ops-граф описания
     // общий; op, неприменимая профилю данного слоя, пропускается (однородный
     // план — частный случай: у dense-описания нет moe-op, у MoE-описания нет
     // ffn-op — маршрутизация вырождается в прежнее поведение).
     const bool moe_layer = group(layer_prefix(layer) + "mlp.router") != nullptr;
+    // [R1] round 10 (ADR-13 §[R3]): пин перед слоем; для MoE-слоя —
+    // гранулярный (не-экспертные группы + роутер; выбранные эксперты — после
+    // маршрутизации в op_moe); dense — прежний pin_layer слоя целиком.
+    std::vector<stell::tiers::GroupKey> pinned;
+    pin_and_prefetch(layer, moe_layer, &pinned);
     for (const PlainOp& op : spec_.ops) {
         if (op.op == "rmsnorm") op_rmsnorm(layer, hidden);
         else if (op.op == "attention") op_attention(layer, hidden, st);
         else if (op.op == "ffn") { if (!moe_layer) op_ffn(layer, hidden); }
-        else if (op.op == "moe_gather_scatter") { if (moe_layer) op_moe(layer, hidden); }
+        else if (op.op == "moe_gather_scatter") { if (moe_layer) op_moe(layer, hidden, &pinned); }
         else throw std::invalid_argument("ops runner: неизвестная op '" + op.op + "'");
     }
-    unpin_layer(layer);                            // слот свободен для следующего слоя
+    // Снятие пина: MoE — ровно ПИННУТОЕ подмножество (у невыбранных
+    // экспертов пина не было — unpin бросил бы NotPinned); dense — прежний
+    // проход по слою (семантика round 1).
+    if (moe_layer) unpin_keys(pinned);
+    else unpin_layer(layer);                       // слот свободен для следующего слоя
 }
 
 // --- forward / step ----------------------------------------------------------
