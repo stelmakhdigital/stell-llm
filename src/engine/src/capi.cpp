@@ -398,7 +398,10 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
     char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "{\"engine\":{\"state\":\"serving\",\"sessions_active\":%zu,"
-                  "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16},"
+                  "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16,"
+                  // [R3] ADR-13: шаги, прижатые mixed-prefill бюджетом
+                  // (0 при default без лимита — честный ноль, не пропуск).
+                  "\"prefill_budget_deferrals\":%llu},"
                   "\"logits\":{\"requests_total\":%llu,\"errors_total\":%llu,"
                   "\"last_n_vocab\":%s,\"last_positions\":%s},"
                   "\"features\":{\"spec_draft\":%s,"
@@ -409,6 +412,7 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   "\"n_draft_effective\":%u,\"rounds\":%llu}}",
                   ctx->sched->active(), ctx->pool->busy(),
                   (unsigned)ctx->pool->capacity(),
+                  (unsigned long long)ctx->sched->prefill_deferrals(),
                   (unsigned long long)ctx->lstats.requests.load(),
                   (unsigned long long)ctx->lstats.errors.load(),
                   // -1 → null (успешных вызовов ещё не было)

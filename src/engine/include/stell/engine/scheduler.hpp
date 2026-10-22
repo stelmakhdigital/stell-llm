@@ -92,6 +92,17 @@ public:
     struct Config {
         std::size_t batch_step_max = 16;      // максимум слотов в одном шаге декода
         bool broadcast_step_meta = false;     // ADR-10 §3: ранг 0 рассылает мету шага
+        // Round 10 ([R3] ADR-13): mixed-prefill budget — максимум СУММАРНЫХ
+        // токенов новых префиллов на шаг (ADR-13 §[R4]): входящие префиллы
+        // не должны блокировать resident-декодеры. 0 = без лимита (default —
+        // поведение round 1..9 не меняется). Сессии, уже декодирующие
+        // (префилл сделан), бюджетом не ограничены; префилл, не влезший в
+        // остаток бюджета, откладывается до следующего шага (soft target,
+        // НЕ latency-гарантия — ADR-13 [R4]). Честное ограничение: промпт
+        // ДЛИННЕЕ самого бюджета не планируется никогда — конфигурируйте
+        // бюджет ≥ максимального промпта (иначе — голодание сессии).
+        // Телеметрия: prefill_deferrals().
+        std::size_t prefill_token_budget = 0;
     };
 
     Scheduler(IModelRunner& runner, ISlotPool& pool);
@@ -121,6 +132,12 @@ public:
     std::size_t active() const;                 // активные (не завершённые) сессии
     std::uint64_t steps_done() const;           // счётчик шагов (метрики TPOT/TTFT)
 
+    // Телеметрия mixed-prefill budget ([R3] ADR-13): число ШАГОВ, прижатых
+    // бюджетом (в шаге был хотя бы один отложенный префилл). Доля прижатых
+    // шагов = prefill_deferrals() / steps_done(); при default (без лимита)
+    // счётчик всегда 0.
+    std::uint64_t prefill_deferrals() const { return prefill_deferred_; }
+
 private:
     struct Session {
         SessionId id = 0;
@@ -148,6 +165,7 @@ private:
     std::unordered_map<SessionId, std::deque<Event>> inbox_;  // события по ADR-11 §3
     std::uint64_t next_session_id_ = 1;
     std::uint64_t steps_ = 0;
+    std::uint64_t prefill_deferred_ = 0;         // [R3] ADR-13: шаги, прижатые бюджетом
 };
 
 } // namespace stell::engine
