@@ -373,7 +373,7 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
     //   latency.tok_s.spec_decode — tok/s спек-декода по телеметрии (0 —
     //   контур не вооружён/не использовался — честный ноль, не пропуск);
     //   spec.accept_rate/n_draft/rounds — телеметрия драфтера.
-    // round 9 (ADR-13 [R1]): «configured ≠ executed» (прецедент 1Cat) —
+    // round 9 (ADR-13 [R1]): «configured ≠ executed» (ADR-13 [R1]) —
     //   features.spec_draft_configured / _executed / _reason различают
     //   настроенный путь, фактическое исполнение и причину неактивности.
     //   Обратная совместимость: features.spec_draft остаётся bool (его читают
