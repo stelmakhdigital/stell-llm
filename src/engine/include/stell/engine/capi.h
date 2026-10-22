@@ -70,6 +70,20 @@ int  stell_metrics(stell_engine_t* e, char** out_json);
    вызывающем (конвенция ADR-11 §1 для malloc-строк). */
 int  stell_logits(stell_engine_t* e, const char* request_json, char** out_json);
 
+/* round 8 (срез 4): спекулятивный декод на реальном runner'е (ADR-11 §1 —
+   ABI-совместимое расширение, новый символ). Драфтер — модель-плагин из
+   конфига "spec" (spec.draft_model); верификация — FP32-логиты цели;
+   последовательность на выходе побитово == plain greedy (спекуляция без
+   потери качества). Требует runner:"ops" и секцию "spec".
+   request_json: {"prompt_tokens":[...], "n_steps":K} (n_steps — 16 по
+   умолчанию; K — сколько токенов декодировать в этом вызове).
+   out_json: {"tokens":[...], "accepted":N, "proposed":M, "rounds":R,
+              "emitted":E, "wall_s":S, "tok_s":T, "enabled":bool}
+     — tok_s — честная скорость спек-декода (на CPU-контуре верификация
+     последовательна: ускорения может не быть — арбитр калибровки решает).
+   Возврат: 0 — успех; -1 — ошибка (out_json = {"error":"..."}). */
+int  stell_spec_step(stell_engine_t* e, const char* request_json, char** out_json);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,7 @@ set(STELL_ENGINE_SOURCES
     src/scheduler.cpp
     src/execution_plan.cpp
     src/speculative.cpp
+    src/spec_decode.cpp
     src/json.cpp
     src/tokenizer.cpp
     src/ops_runner.cpp
@@ -292,6 +293,26 @@ target_include_directories(test_engine_ops_qk_norm PRIVATE ../../tests/core)
 target_compile_definitions(test_engine_ops_qk_norm PRIVATE
     STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
 add_test(NAME engine/ops_qk_norm COMMAND test_engine_ops_qk_norm)
+
+# --- round 8 (срез 4): спекуляция на реальном runner'е (drafter + FP32) ------
+
+add_executable(test_engine_spec_e2e
+    ../../tests/core/engine/test_spec_e2e.cpp
+)
+target_link_libraries(test_engine_spec_e2e stell_engine)
+target_include_directories(test_engine_spec_e2e PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_spec_e2e PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/spec_e2e COMMAND test_engine_spec_e2e)
+
+add_executable(test_engine_spec_capi
+    ../../tests/core/engine/test_spec_capi.cpp
+)
+target_link_libraries(test_engine_spec_capi stell_engine)
+target_include_directories(test_engine_spec_capi PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_spec_capi PRIVATE
+    STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/spec_capi COMMAND test_engine_spec_capi)
 
 # --- round 5: [R6] source_slice через мост (fused qkv, одно открытие) ---------
 
