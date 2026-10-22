@@ -147,7 +147,7 @@ void run() {
     for (std::size_t i = 0; i < ref2.size(); ++i)
         STELL_CHECK_MSG(got_b[i] == ref2[i], "второй слот: спекуляция != greedy");
 
-    // (г) Динамическая глубина драфта (ADR-13 [R2], DSpark): adaptive_draft —
+    // (г) Динамическая глубина драфта (ADR-13 [R2]): adaptive_draft —
     //     глубина следующего раунда масштабируется скользящим accept-rate.
     //     При высоком accept-rate глубина РАСТЁТ выше базовой; качество —
     //     по-прежнему побитово == plain greedy.

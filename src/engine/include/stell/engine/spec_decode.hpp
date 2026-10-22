@@ -56,7 +56,7 @@ public:
         double accept_target = 0.5;         // порог арбитра (accept-rate)
         std::uint32_t window = 32;          // окно калибровки (раундов)
         std::uint32_t warmup_rounds = 4;    // окно не карается до warmup
-        // Динамическая глубина драфта (ADR-13 [R2], DSpark/DeepInfer): пока
+        // Динамическая глубина драфта (ADR-13 [R2]): пока
         // окно пусто или фича выключена — базовый n_draft; далее глубина
         // масштабируется скользящим accept-rate (см. effective_n_draft).
         bool adaptive_draft = false;
@@ -96,7 +96,7 @@ public:
     // ADR-13 [R1]): отличие от «выключен конфигом».
     bool auto_disabled() const { return auto_disabled_; }
     // Действующая глубина драфта СЛЕДУЮЩЕГО раунда. Политика (ADR-13 [R2],
-    // DSpark): при пустом окне — базовый n_draft; иначе
+    // ADR-13 [R2]): при пустом окне — базовый n_draft; иначе
     // n_eff = round(n_draft * (0.5 + accept_rate)), зажат в
     // [n_draft_min, n_draft_max] — при высоком accept-rate глубина растёт,
     // при низком — сжимается (дешёвые раунды перед отключением арбитром).
