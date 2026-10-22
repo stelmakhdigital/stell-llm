@@ -40,6 +40,42 @@ def is_valid_logits_snapshot(obj: Any) -> bool:
     return True
 
 
+# Спек-поля снапшота движка (round 9, состав от core-9): снапшот может
+# нести их все, часть или none — до merge core-9 реальный движок их не
+# публикует вовсе. Имена зафиксированы планом round 9:
+#   features.spec_draft            — bool, фича включена арбитром
+#   latency.tok_s.spec_decode      — float, tok/s спек-декода
+#   spec.accept_rate / spec.n_draft — float/uint, телеметрия драфтера
+# (bench-харнесс уже читает первые два: src/bench/stell_bench/harness.py).
+_SPEC_FEATURES_KEY = "spec_draft"
+_SPEC_TOK_S_KEY = "spec_decode"
+_SPEC_BLOCK_KEY = "spec"
+
+
+def spec_fields_note(snap: Dict[str, Any]) -> Optional[str]:
+    """Честная пометка об отсутствии spec-полей в снапшоте движка (round 9,
+    по прецеденту dtype_orig round 6: отсутствие поля ≠ молчаливый None).
+
+    Возвращает пометку, если в снапшоте НЕТ ни одного spec-поля — её кладёт
+    в ответ /metrics ключом `spec_note` serve-сторона (движок не трогаем).
+    Если есть хотя бы одно поле (даже ложь/0.0 — это честные значения
+    «фича выключена») — None: passthrough без пометки и без фабрикации.
+    """
+    features = snap.get("features")
+    if isinstance(features, dict) and _SPEC_FEATURES_KEY in features:
+        return None
+    latency = snap.get("latency")
+    if isinstance(latency, dict):
+        tok_s = latency.get("tok_s")
+        if isinstance(tok_s, dict) and _SPEC_TOK_S_KEY in tok_s:
+            return None
+    spec = snap.get(_SPEC_BLOCK_KEY)
+    if isinstance(spec, dict) and spec:
+        return None
+    return ("снапшот движка без spec-полей (features.spec_draft / "
+            "latency.tok_s.spec_decode / spec) — появятся после merge core-9")
+
+
 def _percentile(sorted_values: List[float], q: float) -> Optional[float]:
     if not sorted_values:
         return None

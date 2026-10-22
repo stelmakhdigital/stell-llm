@@ -30,7 +30,7 @@ from .dialects import (
     sse_done,
 )
 from .engine import CtypesEngineBackend, EngineBackend, EngineError
-from .metrics import ServeMetrics
+from .metrics import ServeMetrics, spec_fields_note
 
 _REPO_UI = None
 try:  # путь по умолчанию — src/ui репозитория
@@ -655,6 +655,12 @@ def create_app(
     @app.get("/metrics")
     def metrics():
         snap: Dict[str, Any] = dict(app.state.engine.metrics())
+        # round 9: снапшот БЕЗ spec-полей — честная пометка (прецедент
+        # dtype_orig round 6: отсутствие поля ≠ молчаливый None); с полями
+        # — passthrough 1:1 (движок не трогаем, дописываем только serve/).
+        note = spec_fields_note(snap)
+        if note:
+            snap["spec_note"] = note
         snap["serve"] = app.state.metrics.snapshot()
         return snap
 

@@ -25,6 +25,7 @@ function render() {
     renderTierStats(snap.tiers || {});
     renderSlots(snap.engine || {});
     renderFeatures(snap.features, snap.build, snap.parallel);
+    renderSpec(snap);
     renderLogs(snap.serve?.logs || []);
     renderLogits(snap.logits);
     text(document.getElementById("updated"),
@@ -125,6 +126,27 @@ function renderFeatures(features, build, parallel) {
       c.innerHTML = `<div class="k">${k}</div><div class="v">${v ?? "—"}</div>`;
       host.appendChild(c);
     });
+}
+
+// Спекулятивный контур (round 8, ADR-11 §4): состояние фичи, телеметрия
+// драфтера (accept-rate, n_draft) и tok/s спек-декода. Честность: если
+// движок ещё не публикует spec-поля — служебная пометка spec_note
+// (прецедент dtype_orig round 6: отсутствие поля ≠ молчаливый ноль).
+function renderSpec(snap) {
+  const host = document.getElementById("spec-cards");
+  if (!host) return;
+  const spec = snap.spec || {};
+  const tokS = snap.latency?.tok_s?.spec_decode;
+  const enabled = snap.features?.spec_draft;
+  const rows = [
+    ["features.spec_draft", enabled === undefined ? "—" : String(enabled)],
+    ["accept-rate", spec.accept_rate === undefined ? "—" : (spec.accept_rate * 100).toFixed(1) + "%"],
+    ["n_draft", spec.n_draft ?? "—"],
+    ["spec-decode tok/s", tokS === undefined ? "—" : tokS.toFixed(2)],
+  ];
+  host.innerHTML = rows.map(([k, v]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")
+    + (snap.spec_note ? `<div class="note">${snap.spec_note}</div>` : "");
 }
 
 function renderLogs(logs) {
