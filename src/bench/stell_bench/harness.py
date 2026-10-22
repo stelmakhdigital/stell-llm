@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .aggregate import RunMetrics, aggregate_runs
+from .ppl_gate import SPEC_PPL_DELTA_FIELD, ppl_delta
 from .protocol import BenchmarkProtocol, capture_env
 
 
@@ -24,6 +25,10 @@ class BenchResult:
     protocol: Dict[str, Any]
     pending: bool = True          # True = прогоны без реальной модели/GPU
     notes: List[str] = field(default_factory=list)
+    # ADR-13 [R6] (round 10): PPL-дельта цели между plain- и спекулятивным
+    # путём на одном семплинг-конфиге. None = не измерено (mock/нет
+    # лог-вероятностей) — честный null в report.json, не ноль.
+    spec_ppl_delta: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -33,6 +38,7 @@ class BenchResult:
             "protocol": self.protocol,
             "pending": self.pending,
             "notes": self.notes,
+            SPEC_PPL_DELTA_FIELD: self.spec_ppl_delta,
         }
 
 
@@ -40,12 +46,16 @@ class BenchRunner:
     """Харнесс: один успешный старт на версию (§5), 1 холодный + N тёплых."""
 
     def __init__(self, backend, protocol: Optional[BenchmarkProtocol] = None,
-                 pending: bool = True, notes: Optional[List[str]] = None) -> None:
+                 pending: bool = True, notes: Optional[List[str]] = None,
+                 ppl_logprobs_fn: Optional[Any] = None) -> None:
         self.backend = backend
         self.protocol = protocol or BenchmarkProtocol()
         self.protocol.validate()
         self.pending = pending
         self.notes = notes or []
+        # ADR-13 [R6]: callable(plain_logprobs, spec_logprobs) уже собранных
+        # путей — либо None (измерение недоступно; поле отчёта — null).
+        self.ppl_logprobs_fn = ppl_logprobs_fn
 
     def run_single(self, prompt: str) -> RunMetrics:
         """Single-request прогон: T=1, top-p=0.95, top-k=20, seed=0 (§5)."""
@@ -104,8 +114,18 @@ class BenchRunner:
         medians = aggregate_runs(warm)
         env = capture_env(gpu_hours=None)
         env["co_tenancy"] = self.protocol.co_tenancy
+        # ADR-13 [R6]: PPL-дельта на том же семплинг-конфиге; callable даёт
+        # пары лог-вероятностей (plain, spec) — mock/недоступность → None.
+        spec_ppl_delta = None
+        if self.ppl_logprobs_fn is not None:
+            try:
+                plain, spec = self.ppl_logprobs_fn()
+                spec_ppl_delta = ppl_delta(plain, spec)
+            except Exception as exc:  # честность: не измерено ≠ ноль
+                self.notes.append(f"spec_ppl_delta: не измерено ({exc})")
         return BenchResult(
             medians=medians, runs=warm, env=env,
+            spec_ppl_delta=spec_ppl_delta,
             protocol={
                 "name": self.protocol.name,
                 "session": dict(self.protocol.session),
