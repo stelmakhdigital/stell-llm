@@ -15,7 +15,9 @@
 // сами веса материалены из лоадера (см. ops_runner.hpp).
 #include "stell/engine/capi.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +31,7 @@
 #include "stell/engine/ops_runner.hpp"
 #include "stell/engine/plain_spec.hpp"
 #include "stell/engine/scheduler.hpp"
+#include "stell/engine/spec_decode.hpp"
 #include "stell/engine/tokenizer.hpp"
 
 using namespace stell::engine;
@@ -84,8 +87,46 @@ struct EngineCtx {
     ByteTokenizer tok;
     std::string last_error;
     LogitsStats lstats;                            // round 3 [R5]: /metrics "logits"
+    // round 8 (срез 4): спекулятивный контур на реальном runner'е
+    // (spec_decode.hpp): decoder — только при runner=ops и конфиге "spec"
+    // (drafter — отдельная модель-плагин, свой ops-раннер); slot — вне слотов
+    // планировщика (резервный id). Телеметрия — decoder->telemetry().
+    std::unique_ptr<IModelRunner> spec_draft_runner;
+    std::unique_ptr<SpeculativeDecoder> spec;
 };
 
+    // round 8 (срез 4): сборка ops-раннера из секции описания модели (цель и
+    // драфтер — один путь; у драфтера tiers нет — маленькая модель).
+    std::unique_ptr<CpuModelRunner> make_ops_runner(const Json& model,
+                                                    std::unique_ptr<stell::tiers::TierManager>& tiers_owner) {
+        const std::string desc_path =
+            model.find("description") ? model.find("description")->as_string("") : std::string();
+        const std::string weights_uri =
+            model.find("weights") ? model.find("weights")->as_string("") : std::string();
+        const std::string fmt_name =
+            model.find("weights_format") ? model.find("weights_format")->as_string("safetensors")
+                                         : std::string("safetensors");
+        if (desc_path.empty() || weights_uri.empty())
+            throw std::runtime_error(
+                "capi: секция модели требует description и weights");
+        const PlainSpec spec = load_plain_spec(desc_path);
+        const LoadedWeights weights =
+            load_plain_weights(weights_uri, spec, weights_format_from_name(fmt_name));
+        const ExecutionPlan plan = build_execution_plan(spec);
+        stell::tiers::TierManager* tiers = nullptr;
+        if (const Json* t = model.find("tiering")) {
+            stell::tiers::TierConfig tc{};
+            if (const Json* v = t->find("vram_slots"))
+                tc.vram_slots = static_cast<std::size_t>(v->as_int(4));
+            if (const Json* v = t->find("ram_capacity"))
+                tc.ram_capacity = static_cast<std::size_t>(v->as_int(0));
+            if (const Json* v = t->find("nvme_layout"))
+                tc.nvme_layout = v->as_string("");
+            tiers_owner = std::make_unique<stell::tiers::TierManager>(tc);
+            tiers = tiers_owner.get();
+        }
+        return std::make_unique<CpuModelRunner>(spec, plan, weights, tiers);
+    }
 } // namespace
 
 extern "C" {
@@ -114,40 +155,70 @@ int stell_engine_create(const char* cfg_json, stell_engine_t** out) {
             const Json* model = cfg.find("model");
             if (!model)
                 throw std::runtime_error("capi: runner=ops требует секцию model");
-            const std::string desc_path = model->find("description")
-                                              ? model->find("description")->as_string("")
-                                              : std::string();
-            const std::string weights_uri =
-                model->find("weights") ? model->find("weights")->as_string("") : std::string();
-            const std::string fmt_name =
-                model->find("weights_format")
-                    ? model->find("weights_format")->as_string("safetensors")
-                    : std::string("safetensors");
-            if (desc_path.empty() || weights_uri.empty())
-                throw std::runtime_error("capi: runner=ops требует model.description "
-                                         "и model.weights");
 
-            const PlainSpec spec = load_plain_spec(desc_path);
-            const LoadedWeights weights =
-                load_plain_weights(weights_uri, spec, weights_format_from_name(fmt_name));
-            const ExecutionPlan plan = build_execution_plan(spec);
-
-            stell::tiers::TierManager* tiers = nullptr;
-            if (const Json* t = model->find("tiering")) {
-                stell::tiers::TierConfig tc{};
-                if (const Json* v = t->find("vram_slots"))
-                    tc.vram_slots = static_cast<std::size_t>(v->as_int(4));
-                if (const Json* v = t->find("ram_capacity"))
-                    tc.ram_capacity = static_cast<std::size_t>(v->as_int(0));
-                if (const Json* v = t->find("nvme_layout"))
-                    tc.nvme_layout = v->as_string("");
-                ctx->tiers = std::make_unique<stell::tiers::TierManager>(tc);
-                tiers = ctx->tiers.get();
-            }
-
-            ctx->runner = std::make_unique<CpuModelRunner>(spec, plan, weights, tiers);
+            ctx->runner = make_ops_runner(*model, ctx->tiers);
             ctx->sched = new Scheduler(*ctx->runner, *ctx->pool);
             ctx->sched->set_tokenizer(&ctx->tok);          // byte-level fallback
+
+            // round 8 (срез 4): спекулятивный контур — конфиг "spec"
+            // (drafter — отдельная модель-плагин, свой ops-раннер; slot —
+            // резервный, вне слотов планировщика). Честно: без секции "spec"
+            // контура нет (features.spec_draft=false в снапшоте).
+            if (const Json* sp = cfg.find("spec")) {
+                const bool sp_enabled =
+                    sp->find("enabled") ? (sp->find("enabled")->t == Json::T::Bool ? sp->find("enabled")->boolean : false) : false;
+                if (sp_enabled) {
+                    const Json* dm = sp->find("draft_model");
+                    if (!dm)
+                        throw std::runtime_error(
+                            "capi: spec.enabled требует spec.draft_model "
+                            "(драфтер — отдельная модель-плагин)");
+                    if (!dynamic_cast<CpuModelRunner*>(ctx->runner.get()))
+                        throw std::runtime_error(
+                            "capi: spec.enabled требует runner=ops (верификация — "
+                            "FP32-логиты цели через ops-раннер)");
+                    ctx->spec_draft_runner = make_ops_runner(*dm, ctx->tiers);
+                    auto* draft_cpu =
+                        dynamic_cast<CpuModelRunner*>(ctx->spec_draft_runner.get());
+                    auto* target_cpu = dynamic_cast<CpuModelRunner*>(ctx->runner.get());
+                    SpeculativeDecoder::Config sc{};
+                    if (const Json* v = sp->find("n_draft"))
+                        sc.n_draft = static_cast<std::uint32_t>(v->as_int(4));
+                    if (const Json* v = sp->find("accept_target"))
+                        sc.accept_target = v->t == Json::T::Number ? v->num : 0.5;
+                    if (const Json* v = sp->find("window"))
+                        sc.window = static_cast<std::uint32_t>(v->as_int(32));
+                    if (const Json* v = sp->find("warmup_rounds"))
+                        sc.warmup_rounds = static_cast<std::uint32_t>(v->as_int(4));
+                    sc.enabled = true;
+                    // Драфтер-плагин: greedy-продолжение драфт-модели по полному
+                    // контексту (stateless пересчёт — честное ограничение round 8;
+                    // stateful-драфтер с KV-rollback — отдельная задача).
+                    OpsInterpreter* draft_interp = &draft_cpu->interpreter();
+                    const SlotId kDraftSlot = static_cast<SlotId>(0xFFFFFFF0);
+                    SpeculativeDecoder::DrafterFn drafter =
+                        [draft_interp, kDraftSlot](
+                            const std::vector<std::int32_t>& context,
+                            std::size_t n_draft) {
+                            if (context.empty() || n_draft == 0)
+                                return std::vector<std::int32_t>{};
+                            draft_interp->release_slot(kDraftSlot);
+                            std::vector<float> lg = draft_interp->step_logits(
+                                kDraftSlot, context, context.back());
+                            std::vector<std::int32_t> out;
+                            for (std::size_t i = 0; i < n_draft; ++i) {
+                                const std::int32_t c = static_cast<std::int32_t>(
+                                    std::max_element(lg.begin(), lg.end()) - lg.begin());
+                                out.push_back(c);
+                                lg = draft_interp->step_logits(kDraftSlot, {}, c);
+                            }
+                            return out;
+                        };
+                    ctx->spec = std::make_unique<SpeculativeDecoder>(
+                        target_cpu->interpreter(), drafter, sc,
+                        static_cast<SlotId>(0xFFFFFFFE));
+                }
+            }
         } else {
             ctx->runner = std::make_unique<DemoRunner>();
             Scheduler::Config cfg2{};
@@ -167,6 +238,8 @@ void stell_engine_destroy(stell_engine_t* e) {
     if (!e) return;
     auto* ctx = reinterpret_cast<EngineCtx*>(e);
     delete ctx->sched;
+    ctx->spec.reset();
+    ctx->spec_draft_runner.reset();
     ctx->runner.reset();
     ctx->tiers.reset();
     delete ctx->pool;
@@ -295,13 +368,27 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
     // вызовов stell_logits БЕЗ payload (массивы логитов в /metrics не выдаются
     // никогда — размер). До первого успешного вызова last_* — null («честно:
     // нет данных», как в serve-секции).
+    // round 8 (срез 4): spec-поля (ADR-11 §4, bench harness.py их читает):
+    //   features.spec_draft — контур сконфигурирован и включён арбитром;
+    //   latency.tok_s.spec_decode — tok/s спек-декода по телеметрии (0 —
+    //   контур не вооружён/не использовался — честный ноль, не пропуск);
+    //   spec.accept_rate/n_draft/rounds — телеметрия драфтера.
     const auto pos = ctx->lstats.last_positions.load();
-    char buf[768];
+    const bool spec_on = ctx->spec && ctx->spec->enabled();
+    const auto& st = ctx->spec ? ctx->spec->telemetry()
+                               : SpeculativeDecoder::Telemetry{};
+    const double spec_tok_s = st.wall_s > 0.0
+                                  ? static_cast<double>(st.tokens) / st.wall_s
+                                  : 0.0;
+    char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "{\"engine\":{\"state\":\"serving\",\"sessions_active\":%zu,"
                   "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16},"
                   "\"logits\":{\"requests_total\":%llu,\"errors_total\":%llu,"
-                  "\"last_n_vocab\":%s,\"last_positions\":%s}}",
+                  "\"last_n_vocab\":%s,\"last_positions\":%s},"
+                  "\"features\":{\"spec_draft\":%s},"
+                  "\"latency\":{\"tok_s\":{\"spec_decode\":%.3f}},"
+                  "\"spec\":{\"accept_rate\":%.4f,\"n_draft\":%u,\"rounds\":%llu}}",
                   ctx->sched->active(), ctx->pool->busy(),
                   (unsigned)ctx->pool->capacity(),
                   (unsigned long long)ctx->lstats.requests.load(),
@@ -309,9 +396,73 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   // -1 → null (успешных вызовов ещё не было)
                   [&]{ const auto v = ctx->lstats.last_n_vocab.load();
                        return v < 0 ? std::string("null") : std::to_string(v); }().c_str(),
-                  pos == 2 ? "\"all\"" : pos == 1 ? "\"last\"" : "null");
+                  pos == 2 ? "\"all\"" : pos == 1 ? "\"last\"" : "null",
+                  spec_on ? "true" : "false",
+                  spec_tok_s,
+                  ctx->spec ? ctx->spec->acceptance_rate() : 0.0,
+                  ctx->spec ? ctx->spec->config().n_draft : 0u,
+                  (unsigned long long)st.rounds);
     *out_json = strdup(buf);
     return 0;
+}
+
+// --- round 8 (срез 4): спекулятивный контур на реальном runner'е ------------
+// ABI-расширение ADR-11 §1 (по образцу stell_logits round 2): новый символ,
+// существующие не меняются. Контракт — spec_decode.hpp; драфтер — модель-плагин
+// из конфига "spec"; верификация — FP32-логиты цели; последовательность на
+// выходе побитово == plain greedy (спекуляция без потери качества).
+int stell_spec_step(stell_engine_t* e, const char* request_json, char** out_json) {
+    auto* ctx = reinterpret_cast<EngineCtx*>(e);
+    auto fail = [&](const std::string& what) -> int {
+        if (out_json)
+            *out_json = strdup(("{\"error\":\"" + what + "\"}").c_str());
+        return -1;
+    };
+    if (!ctx || !request_json || !out_json) return -1;
+    if (!ctx->spec)
+        return fail("stell_spec_step: спекулятивный контур не сконфигурирован "
+                    "(нужна секция spec с draft_model, runner=ops)");
+    try {
+        Json req = json_parse(request_json);
+        std::vector<std::int32_t> prompt;
+        if (const Json* v = req.find("prompt_tokens")) {
+            if (v->t != Json::T::Array) return fail("prompt_tokens: not array");
+            for (const Json& t : v->arr)
+                prompt.push_back(static_cast<std::int32_t>(t.as_int()));
+        }
+        if (prompt.empty()) return fail("empty prompt_tokens");
+        std::size_t n_steps = 16;
+        if (const Json* v = req.find("n_steps"))
+            n_steps = static_cast<std::size_t>(v->as_int(16));
+
+        const auto before = ctx->spec->telemetry();
+        const std::vector<std::int32_t> tokens = ctx->spec->run(prompt, n_steps);
+        const auto after = ctx->spec->telemetry();
+
+        std::string arr;
+        for (std::size_t i = 0; i < tokens.size(); ++i)
+            arr += (i ? "," : "") + std::to_string(tokens[i]);
+        const double tok_s = after.wall_s > 0.0
+                                 ? static_cast<double>(after.tokens) / after.wall_s
+                                 : 0.0;
+        char buf[512];
+        std::snprintf(buf, sizeof buf,
+                      "{\"tokens\":[%s],\"accepted\":%llu,\"proposed\":%llu,"
+                      "\"rounds\":%llu,\"emitted\":%llu,\"wall_s\":%.6f,"
+                      "\"tok_s\":%.3f,\"enabled\":%s}",
+                      arr.c_str(),
+                      (unsigned long long)(after.accepted - before.accepted),
+                      (unsigned long long)(after.proposed - before.proposed),
+                      (unsigned long long)(after.rounds - before.rounds),
+                      (unsigned long long)tokens.size(),
+                      after.wall_s - before.wall_s,
+                      tok_s,
+                      ctx->spec->enabled() ? "true" : "false");
+        *out_json = strdup(buf);
+        return 0;
+    } catch (const std::exception& ex) {
+        return fail(std::string("stell_spec_step: ") + ex.what());
+    }
 }
 
 // --- round 2: stell_logits (ADR-11 §1, новое ABI-расширение) -----------------
