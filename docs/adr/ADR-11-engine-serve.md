@@ -332,3 +332,81 @@ planner round 5 ([Q1]→[R1], вердикт round 4: approve).
   логит-контрактов) оправдана только измеренной потребностью; триггер
   формализован (wall > 1 ч), чтобы решение принималось по замеру, а не
   по предположению.
+
+## Уточнение (round 8, задача T-20261020065719) — спекулятивный контур в ABI и снапшоте
+
+Контракт §4 не ломается (поля снапшота только добавляются; существующие
+поля побитово неизменны); фиксация по реализации round 8 (срез 4 PLAN.md §4,
+`src/engine/spec_decode.{hpp,cpp}`, `src/engine/src/capi.cpp`,
+`src/bench/stell_bench/harness.py`).
+
+- **`stell_spec_step` (§1) — ABI-совместимое расширение.** Новый символ по
+  тому же прецеденту, что `stell_step`/`stell_logits` («символы только
+  добавляются», мажор ABI не меняется):
+
+  ```c
+  int stell_spec_step(stell_engine_t* e, const char* request_json, char** out_json);
+  ```
+
+  - `request_json`: `{"prompt_tokens":[...], "n_steps":K}` (`n_steps` — 16 по
+    умолчанию); токены — готовые id (конвенция round 1).
+  - `out_json`: `{"tokens":[...], "accepted":N, "proposed":M, "rounds":R,
+    "emitted":E, "wall_s":S, "tok_s":T, "enabled":bool}`.
+  - Владение malloc-строками и конвенция `0/-1` — как в round 1/2.
+  - Требует `runner:"ops"` и секции конфига `"spec"` (`{enabled, n_draft,
+    accept_target, window, warmup_rounds, draft_model{description, weights}}`);
+    драфтер — отдельная модель через собственный ops-раннер той же сборки
+    (слоты-резервы вне планировщика).
+  - Гарантия качества: последовательность на выходе **побитово == plain
+    greedy** цели (FP32-верификация каждого драфт-токена; арбитр отключает
+    контур при accept-rate ниже порога — результат не меняется). Тесты:
+    `engine/spec_e2e` (многосессионность, арбитр), `engine/spec_capi`
+    (ABI-сверка со `stell_logits`).
+- **Spec-поля снапшота `/metrics` (§4) — контракт bench-харнесса.**
+  `src/bench/stell_bench/harness.py` уже читает пути
+  `snap['features']['spec_draft']` и `snap['latency']['tok_s']['spec_decode']`;
+  снапшот движка теперь несёт их явно (честные значения при выключенном
+  контуре — `false`/`0.0`, не пропуск поля):
+
+  ```json
+  {"features": {"spec_draft": false},
+   "latency": {"tok_s": {"spec_decode": 0.0}},
+   "spec": {"accept_rate": 0.0, "n_draft": 4, "rounds": 0}}
+  ```
+
+  - `features.spec_draft` — контур сконфигурирован **и включён арбитром**;
+  - `latency.tok_s.spec_decode` — tok/s спек-декода по телеметрии
+    (`tokens/wall_s`); на CPU-контуре верификация последовательна —
+    ускорения может не быть, арбитр решает по измерениям;
+  - `spec.accept_rate` — `accepted/proposed` арбитра; `n_draft` — окно
+    драфтера; `rounds` — число раундов спек-декода.
+- **Serve-поведение `/metrics` (§4, прецедент dtype_orig round 6).**
+  При наличии spec-полей у движка — passthrough 1:1 без фабрикации; при
+  отсутствии (старый .so/ABI) — явная пометка `spec_note` с составом
+  ожидаемых полей («отсутствие поля ≠ молчаливый None»). Контрактные тесты:
+  `tests/serve/test_metrics_spec.py` (passthrough на реальном движке,
+  `spec_note` на стабе старого ABI, честные 0/false как «значения, а не
+  отсутствие»).
+- **Дашборд** рендерит блок «Спекуляция» фиксированной схемой
+  (`renderSpec` в `src/ui/app.js`): spec_draft, accept-rate, n_draft,
+  spec-decode tok/s, `spec_note` — по прецеденту `LOGITS_FIELDS` round 3.
+
+### Сверка docs↔code (round 8, ADR-08 и ADR-12)
+
+Сверка проведена по мастер-состоянию после merge core/serve round 8 —
+расхождений не найдено:
+
+- **ADR-08 ↔ `src/tiers`/`src/engine`:** интерфейс `ITierManager`
+  (`set_plan/pin/unpin/pin_layer/prefetch/stats`) и `TierStats`/
+  `PrefetchStats`/`PauseStats` (`manager.hpp`) совпадают с §2;
+  `TierError::Code {PlanMismatch, SlotExhausted, IoFailure, NotPinned,
+  Timeout}` (`errors.hpp`) совпадает с §3; расширение-прецедент
+  `set_layer_map` (round 1) и `verify_slots` (round 3) — на реализации,
+  интерфейс не расширяют; `layout_version` в `ExecutionPlan` (§, round 1)
+  на месте (`execution_plan.hpp`).
+- **ADR-12 ↔ `src/tiers`/`src/models`:** канон `header_crc32` — байты
+  `[0x00..0x2C)` — в writer/reader обоих модулей (`layout.cpp` 0x2C,
+  `stelltier_format.cpp` `crc32_ieee(h, 0x2C)`) — исправление round 2
+  подтверждено применённым; имя группы `char[16]`; payload-CRC по слоту
+  целиком; verify-политика round 3 (`STELL_TIER_VERIFY_CRC`, OR-семантика,
+  CRC-once после `verify_slots()`) — по факту кода.
