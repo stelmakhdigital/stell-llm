@@ -99,8 +99,19 @@ PPL-дельты цели между plain и спекулятивным пут�
 
 - [R1]/[R2] реализованы в round 9 (engine); тесты — `test_engine_spec_e2e`;
   базелайны сохранены (ctest 56/56, pytest 194+2skip).
-- [R3]…[R6] — требования следующих раундов; планировщик раундов обязан
-  учитывать их при постановке задач потокам B (tiers) и A (engine).
-- Честность: в этом раунде не заявлено ускорение CPU-спекуляции
+- Round 10 (T-20261022183913 R2): [R3] экспертно-гранулярный tier-flow —
+  реализован (TierManager::pin_groups + MoE-контур ops_runner: пин не-
+  экспертных групп + роутера + shared, выбранные эксперты — после
+  маршрутизации, невыбранные вытесняемы; hit-rate матрица {LRU,LCU}×{k}
+  измерена — `bench/results/20261022-tiers-hitrate-matrix/`, ≥60% хотя бы
+  в одной ячейке, p95 групп ≤ p95 слоя целиком); [R4] mixed-prefill budget —
+  реализован (Scheduler::prefill_token_budget + телеметрия
+  prefill_budget_deferrals); [R6] PPL-delta gate — реализован
+  (bench-поле `spec_ppl_delta`, planner R2 [R4]). [R5] (NGRAM/lookup-дрáфтеры)
+  — остаётся pending. Qwen3_5Moe (планировщик R2 [R5], models) — синтетическая
+  поддержка, см. ADR-09. CPU-прогоны: ctest 58/58,
+  pytest 202+2skip; GPU-контуры (NCCL/CUDA-окно) — честный pending
+  (co-tenancy).
+- Честность: в раундах 9–10 не заявлено ускорение CPU-спекуляции
   (sequential-верификация — ограничение задокументировано в
   `spec_decode.hpp`); [R2] меняет только глубину драфта, не скорость.
