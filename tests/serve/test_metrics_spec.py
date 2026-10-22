@@ -98,19 +98,94 @@ def spec_client(stub_spec_lib):
     backend.close()
 
 
+# ---------------- stub .so БЕЗ spec-полей (сценарий «движок старого ABI») ---
+# Реальный движок после core round 8 поля отдаёт; сценарий «полей нет»
+# остаётся валидным (старый .so / другой ABI) — покрыт отдельным стабом.
+_STUB_PLAIN_C = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+typedef struct stell_engine stell_engine_t;
+int stell_engine_create(const char* cfg, stell_engine_t** out) {
+    (void)cfg; if (!out) return -1; *out = (stell_engine_t*)1; return 0;
+}
+void stell_engine_destroy(stell_engine_t* e) { (void)e; }
+uint64_t stell_submit(stell_engine_t* e, const char* r, char** msg) {
+    (void)e; (void)r; if (msg) *msg = NULL; return 1;
+}
+int stell_poll(stell_engine_t* e, uint64_t sid, char** out) {
+    (void)e; (void)sid; if (out) *out = NULL; return 0;
+}
+int stell_cancel(stell_engine_t* e, uint64_t sid) { (void)e; (void)sid; return 0; }
+int stell_metrics(stell_engine_t* e, char** out_json) {
+    (void)e;
+    const char* s =
+        "{\"engine\":{\"state\":\"serving\",\"sessions_active\":0,"
+        "\"slots_busy\":0,\"slots_total\":16,\"batch_size_max\":16},"
+        "\"logits\":{\"requests_total\":0,\"errors_total\":0,"
+        "\"last_n_vocab\":null,\"last_positions\":null}}";
+    *out_json = (char*)malloc(strlen(s) + 1);
+    strcpy(*out_json, s);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def stub_plain_lib(tmp_path_factory):
+    out_dir = tmp_path_factory.mktemp("stub_plain_engine")
+    src = out_dir / "stub_plain_engine.c"
+    so = out_dir / "libstell_stub_plain.so"
+    src.write_text(_STUB_PLAIN_C)
+    cc = None
+    for cand in ("x86_64-conda-linux-gnu-gcc", "gcc", "cc"):
+        cc = shutil.which(cand, path=_toolchain_env()["PATH"])
+        if cc:
+            break
+    assert cc, "не найден C-компилятор для stub-.so"
+    subprocess.run([cc, "-shared", "-fPIC", "-O0", "-o", str(so), str(src)],
+                   check=True, capture_output=True, env=_toolchain_env())
+    return so
+
+
+@pytest.fixture()
+def plain_client(stub_plain_lib):
+    from fastapi.testclient import TestClient
+    from stell_serve.app import create_app, default_engine_cfg
+    from stell_serve.engine import CtypesEngineBackend
+
+    backend = CtypesEngineBackend(stub_plain_lib)
+    application = create_app(backend, engine_cfg=default_engine_cfg("stub-model"))
+    yield TestClient(application)
+    backend.close()
+
+
 # --------------------------- (а) снапшот БЕЗ полей ---------------------------
 
 def test_metrics_without_spec_fields_honest_note(real_client):
-    """Текущий реальный движок (ABI-копия src/engine) не публикует spec-поля:
-    /metrics несёт явную пометку spec_note — НЕ молчаливое отсутствие."""
+    """Реальный движок после merge core-9 (round 8, срез 4) публикует spec-поля
+    (features.spec_draft, latency.tok_s.spec_decode, spec.*) — serve делает
+    passthrough 1:1 и НЕ ставит spec_note (пометка — только для честного
+    «у движка полей нет»; сценарий «полей нет» остаётся покрытым логикой
+    spec_note на стабах, движок ABI больше не даёт такой снапшот)."""
     snap = real_client.get("/metrics").json()
+    assert "spec_note" not in snap, (
+        "при наличии spec-полей у движка пометка не нужна")
+    assert snap["features"]["spec_draft"] in (True, False)
+    assert "spec_decode" in snap["latency"]["tok_s"]
+    assert "accept_rate" in snap["spec"] and "n_draft" in snap["spec"]
+
+
+def test_metrics_without_spec_fields_honest_note_stub(plain_client):
+    """Сценарий «у движка spec-полей нет» (старый ABI/старый .so): служит
+    честной пометке spec_note — НЕ молчаливое отсутствие (прецедент
+    dtype_orig round 6); при этом serve НЕ фабрикует пустые spec-поля."""
+    snap = plain_client.get("/metrics").json()
     assert "spec_note" in snap, "молчаливое отсутствие spec-полей запрещено"
     note = snap["spec_note"]
     assert "spec-полей" in note
-    # пометка называет ожидаемый состав полей (сверка с core-9 при merge)
     for name in ("features.spec_draft", "latency.tok_s.spec_decode", "spec"):
         assert name in note
-    # и при этом serve НЕ фабрикует пустые spec-поля
     assert "spec" not in snap
     assert not isinstance(snap.get("features"), dict) or \
         "spec_draft" not in snap["features"]

@@ -194,7 +194,12 @@ def test_api_metrics_real_engine(real_client):
     # passthrough engine-блока (у реального движка — min-снапшот)
     assert snap["engine"]["state"] == "serving"
     assert snap["engine"]["slots_total"] == 16
-    assert "tiers" not in snap and "latency" not in snap  # честно: нет данных
+    assert "tiers" not in snap
+    # round 8: движок публикует latency.tok_s.spec_decode (core round 8,
+    # срез 4) — passthrough; tiers по-прежнему нет (честно: нет данных).
+    assert "latency" in snap and "tok_s" in snap["latency"]
+    assert "spec_decode" in snap["latency"]["tok_s"]
+    assert snap["features"]["spec_draft"] in (True, False)
     # serve-секция как у mock (ADR-11 §4)
     assert snap["serve"]["requests_total"] == 1
     assert snap["serve"]["latency"]["ttft_ms"]["p50"] is not None
