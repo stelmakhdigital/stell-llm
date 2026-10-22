@@ -140,8 +140,14 @@ function renderSpec(snap) {
   const enabled = snap.features?.spec_draft;
   const rows = [
     ["features.spec_draft", enabled === undefined ? "—" : String(enabled)],
+    ["spec configured/executed", (snap.features?.spec_draft_configured === undefined ||
+                                  snap.features?.spec_draft_executed === undefined)
+      ? "—"
+      : `${snap.features.spec_draft_configured}/${snap.features.spec_draft_executed}`],
+    ["spec reason", snap.features?.spec_draft_reason ?? "—"],
     ["accept-rate", spec.accept_rate === undefined ? "—" : (spec.accept_rate * 100).toFixed(1) + "%"],
     ["n_draft", spec.n_draft ?? "—"],
+    ["n_draft effective", spec.n_draft_effective ?? "—"],
     ["spec-decode tok/s", tokS === undefined ? "—" : tokS.toFixed(2)],
   ];
   host.innerHTML = rows.map(([k, v]) =>

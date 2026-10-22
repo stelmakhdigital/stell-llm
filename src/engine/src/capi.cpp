@@ -373,10 +373,25 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
     //   latency.tok_s.spec_decode — tok/s спек-декода по телеметрии (0 —
     //   контур не вооружён/не использовался — честный ноль, не пропуск);
     //   spec.accept_rate/n_draft/rounds — телеметрия драфтера.
+    // round 9 (ADR-13 [R1]): «configured ≠ executed» (прецедент 1Cat) —
+    //   features.spec_draft_configured / _executed / _reason различают
+    //   настроенный путь, фактическое исполнение и причину неактивности.
+    //   Обратная совместимость: features.spec_draft остаётся bool (его читают
+    //   bench harness.py и python control-plane).
     const auto pos = ctx->lstats.last_positions.load();
     const bool spec_on = ctx->spec && ctx->spec->enabled();
     const auto& st = ctx->spec ? ctx->spec->telemetry()
                                : SpeculativeDecoder::Telemetry{};
+    // configured ≠ executed (ADR-13 [R1]): configured — контур собран и
+    // подключён (ctx->spec); executed — был хотя бы один состоявшийся
+    // спек-раунд. reason — почему фича не активна ПРЯМО СЕЙЧАС.
+    const bool spec_configured = ctx->spec != nullptr;
+    const bool spec_executed = spec_configured && st.rounds > 0;
+    const char* spec_reason =
+        !spec_configured ? "not_configured"
+        : ctx->spec->auto_disabled() ? "arbiter_disabled"
+        : spec_on ? "enabled"
+                  : "disabled_by_config";
     const double spec_tok_s = st.wall_s > 0.0
                                   ? static_cast<double>(st.tokens) / st.wall_s
                                   : 0.0;
@@ -386,9 +401,12 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   "\"slots_busy\":%zu,\"slots_total\":%u,\"batch_size_max\":16},"
                   "\"logits\":{\"requests_total\":%llu,\"errors_total\":%llu,"
                   "\"last_n_vocab\":%s,\"last_positions\":%s},"
-                  "\"features\":{\"spec_draft\":%s},"
+                  "\"features\":{\"spec_draft\":%s,"
+                  "\"spec_draft_configured\":%s,\"spec_draft_executed\":%s,"
+                  "\"spec_draft_reason\":\"%s\"},"
                   "\"latency\":{\"tok_s\":{\"spec_decode\":%.3f}},"
-                  "\"spec\":{\"accept_rate\":%.4f,\"n_draft\":%u,\"rounds\":%llu}}",
+                  "\"spec\":{\"accept_rate\":%.4f,\"n_draft\":%u,"
+                  "\"n_draft_effective\":%u,\"rounds\":%llu}}",
                   ctx->sched->active(), ctx->pool->busy(),
                   (unsigned)ctx->pool->capacity(),
                   (unsigned long long)ctx->lstats.requests.load(),
@@ -398,9 +416,13 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                        return v < 0 ? std::string("null") : std::to_string(v); }().c_str(),
                   pos == 2 ? "\"all\"" : pos == 1 ? "\"last\"" : "null",
                   spec_on ? "true" : "false",
+                  spec_configured ? "true" : "false",
+                  spec_executed ? "true" : "false",
+                  spec_reason,
                   spec_tok_s,
                   ctx->spec ? ctx->spec->acceptance_rate() : 0.0,
                   ctx->spec ? ctx->spec->config().n_draft : 0u,
+                  ctx->spec ? ctx->spec->effective_n_draft() : 0u,
                   (unsigned long long)st.rounds);
     *out_json = strdup(buf);
     return 0;
