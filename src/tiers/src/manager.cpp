@@ -394,7 +394,6 @@ void TierManager::set_plan(const std::vector<TensorGroup>& groups) {
                                 cudaGetErrorString(e));
         dev_storage_ = static_cast<std::uint8_t*>(dev);
     }
-    vram_storage_.clear(); // host-эмуляция не используется (device ptr ниже)
     vram_slots_.assign(cfg_.vram_slots, nullptr);
     for (std::size_t i = 0; i < cfg_.vram_slots; ++i)
         vram_slots_[i] = dev_storage_ + i * slot_size_;
