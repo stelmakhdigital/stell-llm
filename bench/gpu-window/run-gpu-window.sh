@@ -61,7 +61,15 @@ if command -v cmake >/dev/null 2>&1; then
     ( cmake -S . -B "$BUILD" -G Ninja -DSTELL_CUDA=ON &&
       cmake --build "$BUILD" -j"$(nproc)" ) > "$LOGS/build.log" 2>&1
     if [ $? = 0 ]; then done_m "сборка STELL_CUDA=ON (лог: logs/build.log)";
-    else pend "сборка STELL_CUDA=ON не прошла (лог: logs/build.log) — GPU-шаги отложены"; fi
+    else
+        pend "сборка STELL_CUDA=ON не прошла (лог: logs/build.log) — GPU-шаги отложены"
+        note "  диагностика (хвост logs/build.log):"
+        tail -n 12 "$LOGS/build.log" | sed 's/^/  > /' | tee -a "$SUMMARY"
+        note "  подсказки: 1) если build/gpu остался от CPU-конфигурации — rm -rf $BUILD и повторить;
+  2) nccl.h ищется в /usr/include и /usr/local/cuda/include — при другом пути:
+     cmake -S . -B $BUILD -G Ninja -DSTELL_CUDA=ON -DSTELL_NCCL_INCLUDE=<каталог с nccl.h>;
+  3) CUDA toolkit должен быть в PATH (nvcc)."
+    fi
 else
     pend "cmake недоступен в PATH"
 fi
@@ -103,6 +111,26 @@ note "## C. Layout реального чекпоинта (stell-tier)"
 LAYOUT=""
 HD="$(BIN stell_hf_description)"
 CV="$(BIN stell_convert_streaming)"
+# Автопоиск модели: MODEL_DIR → ~/models/* по config.json (первый с знакомой
+# конвертеру архитектурой); найденное честно перечисляется в сводке.
+if [ ! -d "$MODEL_DIR" ]; then
+    FOUND=""
+    for cfg in "$HOME"/models/*/config.json; do
+        [ -f "$cfg" ] || continue
+        d=$(dirname "$cfg")
+        FOUND="$FOUND $(basename "$d")"
+    done
+    [ -n "$FOUND" ] && note "  - \"$MODEL_DIR\" отсутствует; в ~/models найдены: $FOUND"
+    for cfg in "$HOME"/models/*/config.json; do
+        [ -f "$cfg" ] || continue
+        d=$(dirname "$cfg")
+        arch=$(python3 -c "import json;print(json.load(open('$cfg')).get('architectures',['?'])[0])" 2>/dev/null || echo '?')
+        case "$arch" in
+            LlamaForCausalLM|Qwen2ForCausalLM|MixtralForCausalLM|Qwen2MoeForCausalLM|Qwen1.5MoeForCausalLM|OlmoeForCausalLM|Qwen3MoeForCausalLM)
+                MODEL_DIR="$d"; note "  - автопоиск: выбран \"$d\" (arch=$arch)"; break ;;
+        esac
+    done
+fi
 if [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ] && [ -n "$HD" ] && [ -n "$CV" ]; then
     DESC="$RESULTS/description.json"
     LAYOUT="$RESULTS/checkpoint.stelltier"
@@ -168,8 +196,14 @@ fi
 # --- F. Quality gates live-real (PPL/GSM8K/HumanEval через ABI) --------------
 note
 note "## F. Quality gates (live-real)"
-PY=/home/arkalaust/.local/stell-conda/envs/serve/bin/python
-PY="${STELL_GPUWINDOW_PYTHON:-$PY}"
+PY="${STELL_GPUWINDOW_PYTHON:-}"
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+    for cand in /home/arkalaust/.local/stell-conda/envs/serve/bin/python \
+                "$HOME/.local/stell-conda/envs/serve/bin/python" \
+                "$(command -v python3 2>/dev/null)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && PY="$cand" && break
+    done
+fi
 if [ -x "$PY" ] && [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ]; then
     ( cd src/bench && STELL_R8_MODEL_DIR="$MODEL_DIR" \
       STELL_R8_RESULTS_DIR="$REPO/$RESULTS/quality-gates" \

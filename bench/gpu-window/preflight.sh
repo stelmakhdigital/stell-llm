@@ -27,17 +27,28 @@ snap nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --for
 nvidia-smi topo -m > "$OUT/topology.txt" 2>&1 || log "topo -m недоступен"
 nvidia-smi -q > "$OUT/nvidia-smi-q.txt" 2>&1 || true
 
-# --- Карты: ≥4 V100 ----------------------------------------------------------
-GPU_LIST=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)
-V100_COUNT=$(echo "$GPU_LIST" | grep -c "V100" || true)
-log "Карт V100: $V100_COUNT"
+# --- Карты: ≥4 V100 (прочие карты — не участники, не мешают) ---------------
+# Правило (по факту машины): не-V100 карты (RTX 2060 и т.п.) в окне НЕ
+# участвуют и из критериев исключены — только V100-SXM2 считаются.
+GPU_LIST=$(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null)
+V100_IDX=$(echo "$GPU_LIST" | awk -F', ' '$2 ~ /V100/ {print $1}')
+V100_COUNT=$(echo "$V100_IDX" | grep -c . || true)
+OTHER=$(echo "$GPU_LIST" | awk -F', ' '$2 !~ /V100/ {print $1" ("$2")"}')
+[ -n "$OTHER" ] && log "Карты-не-участники (исключены из критериев): $OTHER"
+log "Карт V100 (участники): $V100_COUNT"
 if [ "$V100_COUNT" -lt 4 ]; then
     log "PREFLIGHT: НЕДостаточно V100 (нужно ≥4 для TP4) — окно НЕЧИСТОЕ"
     exit 1
 fi
 
-# --- Чужие процессы (co-tenancy) ---------------------------------------------
-FOREIGN=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | grep -v "^\s*$" || true)
+# --- Чужие процессы на V100 (co-tenancy) ------------------------------------
+# Учитываются ТОЛЬКО процессы на V100 (не-V100 карты игнорируются).
+FOREIGN=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
+    | grep -v "^\s*$" | while IFS=', ' read -r uuid pid pname mem; do
+        idx=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null \
+              | awk -F', ' -v u="$uuid" '$2 == u {print $1}')
+        for vi in $V100_IDX; do [ "$idx" = "$vi" ] && echo "gpu$idx pid=$pid $pname ($mem)"; done
+    done)
 if [ -n "$FOREIGN" ]; then
     log "PREFLIGHT: на GPU ЕСТЬ вычислительные процессы — окно ЗАНЯТО:"
     log "$FOREIGN"
@@ -47,9 +58,13 @@ if [ -n "$FOREIGN" ]; then
     exit 1
 fi
 
-# --- Свободная VRAM на каждой карте ------------------------------------------
+# --- Свободная VRAM на каждой V100 ------------------------------------------
 LOWFREE=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null \
-    | awk -F', ' '$2 < 30000 {print $1" ("$2" MiB свободно)"}')
+    | awk -F', ' '$2 < 30000 {print $1" ("$2" MiB свободно)"}' \
+    | while read -r line; do
+        idx=${line%% *}
+        for vi in $V100_IDX; do [ "$idx" = "$vi" ] && echo "$line"; done
+    done)
 if [ -n "$LOWFREE" ]; then
     log "PREFLIGHT: карты со свободной VRAM < 30 GiB: $LOWFREE — окно НЕЧИСТОЕ"
     exit 1
