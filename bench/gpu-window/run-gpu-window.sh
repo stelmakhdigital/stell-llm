@@ -229,7 +229,7 @@ if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -f "$HARNESS_SRC" ] && [ -d "$BUILD
         -Wl,-rpath,/usr/local/cuda-12.8/lib64 -Wl,-rpath,/usr/local/cuda/lib64 \
         -o "$LOGS/decode_logits" > "$LOGS/decode-build.log" 2>&1
     if [ -x "$LOGS/decode_logits" ]; then
-        "$LOGS/decode_logits" "$MODEL_DIR" "$LAYOUT" \
+        stdbuf -oL -eL "$LOGS/decode_logits" "$MODEL_DIR" "$LAYOUT" \
             > "$LOGS/decode-logits.log" 2>&1 \
             && done_m "декод-контур: логиты побитово + wall/token (лог: logs/decode-logits.log)" \
             || pend "декод-контур завершился ошибкой (лог: logs/decode-logits.log)"
@@ -268,7 +268,8 @@ if [ -f "$MODEL_DIR/model.safetensors" ] && [ -f "$MODEL_DIR/description.json" ]
     QG_DESC="$MODEL_DIR/description.json"; QG_NAME="$MODEL_DIR"
 else
     for d in "$HOME"/models/*/; do
-        if [ -f "$d/model.safetensors" ] && [ -f "$d/description.json" ]; then
+        if [ -f "$d/model.safetensors" ] && [ -s "$d/description.json" ] \
+           && grep -q '"schema"' "$d/description.json"; then
             QG_DESC="$d/description.json"; QG_NAME="$d"; break
         fi
     done
