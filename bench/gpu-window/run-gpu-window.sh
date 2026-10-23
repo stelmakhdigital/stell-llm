@@ -111,6 +111,10 @@ fi
 note
 note "## C. Layout реального чекпоинта (stell-tier)"
 LAYOUT=""
+# Переиспользование layout предыдущего прогона (конвертация ~33 мин):
+for f in bench/results/*-gpu-window/*.stelltier; do
+    [ -s "$f" ] && LAYOUT="$f" && note "  - layout предыдущего прогона: $f (конвертация пропущена)" && break
+done
 HD="$(BIN stell_hf_description)"
 CV="$(BIN stell_convert_streaming)"
 # Автопоиск модели: MODEL_DIR → ~/models/* по config.json (первый с знакомой
@@ -139,7 +143,7 @@ if [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ] && [ -n "$HD" ] && [ -n "$CV" ]; t
     DESC="$MODEL_DIR/description.json"
     # Конвертер пишет <model_name>.stelltier ВНУТРИ out_dir; source — каталог
     # .safetensors-шардов HF (шардированные чекпоинты поддержаны: merge shards).
-    if ls "$RESULTS"/*.stelltier >/dev/null 2>&1; then
+    if [ -n "$LAYOUT" ] || ls "$RESULTS"/*.stelltier >/dev/null 2>&1; then
         note "- layout уже существует, конвертация пропущена (см. *.stelltier в артефакте)"
         LAYOUT=$(ls -1 "$RESULTS"/*.stelltier | head -1)
     else
@@ -156,27 +160,62 @@ else
     pend "конвертация: нет модели ($MODEL_DIR) или инструментов stell_hf_description/stell_convert_streaming"
 fi
 
-# --- D. per-group bench матрица (hit-rate + p95; CPU/NVMe контур) ------------
+# --- D. per-group bench матрица (hit-rate + p95) ------------------------------
 note
 note "## D. per-group bench: hit-rate + p95 (спека Потока B: p95 ≤ 5 мс, prefetch ≥ 60%)"
-if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && BP="$(BIN bench_tiers_pause)"; then
+# D-CPU: TierManager CPU-конфигурации (VRAM-слоты — host-буферы, прецедент
+# round-7 прогона) — работает и под co-tenancy, помечается честно.
+CPU_BP=""
+for c in build/cpu/tests/tiers/bench_tiers_pause build/cpu/bench_tiers_pause; do
+    [ -x "$c" ] && CPU_BP="$c" && break
+done
+if [ -z "$CPU_BP" ] && [ -f build/cpu/build.ninja ]; then
+    ( cmake --build build/cpu -j"$(nproc)" --target bench_tiers_pause ) \
+        > "$LOGS/build-cpu-bp.log" 2>&1
+    for c in build/cpu/tests/tiers/bench_tiers_pause build/cpu/bench_tiers_pause; do
+        [ -x "$c" ] && CPU_BP="$c" && break
+    done
+fi
+if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -n "$CPU_BP" ]; then
     for io in 0 1; do
         for k in 1 4; do
             for slots in 24 48 96; do
-                tag="pergroup_io${io}_k${k}_slots${slots}"
+                tag="pergroup_cpu_io${io}_k${k}_slots${slots}"
                 STELL_TIER_ODIRECT=$io STELL_TIER_PREFETCH_DEPTH=$k \
                 STELL_TIER_VRAM_SLOTS=$slots \
-                "$BP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
+                "$CPU_BP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
                     > "$LOGS/${tag}.log" 2>&1 \
                 || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
             done
         done
     done
-    grep -l "pergroup hit-rate" "$LOGS"/pergroup_*.log >/dev/null 2>&1 \
-        && done_m "матрица per-group {io}×{k}×{бюджет} (логи: pergroup_*.log; критерии Потока B сверять по строкам 'pergroup hit-rate' и 'цель PLAN.md §4')" \
-        || pend "per-group матрица: ни одна ячейка не выпустила hit-rate (см. логи)"
+    grep -l "pergroup hit-rate" "$LOGS"/pergroup_cpu_*.log >/dev/null 2>&1 \
+        && done_m "матрица per-group CPU {io}×{k}×{бюджет} (логи: pergroup_cpu_*.log; критерии Потока B — по строкам 'pergroup hit-rate' и 'цель PLAN.md §4'; среда: CPU/NVMe$( [ "$WINDOW" = clean ] && echo ", окно чистое" || echo ", co-tenancy"))" \
+        || pend "per-group матрица CPU: ни одна ячейка не выпустила hit-rate (см. логи)"
 else
-    pend "per-group bench: нет layout (шаг C) или bench_tiers_pause"
+    pend "per-group bench CPU: нет layout (шаг C) или bench_tiers_pause (build/cpu)"
+fi
+# D-GPU: TierManager CUDA-конфигурации (VRAM-слоты — device-пул, критерий
+# Потока B «на V100») — ТОЛЬКО чистое окно (strata занимает 25-31 GiB на
+# карту; cudaMalloc под бюджет слотов упирается в чужую память — честный
+# pending, не трогаем). Бюджеты малые: slots × max_slot(594 МиБ) ≤ ~5 ГиБ.
+if [ "$WINDOW" = clean ] && [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && GP="$(BIN bench_tiers_pause)"; then
+    for k in 1 4; do
+        for slots in 2 4 8; do
+            tag="pergroup_gpu_k${k}_slots${slots}"
+            STELL_TIER_PREFETCH_DEPTH=$k STELL_TIER_VRAM_SLOTS=$slots \
+            "$GP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
+                > "$LOGS/${tag}.log" 2>&1 \
+            || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
+        done
+    done
+    grep -l "pergroup hit-rate" "$LOGS"/pergroup_gpu_*.log >/dev/null 2>&1 \
+        && done_m "матрица per-group GPU {k}×{бюджет 2/4/8} на V100 (логи: pergroup_gpu_*.log)" \
+        || pend "per-group матрица GPU: ни одна ячейка не выпустила hit-rate (см. логи)"
+elif [ "$WINDOW" != clean ]; then
+    pend "per-group bench GPU (критерий Потока B «на V100») — окно занято: cudaMalloc под слоты упирается в чужую память; только при чистом окне"
+else
+    pend "per-group bench GPU: нет bench_tiers_pause (build/gpu)"
 fi
 
 # --- E. Декод-контур: побитовые логиты + wall/token ---------------------------
@@ -185,7 +224,7 @@ note "## E. Декод-контур (побитовая сверка логит�
 HARNESS_SRC="bench/results/20261020-decode-real-qwen3-30b-a3b/harness_decode_logits.cpp"
 if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -f "$HARNESS_SRC" ] && [ -d "$BUILD" ]; then
     g++ -std=c++20 -O2 -I src/tiers/include -I src/models/include \
-        -I src/engine/include -I src/kernels/include \
+        -I src/engine/include -I src/kernels/include -I src/parallel/include \
         "$HARNESS_SRC" "$BUILD/src/engine/libstell_engine.a" \
         "$BUILD/src/models/libstell_models.a" "$BUILD/src/tiers/libstell_tiers.a" \
         "$BUILD/src/kernels/libstell_kernels.a" -lpthread \
@@ -205,14 +244,9 @@ fi
 # --- F. Quality gates live-real (PPL/GSM8K/HumanEval через ABI) --------------
 note
 note "## F. Quality gates (live-real)"
-# Движок ABI — build/cpu/libstell_core.so (run_real_gates ищет его там);
-# CPU-сборка дешевая и не зависит от GPU-шага.
-if [ ! -f build/cpu/libstell_core.so ] || [ ! -f build/cpu/test_engine_capi ]; then
-    ( cmake -S . -B build/cpu -G Ninja && cmake --build build/cpu -j"$(nproc)" ) \
-        > "$LOGS/build-cpu.log" 2>&1 \
-        && note "- CPU-сборка для ABI (build/cpu) готова (лог: logs/build-cpu.log)" \
-        || pend "CPU-сборка не прошла (лог: logs/build-cpu.log) — quality gates отложены"
-fi
+# Движок ABI — build/cpu/libstell_core.so; веса — stell-tier layout (шаг C):
+# plain-лоадер safetensors открывает ровно один файл, шардированные HF-чатсы
+# подаются runner'у как desc + stell-tier (указание самого runner'а).
 PY="${STELL_GPUWINDOW_PYTHON:-}"
 if [ -z "$PY" ] || [ ! -x "$PY" ]; then
     for cand in /home/arkalaust/.local/stell-conda/envs/serve/bin/python \
@@ -221,16 +255,25 @@ if [ -z "$PY" ] || [ ! -x "$PY" ]; then
         [ -n "$cand" ] && [ -x "$cand" ] && PY="$cand" && break
     done
 fi
-if [ -x "$PY" ] && [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ]; then
-    ( cd src/bench && STELL_R8_MODEL_DIR="$MODEL_DIR" \
-      STELL_R8_RESULTS_DIR="$REPO/$RESULTS/quality-gates" \
-      STELL_R8_CO_TENANCY=$([ "$WINDOW" = clean ] && echo 0 || echo 1) \
-      bash stell_bench/run_real_gates.sh ) \
-      > "$LOGS/quality-gates.log" 2>&1 \
-      && done_m "quality gates live-real (лог: logs/quality-gates.log, артефакт: quality-gates/)" \
-      || pend "quality gates: прогон с ошибкой/тайм-аутом (лог: logs/quality-gates.log)"
+if [ ! -f build/cpu/libstell_core.so ] || [ ! -f build/cpu/test_engine_capi ]; then
+    ( cmake -S . -B build/cpu -G Ninja && cmake --build build/cpu -j"$(nproc)" ) \
+        > "$LOGS/build-cpu.log" 2>&1 \
+        && note "- CPU-сборка для ABI (build/cpu) готова (лог: logs/build-cpu.log)" \
+        || pend "CPU-сборка не прошла (лог: logs/build-cpu.log) — quality gates отложены"
+fi
+if [ -x "$PY" ] && [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] \
+   && [ -f "$MODEL_DIR/description.json" ]; then
+    ( cd src/bench && "$PY" -m stell_bench.quality_gates_runner --live --real \
+        --engine-lib "$REPO/build/cpu/libstell_core.so" \
+        --model-desc "$MODEL_DIR/description.json" \
+        --model-weights "$LAYOUT" \
+        --results-dir "$REPO/$RESULTS/quality-gates" --committed \
+        $( [ "$WINDOW" = clean ] || echo --co-tenancy ) ) \
+        > "$LOGS/quality-gates.log" 2>&1 \
+        && done_m "quality gates live-real (лог: logs/quality-gates.log, артефакт: quality-gates/)" \
+        || pend "quality gates: прогон с ошибкой/тайм-аутом (лог: logs/quality-gates.log)"
 else
-    pend "quality gates: нет python ($PY) или каталога модели"
+    pend "quality gates: нет python ($PY), layout (шаг C) или description.json в каталоге модели"
 fi
 
 # --- G. Дополнительные чекпоинты (GLM/Qwen3_5Moe/dense — пробы конвертера) ---
