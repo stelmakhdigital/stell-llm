@@ -177,20 +177,22 @@ if [ -z "$CPU_BP" ] && [ -f build/cpu/build.ninja ]; then
     done
 fi
 if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -n "$CPU_BP" ]; then
-    for io in 0 1; do
+    for pol in lru lcu; do
+      for io in 0 1; do
         for k in 1 4; do
-            for slots in 24 48 96; do
-                tag="pergroup_cpu_io${io}_k${k}_slots${slots}"
-                STELL_TIER_ODIRECT=$io STELL_TIER_PREFETCH_DEPTH=$k \
-                STELL_TIER_VRAM_SLOTS=$slots \
+            for slots in 24 96; do
+                tag="pergroup_cpu_${pol}_io${io}_k${k}_slots${slots}"
+                STELL_TIER_POLICY=$pol STELL_TIER_ODIRECT=$io \
+                STELL_TIER_PREFETCH_DEPTH=$k STELL_TIER_VRAM_SLOTS=$slots \
                 "$CPU_BP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
                     > "$LOGS/${tag}.log" 2>&1 \
                 || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
             done
         done
+      done
     done
-    grep -l "pergroup hit-rate" "$LOGS"/pergroup_cpu_*.log >/dev/null 2>&1 \
-        && done_m "матрица per-group CPU {io}×{k}×{бюджет} (логи: pergroup_cpu_*.log; критерии Потока B — по строкам 'pergroup hit-rate' и 'цель PLAN.md §4'; среда: CPU/NVMe$( [ "$WINDOW" = clean ] && echo ", окно чистое" || echo ", co-tenancy"))" \
+    grep -l "pergroup hit-rate" "$LOGS"/pergroup_cpu_*_io*.log >/dev/null 2>&1 \
+        && done_m "матрица per-group CPU {policy}×{io}×{k}×{бюджет} (логи: pergroup_cpu_*.log; критерии Потока B — по строкам 'pergroup hit-rate' и 'цель PLAN.md §4'; среда: CPU/NVMe$( [ "$WINDOW" = clean ] && echo ", окно чистое" || echo ", co-tenancy"))" \
         || pend "per-group матрица CPU: ни одна ячейка не выпустила hit-rate (см. логи)"
 else
     pend "per-group bench CPU: нет layout (шаг C) или bench_tiers_pause (build/cpu)"
@@ -228,6 +230,8 @@ if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -f "$HARNESS_SRC" ] && [ -d "$BUILD
         "$HARNESS_SRC" "$BUILD/src/engine/libstell_engine.a" \
         "$BUILD/src/models/libstell_models.a" "$BUILD/src/tiers/libstell_tiers.a" \
         "$BUILD/src/kernels/libstell_kernels.a" -lpthread \
+        -L/usr/local/cuda-12.8/lib64 -L/usr/local/cuda/lib64 -lcudart \
+        -Wl,-rpath,/usr/local/cuda-12.8/lib64 -Wl,-rpath,/usr/local/cuda/lib64 \
         -o "$LOGS/decode_logits" > "$LOGS/decode-build.log" 2>&1
     if [ -x "$LOGS/decode_logits" ]; then
         "$LOGS/decode_logits" "$MODEL_DIR" "$LAYOUT" \
@@ -261,19 +265,39 @@ if [ ! -f build/cpu/libstell_core.so ] || [ ! -f build/cpu/test_engine_capi ]; t
         && note "- CPU-сборка для ABI (build/cpu) готова (лог: logs/build-cpu.log)" \
         || pend "CPU-сборка не прошла (лог: logs/build-cpu.log) — quality gates отложены"
 fi
-if [ -x "$PY" ] && [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] \
-   && [ -f "$MODEL_DIR/description.json" ]; then
+# runner'у нужен ОДИН файл model.safetensors (REAL_WEIGHTS_NAME); шардированный
+# 30B склеивается в ~57 ГиБ — при нехватке диска честный pending, а gates live-real
+# гоняются на fallback-чекпоинте с односоставным файлом (tiny-qwen2moe, round-10).
+QG_DESC=""; QG_NAME=""
+if [ -f "$MODEL_DIR/model.safetensors" ] && [ -f "$MODEL_DIR/description.json" ]; then
+    QG_DESC="$MODEL_DIR/description.json"; QG_NAME="$MODEL_DIR"
+else
+    for d in "$HOME"/models/*/; do
+        if [ -f "$d/model.safetensors" ] && [ -f "$d/description.json" ]; then
+            QG_DESC="$d/description.json"; QG_NAME="$d"; break
+        fi
+    done
+    [ -z "$QG_DESC" ] && for d in "$HOME"/models/*/; do
+        if [ -f "$d/model.safetensors" ]; then
+            "$HD" "$d" NVFP4 > "$d/description.json" 2>> "$LOGS/quality-gates.log" \
+              && QG_DESC="$d/description.json" && QG_NAME="$d" && break
+        fi
+    done
+fi
+if [ -x "$PY" ] && [ -n "$QG_DESC" ]; then
     ( cd src/bench && "$PY" -m stell_bench.quality_gates_runner --live --real \
         --engine-lib "$REPO/build/cpu/libstell_core.so" \
-        --model-desc "$MODEL_DIR/description.json" \
-        --model-weights "$LAYOUT" \
+        --model-desc "$QG_DESC" \
+        --model-weights "$QG_NAME/model.safetensors" \
         --results-dir "$REPO/$RESULTS/quality-gates" --committed \
         $( [ "$WINDOW" = clean ] || echo --co-tenancy ) ) \
         > "$LOGS/quality-gates.log" 2>&1 \
-        && done_m "quality gates live-real (лог: logs/quality-gates.log, артефакт: quality-gates/)" \
+        && done_m "quality gates live-real: $(basename "$QG_NAME") (лог: logs/quality-gates.log, артефакт: quality-gates/)" \
         || pend "quality gates: прогон с ошибкой/тайм-аутом (лог: logs/quality-gates.log)"
+    [ -f "$MODEL_DIR/model.safetensors" ] || \
+        pend "quality gates на $MODEL_DIR: шардированный чекпоинт требует склейки в model.safetensors (~57 ГиБ) — диска недостаточно ($(df --output=avail -BG "$REPO" 2>/dev/null | tail -1 | tr -d 'G') ГиБ); прогон выполнен на fallback-чекпоинте выше"
 else
-    pend "quality gates: нет python ($PY), layout (шаг C) или description.json в каталоге модели"
+    pend "quality gates: нет python ($PY) или чекпоинта с model.safetensors+description.json (склейка шардированных требует диска)"
 fi
 
 # --- G. Дополнительные чекпоинты (GLM/Qwen3_5Moe/dense — пробы конвертера) ---
