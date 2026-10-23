@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(STELL_CUDA "Build CUDA kernels for SM70" OFF)
+# Tesla V100 (SM70, SXM2) — глобально ДО add_subdirectory: новый CMake (3.2x+)
+# считает пустые CUDA_ARCHITECTURES ошибкой генерации для любого .cu-таргета.
+if(STELL_CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES 70)
+endif()
 option(STELL_BUILD_TESTS "Build tests" ON)
 option(STELL_BUILD_SERVE "Build serve control-plane (python) integration" ON)
 
