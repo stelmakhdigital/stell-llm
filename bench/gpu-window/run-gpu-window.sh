@@ -58,7 +58,7 @@ fi
 note
 note "## Сборка"
 if command -v cmake >/dev/null 2>&1; then
-    ( cmake -S . -B "$BUILD" -G Ninja -DSTELL_CUDA=ON &&
+    ( cmake -S . -B "$BUILD" -G Ninja -DSTELL_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 &&
       cmake --build "$BUILD" -j"$(nproc)" ) > "$LOGS/build.log" 2>&1
     if [ $? = 0 ]; then done_m "сборка STELL_CUDA=ON (лог: logs/build.log)";
     else
