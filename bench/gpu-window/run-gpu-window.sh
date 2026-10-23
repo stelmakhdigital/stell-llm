@@ -134,15 +134,22 @@ if [ ! -d "$MODEL_DIR" ]; then
     done
 fi
 if [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ] && [ -n "$HD" ] && [ -n "$CV" ]; then
-    DESC="$RESULTS/description.json"
-    LAYOUT="$RESULTS/checkpoint.stelltier"
-    if [ -s "$LAYOUT" ]; then
-        note "- layout уже существует, конвертация пропущена: \`$LAYOUT\`"
+    # description.json живёт В КАТАЛОГЕ модели (контракт run_real_gates /
+    # quality_gates_runner --real; прецедент smollm2-moe) + копия в артефакт.
+    DESC="$MODEL_DIR/description.json"
+    # Конвертер пишет <model_name>.stelltier ВНУТРИ out_dir; source — каталог
+    # .safetensors-шардов HF (шардированные чекпоинты поддержаны: merge shards).
+    if ls "$RESULTS"/*.stelltier >/dev/null 2>&1; then
+        note "- layout уже существует, конвертация пропущена (см. *.stelltier в артефакте)"
+        LAYOUT=$(ls -1 "$RESULTS"/*.stelltier | head -1)
     else
         "$HD" "$MODEL_DIR" NVFP4 > "$DESC" 2> "$LOGS/hf-description.err" \
-          && "$CV" "$DESC" "$MODEL_DIR/model.safetensors" "$LAYOUT" \
+          && cp "$DESC" "$RESULTS/description.json" \
+          && "$CV" "$DESC" "$MODEL_DIR" "$RESULTS" \
                   > "$LOGS/convert.log" 2>&1 \
-            && done_m "конвертация layout (лог: logs/convert.log; ~11 мин, peak RSS см. лог)" \
+            && LAYOUT=$(ls -1 "$RESULTS"/*.stelltier 2>/dev/null | head -1) \
+            && [ -n "$LAYOUT" ] \
+            && done_m "конвертация layout: $LAYOUT (лог: logs/convert.log; ~11 мин)" \
             || pend "конвертация не прошла (лог: logs/convert.log, logs/hf-description.err — возможно, архитектура вне конвертера: это тоже честный результат)"
     fi
 else
