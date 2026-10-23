@@ -145,7 +145,7 @@ if [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ] && [ -n "$HD" ] && [ -n "$CV" ]; t
     # .safetensors-шардов HF (шардированные чекпоинты поддержаны: merge shards).
     if [ -n "$LAYOUT" ] || ls "$RESULTS"/*.stelltier >/dev/null 2>&1; then
         note "- layout уже существует, конвертация пропущена (см. *.stelltier в артефакте)"
-        LAYOUT=$(ls -1 "$RESULTS"/*.stelltier | head -1)
+        [ -n "$LAYOUT" ] || LAYOUT=$(ls -1 "$RESULTS"/*.stelltier 2>/dev/null | head -1)
     else
         "$HD" "$MODEL_DIR" NVFP4 > "$DESC" 2> "$LOGS/hf-description.err" \
           && cp "$DESC" "$RESULTS/description.json" \
