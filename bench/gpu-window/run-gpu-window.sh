@@ -63,8 +63,10 @@ if command -v cmake >/dev/null 2>&1; then
     if [ $? = 0 ]; then done_m "сборка STELL_CUDA=ON (лог: logs/build.log)";
     else
         pend "сборка STELL_CUDA=ON не прошла (лог: logs/build.log) — GPU-шаги отложены"
-        note "  диагностика (хвост logs/build.log):"
-        tail -n 12 "$LOGS/build.log" | sed 's/^/  > /' | tee -a "$SUMMARY"
+        note "  реальные строки ошибок (grep 'error:' logs/build.log):"
+        grep -nE "error:|Error:|error [^a-z]" "$LOGS/build.log" | head -n 8 \
+            | sed 's/^/  > /' | tee -a "$SUMMARY"
+        note "  (полный лог: logs/build.log)"
         note "  подсказки: 1) если build/gpu остался от CPU-конфигурации — rm -rf $BUILD и повторить;
   2) nccl.h ищется в /usr/include и /usr/local/cuda/include — при другом пути:
      cmake -S . -B $BUILD -G Ninja -DSTELL_CUDA=ON -DSTELL_NCCL_INCLUDE=<каталог с nccl.h>;
@@ -196,6 +198,14 @@ fi
 # --- F. Quality gates live-real (PPL/GSM8K/HumanEval через ABI) --------------
 note
 note "## F. Quality gates (live-real)"
+# Движок ABI — build/cpu/libstell_core.so (run_real_gates ищет его там);
+# CPU-сборка дешевая и не зависит от GPU-шага.
+if [ ! -f build/cpu/libstell_core.so ] || [ ! -f build/cpu/test_engine_capi ]; then
+    ( cmake -S . -B build/cpu -G Ninja && cmake --build build/cpu -j"$(nproc)" ) \
+        > "$LOGS/build-cpu.log" 2>&1 \
+        && note "- CPU-сборка для ABI (build/cpu) готова (лог: logs/build-cpu.log)" \
+        || pend "CPU-сборка не прошла (лог: logs/build-cpu.log) — quality gates отложены"
+fi
 PY="${STELL_GPUWINDOW_PYTHON:-}"
 if [ -z "$PY" ] || [ ! -x "$PY" ]; then
     for cand in /home/arkalaust/.local/stell-conda/envs/serve/bin/python \

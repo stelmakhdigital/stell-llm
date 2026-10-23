@@ -71,7 +71,8 @@ if [ -n "$LOWFREE" ]; then
 fi
 
 # --- NVMe под layout ---------------------------------------------------------
-FREE_GB=$(df -BG --output=avail -P . | tail -1 | tr -dc '0-9')
+FREE_GB=$(df --output=avail -BG . 2>/dev/null | tail -1 | tr -dc '0-9')
+[ -n "$FREE_GB" ] || FREE_GB=$(df -P . 2>/dev/null | tail -1 | awk '{print int($4/1048576)}')
 log "Свободно на диске репо: ${FREE_GB} GiB"
 if [ "${FREE_GB:-0}" -lt 20 ]; then
     log "PREFLIGHT: < 20 GiB на диске — конвертация layout (~16 GiB) может не пройти."
