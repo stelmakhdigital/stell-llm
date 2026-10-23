@@ -177,22 +177,24 @@ if [ -z "$CPU_BP" ] && [ -f build/cpu/build.ninja ]; then
     done
 fi
 if [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && [ -n "$CPU_BP" ]; then
+    # Бюджет слотов: для РЕАЛЬНОГО layout pin всего слоя = 393 группы
+    # (прецедент round-5: "vram_slots=393 (дефолт bench: вмещает слой)") —
+    # ось slots 24/96 применима только к синтетической матрице (round-10
+    # артефакт), не к реальному чекпоинту; слоты не задаём (дефолт bench).
     for pol in lru lcu; do
       for io in 0 1; do
         for k in 1 4; do
-            for slots in 24 96; do
-                tag="pergroup_cpu_${pol}_io${io}_k${k}_slots${slots}"
-                STELL_TIER_POLICY=$pol STELL_TIER_ODIRECT=$io \
-                STELL_TIER_PREFETCH_DEPTH=$k STELL_TIER_VRAM_SLOTS=$slots \
-                "$CPU_BP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
-                    > "$LOGS/${tag}.log" 2>&1 \
-                || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
-            done
+            tag="pergroup_cpu_${pol}_io${io}_k${k}"
+            STELL_TIER_POLICY=$pol STELL_TIER_ODIRECT=$io \
+            STELL_TIER_PREFETCH_DEPTH=$k \
+            "$CPU_BP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
+                > "$LOGS/${tag}.log" 2>&1 \
+            || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
         done
       done
     done
     grep -l "pergroup hit-rate" "$LOGS"/pergroup_cpu_*_io*.log >/dev/null 2>&1 \
-        && done_m "матрица per-group CPU {policy}×{io}×{k}×{бюджет} (логи: pergroup_cpu_*.log; критерии Потока B — по строкам 'pergroup hit-rate' и 'цель PLAN.md §4'; среда: CPU/NVMe$( [ "$WINDOW" = clean ] && echo ", окно чистое" || echo ", co-tenancy"))" \
+        && done_m "матрица per-group CPU {policy}×{io}×{k} (слоты — дефолт bench: pin слоя) (логи: pergroup_cpu_*.log; критерии Потока B — по строкам 'pergroup hit-rate' и 'цель PLAN.md §4'; среда: CPU/NVMe$( [ "$WINDOW" = clean ] && echo ", окно чистое" || echo ", co-tenancy"))" \
         || pend "per-group матрица CPU: ни одна ячейка не выпустила hit-rate (см. логи)"
 else
     pend "per-group bench CPU: нет layout (шаг C) или bench_tiers_pause (build/cpu)"
@@ -201,23 +203,16 @@ fi
 # Потока B «на V100») — ТОЛЬКО чистое окно (strata занимает 25-31 GiB на
 # карту; cudaMalloc под бюджет слотов упирается в чужую память — честный
 # pending, не трогаем). Бюджеты малые: slots × max_slot(594 МиБ) ≤ ~5 ГиБ.
-if [ "$WINDOW" = clean ] && [ -n "$LAYOUT" ] && [ -s "$LAYOUT" ] && GP="$(BIN bench_tiers_pause)"; then
-    for k in 1 4; do
-        for slots in 2 4 8; do
-            tag="pergroup_gpu_k${k}_slots${slots}"
-            STELL_TIER_PREFETCH_DEPTH=$k STELL_TIER_VRAM_SLOTS=$slots \
-            "$GP" "$LAYOUT" 0 0 0 3 prefetch pergroup \
-                > "$LOGS/${tag}.log" 2>&1 \
-            || note "  - ячейка $tag: завершение с ошибкой (честно: лог $tag.log)"
-        done
-    done
-    grep -l "pergroup hit-rate" "$LOGS"/pergroup_gpu_*.log >/dev/null 2>&1 \
-        && done_m "матрица per-group GPU {k}×{бюджет 2/4/8} на V100 (логи: pergroup_gpu_*.log)" \
-        || pend "per-group матрица GPU: ни одна ячейка не выпустила hit-rate (см. логи)"
-elif [ "$WINDOW" != clean ]; then
-    pend "per-group bench GPU (критерий Потока B «на V100») — окно занято: cudaMalloc под слоты упирается в чужую память; только при чистом окне"
+# GPU-вариант: TierManager CUDA-конфигурации аллоцирует ПУЛ слотов
+# slots × max_slot; для реального layout max_slot = 622 МиБ (embed F16
+# [151936,2048]), pin слоя = 393 группы → пул ≥ 393 × 622 МиБ ≈ 244 ГиБ —
+# принципиально не помещается в 32 ГиБ V100. Нужна ленивая device-аллокация
+# слотов (per-group cudaMalloc при размещении) — СЛЕДУЮЩЕЕ требование после
+# окна; сейчас честный pending, не имитация замера.
+if [ "$WINDOW" != clean ]; then
+    pend "per-group bench GPU (критерий Потока B «на V100») — окно занято; только при чистом окне"
 else
-    pend "per-group bench GPU: нет bench_tiers_pause (build/gpu)"
+    pend "per-group bench GPU: пул слотов CUDA-пути slots×max_slot (622 МиБ; pin слоя 393 группы ≈ 244 ГиБ) не помещается в VRAM V100 — требуется ленивая device-аллокация слотов (follow-up gpu-window; CPU-матрица выше покрывает {policy}×{io}×{k})"
 fi
 
 # --- E. Декод-контур: побитовые логиты + wall/token ---------------------------
