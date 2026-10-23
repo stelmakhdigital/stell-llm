@@ -2,12 +2,12 @@
   "bench": "tiers-hitrate-matrix",
   "env": {"backend": "cpu", "gpu": false, "co_tenancy": true, "io_delay_ms": 2, "note": "io_delay_ms — диагностический крюк тира (детерминизм CPU-замера); абсолютные мс на GPU не переносятся", "trace_seed": 20261022, "layers": 4, "experts": 8, "tokens": 32, "passes": 3, "moe_over_vram": true},
   "matrix": [
-    {"policy": "lru", "k": 1, "hit_rate_expert": 0.945312, "p95_groups_ms": 0.308928, "p95_layerpin_ms": 0.803173},
-    {"policy": "lru", "k": 2, "hit_rate_expert": 0.1875, "p95_groups_ms": 0.498354, "p95_layerpin_ms": 0.648346},
-    {"policy": "lru", "k": 4, "hit_rate_expert": 0.121612, "p95_groups_ms": 0.387076, "p95_layerpin_ms": 0.667875},
-    {"policy": "lcu", "k": 1, "hit_rate_expert": 0.964865, "p95_groups_ms": 0.303462, "p95_layerpin_ms": 0.66054},
-    {"policy": "lcu", "k": 2, "hit_rate_expert": 0.537037, "p95_groups_ms": 0.363354, "p95_layerpin_ms": 0.695157},
-    {"policy": "lcu", "k": 4, "hit_rate_expert": 0.690355, "p95_groups_ms": 0.301718, "p95_layerpin_ms": 0.62804}
+    {"policy": "lru", "k": 1, "hit_rate_expert": 0.945312, "p95_groups_ms": 0.359781, "p95_layerpin_ms": 0.923902},
+    {"policy": "lru", "k": 2, "hit_rate_expert": 0.1875, "p95_groups_ms": 0.478774, "p95_layerpin_ms": 0.985429},
+    {"policy": "lru", "k": 4, "hit_rate_expert": 0.120139, "p95_groups_ms": 0.380553, "p95_layerpin_ms": 0.749009},
+    {"policy": "lcu", "k": 1, "hit_rate_expert": 0.964865, "p95_groups_ms": 0.313648, "p95_layerpin_ms": 0.840208},
+    {"policy": "lcu", "k": 2, "hit_rate_expert": 0.537037, "p95_groups_ms": 0.378828, "p95_layerpin_ms": 1.04432},
+    {"policy": "lcu", "k": 4, "hit_rate_expert": 0.691624, "p95_groups_ms": 0.539183, "p95_layerpin_ms": 0.859198}
   ],
   "verdict": {"cells": 6, "hit_rate_max": 0.964865, "p95_groups_le_layerpin_all": true}
 }
