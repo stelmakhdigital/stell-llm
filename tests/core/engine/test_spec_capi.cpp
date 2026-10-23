@@ -98,6 +98,57 @@ void run() {
 
     stell_engine_destroy(e);
     std::puts("spec capi: снапшот + stell_spec_step побитово == greedy — OK");
+
+    // =========================================================================
+    // [R5] round 11 (ADR-13 [R5]): spec.drafter="ngram" — драфтер БЕЗ второй
+    // модели; снапшот честно помечает тип драфтера; декод побитово == greedy.
+    // =========================================================================
+    {
+        stell_engine_t* en = nullptr;
+        const std::string ngram_cfg = std::string("{\"runner\":\"ops\",") +
+            "\"model\":{\"description\":\"" + kFixtures + "/mini_moe.json\"," +
+            "\"weights\":\"" + kFixtures + "/mini_moe.safetensors\"}," +
+            "\"spec\":{\"enabled\":true,\"drafter\":\"ngram\",\"n_draft\":4," +
+            "\"accept_target\":0.0}}";
+        STELL_CHECK_MSG(stell_engine_create(ngram_cfg.c_str(), &en) == 0 && en,
+                        "engine со spec.drafter=ngram создаётся (без draft_model)");
+        // Повторный промпт: ngram-драфтер даёт кандидатов (раунды состоялись).
+        const std::string req =
+            "{\"prompt_tokens\":[5,1,7,2,9,5,1,7,2,9,5,1,7],\"n_steps\":12}";
+        char* js = nullptr;
+        STELL_CHECK_MSG(stell_spec_step(en, req.c_str(), &js) == 0 && js,
+                        "stell_spec_step (ngram): успешный вызов");
+        Json out = json_parse(js);
+        const Json* toks = out.find("tokens");
+        STELL_CHECK(toks && toks->t == Json::T::Array);
+        const Json* rds = out.find("rounds");
+        STELL_CHECK_MSG(rds && rds->as_int(0) > 0,
+                        "ngram-драфтер на повторном промпте даёт раунды");
+        // Снапшот: spec.drafter == "ngram" (честная пометка типа драфтера).
+        char* mj = nullptr;
+        STELL_CHECK(stell_metrics(en, &mj) == 0 && mj);
+        Json snap = json_parse(mj);
+        const Json* sp = snap.find("spec");
+        STELL_CHECK_MSG(sp && sp->find("drafter") &&
+                            sp->find("drafter")->t == Json::T::String &&
+                            sp->find("drafter")->str == "ngram",
+                        "spec.drafter == \"ngram\" в снапшоте");
+        std::free(mj);
+        std::free(js);
+        stell_engine_destroy(en);
+        // Оба драфтера сразу — честная ошибка конфигурации.
+        stell_engine_t* bad = nullptr;
+        const std::string bad_cfg = std::string("{\"runner\":\"ops\",") +
+            "\"model\":{\"description\":\"" + kFixtures + "/mini_moe.json\"," +
+            "\"weights\":\"" + kFixtures + "/mini_moe.safetensors\"}," +
+            "\"spec\":{\"enabled\":true,\"drafter\":\"ngram\"," +
+            "\"draft_model\":{\"description\":\"" + kFixtures +
+            "/mini_dense.json\"," +
+            "\"weights\":\"" + kFixtures + "/mini_dense.safetensors\"}}}";
+        STELL_CHECK_MSG(stell_engine_create(bad_cfg.c_str(), &bad) != 0 && !bad,
+                        "spec.drafter=ngram + draft_model — ошибка конфигурации");
+        std::puts("spec capi: ngram-драфтер (без второй модели) — OK");
+    }
 }
 
 STELL_TEST_MAIN(run)

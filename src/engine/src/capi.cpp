@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "stell/engine/json.hpp"
+#include "stell/engine/ngram_drafter.hpp"
 #include "stell/engine/ops_runner.hpp"
 #include "stell/engine/plain_spec.hpp"
 #include "stell/engine/scheduler.hpp"
@@ -92,6 +93,10 @@ struct EngineCtx {
     // (drafter — отдельная модель-плагин, свой ops-раннер); slot — вне слотов
     // планировщика (резервный id). Телеметрия — decoder->telemetry().
     std::unique_ptr<IModelRunner> spec_draft_runner;
+    // round 11 (ADR-13 [R5]): NGRAM-драфтер — плагин без второй модели
+    // (spec.drafter="ngram"); индекс n-грамм по контексту цели.
+    std::unique_ptr<NgramDrafter> spec_ngram_drafter;
+    bool spec_drafter_ngram = false;   // для снапшота spec.drafter
     std::unique_ptr<SpeculativeDecoder> spec;
 };
 
@@ -168,18 +173,32 @@ int stell_engine_create(const char* cfg_json, stell_engine_t** out) {
                 const bool sp_enabled =
                     sp->find("enabled") ? (sp->find("enabled")->t == Json::T::Bool ? sp->find("enabled")->boolean : false) : false;
                 if (sp_enabled) {
+                    // round 11 (ADR-13 [R5]): выбор драфтера —
+                    // spec.drafter: "model" (default, отдельная модель-плагин)
+                    // | "ngram" (статистика n-грамм по контексту цели, БЕЗ
+                    // второй модели). Оба сразу — честная ошибка конфигурации.
                     const Json* dm = sp->find("draft_model");
-                    if (!dm)
+                    const Json* dr = sp->find("drafter");
+                    const bool ngram = dr && dr->t == Json::T::String &&
+                                       dr->str == "ngram";
+                    if (ngram && dm)
+                        throw std::runtime_error(
+                            "capi: spec.drafter=ngram и spec.draft_model "
+                            "одновременно — неоднозначно (выберите один "
+                            "драфтер)");
+                    if (!ngram && !dm)
                         throw std::runtime_error(
                             "capi: spec.enabled требует spec.draft_model "
-                            "(драфтер — отдельная модель-плагин)");
+                            "(или spec.drafter=\"ngram\" — драфтер без "
+                            "второй модели)");
                     if (!dynamic_cast<CpuModelRunner*>(ctx->runner.get()))
                         throw std::runtime_error(
                             "capi: spec.enabled требует runner=ops (верификация — "
                             "FP32-логиты цели через ops-раннер)");
-                    ctx->spec_draft_runner = make_ops_runner(*dm, ctx->tiers);
-                    auto* draft_cpu =
-                        dynamic_cast<CpuModelRunner*>(ctx->spec_draft_runner.get());
+                    if (!dynamic_cast<CpuModelRunner*>(ctx->runner.get()))
+                        throw std::runtime_error(
+                            "capi: spec.enabled требует runner=ops (верификация — "
+                            "FP32-логиты цели через ops-раннер)");
                     auto* target_cpu = dynamic_cast<CpuModelRunner*>(ctx->runner.get());
                     SpeculativeDecoder::Config sc{};
                     if (const Json* v = sp->find("n_draft"))
@@ -191,15 +210,27 @@ int stell_engine_create(const char* cfg_json, stell_engine_t** out) {
                     if (const Json* v = sp->find("warmup_rounds"))
                         sc.warmup_rounds = static_cast<std::uint32_t>(v->as_int(4));
                     sc.enabled = true;
-                    // Драфтер-плагин: greedy-продолжение драфт-модели по полному
-                    // контексту (stateless пересчёт — честное ограничение round 8;
-                    // stateful-драфтер с KV-rollback — отдельная задача).
-                    OpsInterpreter* draft_interp = &draft_cpu->interpreter();
-                    const SlotId kDraftSlot = static_cast<SlotId>(0xFFFFFFF0);
-                    SpeculativeDecoder::DrafterFn drafter =
-                        [draft_interp, kDraftSlot](
-                            const std::vector<std::int32_t>& context,
-                            std::size_t n_draft) {
+                    SpeculativeDecoder::DrafterFn drafter;
+                    if (ngram) {
+                        // Драфтер-плагин БЕЗ второй модели (ADR-13 [R5]):
+                        // n-граммная статистика по контексту цели; кандидаты
+                        // верифицируются целью — качество побитово == greedy,
+                        // accept-rate решает арбитр.
+                        ctx->spec_ngram_drafter = std::make_unique<NgramDrafter>();
+                        ctx->spec_drafter_ngram = true;
+                        drafter = ctx->spec_ngram_drafter->fn();
+                    } else {
+                        // Драфтер-плагин: greedy-продолжение драфт-модели по полному
+                        // контексту (stateless пересчёт — честное ограничение round 8;
+                        // stateful-драфтер с KV-rollback — отдельная задача).
+                        ctx->spec_draft_runner = make_ops_runner(*dm, ctx->tiers);
+                        auto* draft_cpu =
+                            dynamic_cast<CpuModelRunner*>(ctx->spec_draft_runner.get());
+                        OpsInterpreter* draft_interp = &draft_cpu->interpreter();
+                        const SlotId kDraftSlot = static_cast<SlotId>(0xFFFFFFF0);
+                        drafter = [draft_interp, kDraftSlot](
+                                      const std::vector<std::int32_t>& context,
+                                      std::size_t n_draft) {
                             if (context.empty() || n_draft == 0)
                                 return std::vector<std::int32_t>{};
                             draft_interp->release_slot(kDraftSlot);
@@ -214,6 +245,7 @@ int stell_engine_create(const char* cfg_json, stell_engine_t** out) {
                             }
                             return out;
                         };
+                    }
                     ctx->spec = std::make_unique<SpeculativeDecoder>(
                         target_cpu->interpreter(), drafter, sc,
                         static_cast<SlotId>(0xFFFFFFFE));
@@ -408,7 +440,8 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   "\"spec_draft_configured\":%s,\"spec_draft_executed\":%s,"
                   "\"spec_draft_reason\":\"%s\"},"
                   "\"latency\":{\"tok_s\":{\"spec_decode\":%.3f}},"
-                  "\"spec\":{\"accept_rate\":%.4f,\"n_draft\":%u,"
+                  // round 11 ([R5]): тип драфтера — model | ngram (ADR-13 [R5])
+                  "\"spec\":{\"drafter\":\"%s\",\"accept_rate\":%.4f,\"n_draft\":%u,"
                   "\"n_draft_effective\":%u,\"rounds\":%llu}}",
                   ctx->sched->active(), ctx->pool->busy(),
                   (unsigned)ctx->pool->capacity(),
@@ -424,6 +457,7 @@ int stell_metrics(stell_engine_t* e, char** out_json) {
                   spec_executed ? "true" : "false",
                   spec_reason,
                   spec_tok_s,
+                  ctx->spec_drafter_ngram ? "ngram" : "model",
                   ctx->spec ? ctx->spec->acceptance_rate() : 0.0,
                   ctx->spec ? ctx->spec->config().n_draft : 0u,
                   ctx->spec ? ctx->spec->effective_n_draft() : 0u,

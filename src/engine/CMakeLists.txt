@@ -15,6 +15,7 @@ set(STELL_ENGINE_SOURCES
     src/tokenizer.cpp
     src/ops_runner.cpp
     src/model_spec_bridge.cpp
+    src/ngram_drafter.cpp
     src/capi.cpp
 )
 
@@ -129,6 +130,16 @@ add_executable(test_engine_speculative
 target_link_libraries(test_engine_speculative stell_engine)
 target_include_directories(test_engine_speculative PRIVATE ../../tests/core)
 add_test(NAME engine/speculative COMMAND test_engine_speculative)
+
+# [R5] round 11 (ADR-13 [R5]): NGRAM-драфтер — плагин без второй модели.
+add_executable(test_engine_ngram_drafter
+    ../../tests/core/engine/test_ngram_drafter.cpp
+)
+target_link_libraries(test_engine_ngram_drafter stell_engine)
+target_include_directories(test_engine_ngram_drafter PRIVATE ../../tests/core)
+target_compile_definitions(test_engine_ngram_drafter PRIVATE
+  STELL_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/models/fixtures")
+add_test(NAME engine/ngram_drafter COMMAND test_engine_ngram_drafter)
 
 add_executable(test_engine_kv_stream
     ../../tests/core/engine/test_kv_stream.cpp
