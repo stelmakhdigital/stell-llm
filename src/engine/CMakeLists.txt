@@ -21,6 +21,12 @@ set(STELL_ENGINE_SOURCES
 
 find_package(Threads REQUIRED)   # parallel: pthread (CPU-эмулятор, ADR-10 §4)
 
+# Tesla V100 (SM70, SXM2) — ДО таргетов: новый CMake (3.2x+) считает пустые
+# CUDA_ARCHITECTURES ошибкой генерации (серверный CMake 3.2x — прогоны gpu-window).
+if(STELL_CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES 70)
+endif()
+
 add_library(stell_engine STATIC ${STELL_ENGINE_SOURCES})
 target_include_directories(stell_engine PUBLIC include)
 target_link_libraries(stell_engine
@@ -83,7 +89,6 @@ endif()
 
 if(STELL_CUDA)
     enable_language(CUDA)
-    set(CMAKE_CUDA_ARCHITECTURES 70)   # Tesla V100 (SM70, SXM2)
     # dep-исходники tiers/parallel с STELL_CUDA=1 тянут cuda_runtime.h —
     # CUDA-include нужен и в перекомпиляции внутри SHARED stell_core
     # (серверная сборка; аналогично include-строкам в чужих CMakeLists).
