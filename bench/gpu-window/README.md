@@ -34,10 +34,18 @@ export PATH=~/.local/stell-conda/envs/stell/bin:$PATH
 ```bash
 # 1. Проверка окна (НЕ запускает замеры — только диагностика):
 bash bench/gpu-window/preflight.sh
+#    ПРИМЕЧАНИЕ: non-V100 карты (RTX 2060 и др.) исключены из критериев —
+#    они не участвуют и окну не мешают.
 
 # 2. Полный прогон (сам проверит окно ещё раз перед GPU-шагами):
 bash bench/gpu-window/run-gpu-window.sh
 ```
+
+Если сборка STELL_CUDA=ON не прошла — оркестратор напечатает хвост
+logs/build.log прямо в сводку с подсказками (частая причина: nccl.h вне
+/usr/include и /usr/local/cuda/include → передать
+-DSTELL_NCCL_INCLUDE=<каталог>; или build/gpu остался от CPU-конфигурации →
+rm -rf build/gpu).
 
 Всё падает в `bench/results/<UTC-date>-gpu-window/`:
 `environment.txt` (снапшот железа/процессов), `logs/*.log` (сырые прогоны),
@@ -45,9 +53,11 @@ bash bench/gpu-window/run-gpu-window.sh
 
 ## Условия чистого окна (preflight проверяет)
 
-1. На каждой из ≥4 V100-SXM2: нет чужих процессов (nvidia-smi --query-compute-apps),
-   свободно ≥ 30 GiB VRAM (strata держит ~21-30 ГиБ — если он жив, окна НЕТ;
-   скрипт это зафиксирует и уйдёт в pending, НЕ трогая чужую память).
+1. На каждой из ≥4 **V100-SXM2** (участвуют ТОЛЬКО они; прочие карты —
+   RTX 2060 и т.п. — не-участники и из критериев исключены): нет чужих
+   процессов (nvidia-smi --query-compute-apps), свободно ≥ 30 GiB VRAM.
+   Если co-тenant жив (держит ~21-30 ГиБ на V100) — окна НЕТ; скрипт это
+   зафиксирует и уйдёт в pending, НЕ трогая чужую память.
 2. NVLink-топология доступна (nvidia-smi topo -m) — для сравнения с server-env.
 3. Свободно ≥ 20 ГиБ на NVMe под layout (+ старые layout удалить).
 4. Сборка STELL_CUDA=ON возможна (CUDA toolkit + NCCL в окружении stell).
@@ -55,7 +65,11 @@ bash bench/gpu-window/run-gpu-window.sh
 ## Переменные окружения (все опциональные)
 
 - `STELL_GPUWINDOW_MODEL` — путь к реальному чекпоинту для C-E
-  (дефолт `~/models/qwen3-30b-a3b`).
+  (дефолт `~/models/qwen3-30b-a3b`; если пути нет — автопоиск по
+  ~/models/*/config.json среди архитектур конвертера, найденное
+  перечисляется в сводке).
+- `STELL_GPUWINDOW_PYTHON` — python для quality gates (дефолт: conda-env
+  serve, затем python3 из PATH).
 - `STELL_GPUWINDOW_EXTRA_MODELS` — каталог с доп. чекпоинтами для шага G
   (GLM/Qwen3_5Moe/dense — то, чего ждёт ADR-09; ищет config.json рекурсивно).
 - `STELL_GPUWINDOW_RESULTS` — куда класть артефакты (дефолт: bench/results).
